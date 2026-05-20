@@ -1,0 +1,16 @@
+{:paths ["src" "resources"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.5"}
+        hato/hato {:mvn/version "1.0.0"}
+        org.replikativ/proximum {:mvn/version "0.1.25"}
+        cheshire/cheshire {:mvn/version "6.2.0"}}
+ :aliases
+ {:run-m {:main-opts ["-m" "kschltz.lateralus"]}
+  :run-x {:ns-default kschltz.lateralus
+          :exec-fn greet
+          :exec-args {:name "Clojure"}}
+  :build {:deps {io.github.clojure/tools.build
+                 {:mvn/version "0.10.13"}}
+          :ns-default build}
+  :test {:extra-paths ["test"]
+         :extra-deps {org.clojure/test.check {:mvn/version "1.1.3"}
+                      io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}}}}}

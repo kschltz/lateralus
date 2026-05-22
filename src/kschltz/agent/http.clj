@@ -1,24 +1,23 @@
 (ns kschltz.agent.http
   (:require [hato.client :as hato]))
 
-(defn- auth-headers [api-key]
-  (when api-key
+(defn auth-headers [api-key]
+  (when (and api-key (not= api-key ""))
     {"Authorization" (str "Bearer " api-key)}))
 
 (defn get-models [base-url api-key]
   (let [url (format "%s/v1/models" base-url)]
     (-> (hato/get url (cond-> {:as :json}
-                       api-key
-                       (assoc :headers (auth-headers api-key))))
+                        api-key
+                        (assoc :headers (auth-headers api-key))))
         :body
         :data)))
-
 
 (defn get-model-info [base-url api-key model-id]
   (let [url (format "%s/v1/models/%s" base-url model-id)]
     (-> (hato/get url (cond-> {:as :json}
-                       api-key
-                       (assoc :headers (auth-headers api-key))))
+                        api-key
+                        (assoc :headers (auth-headers api-key))))
         :body)))
 
 (defn completion [url api-key model message & {:keys [chat-history]
@@ -34,7 +33,7 @@
                          (assoc :headers (auth-headers api-key))))
         :body)))
 
-(defn- assistant-content [response]
+(defn assistant-content [response]
   (get-in response [:choices 0 :message :content]))
 
 (defn step
@@ -44,9 +43,10 @@
           :model        model
           :message      message
           :chat-history [{:role    "user"
-                          :content "You are a helpful assistante running inside a clojure process, with access to runtime via REPL"}]
+                          :content "You are a helpful assistante running inside a clojure process, with access to runtime via REPL, you absolutely must only return  valid clojure edn"}]
           :turn        0}))
-  ([{:keys [base-url api-key model message chat-history turn]}]
+  ([{:keys [base-url api-key model message chat-history turn tools]
+     :or   {turn 0}}]
    (let [response         (completion base-url api-key model message :chat-history chat-history)
          new-chat-history (conj chat-history {:role    "assistant"
                                               :content (assistant-content response)})]
@@ -57,19 +57,33 @@
       :chat-history   new-chat-history
       :turn           (inc turn)})))
 
-
 (comment
   (clojure.repl.deps/sync-deps)
-  (get-models "http://127.0.0.1:11434" nil)
-  (get-model-info "http://127.0.0.1:11434" nil "nemotron-3-super:cloud")
+  (def base-url "http://127.0.0.1:8080")
+  (def qwen "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:BF16")
+  (get-models base-url nil)
+  [{:id "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:BF16",
+    :aliases ["unsloth/Qwen3.6-35B-A3B-MTP-GGUF:BF16"],
+    :tags [],
+    :object "model",
+    :created 1779309212,
+    :owned_by "llamacpp",
+    :meta
+    {:vocab_type 2,
+     :n_vocab 248320,
+     :n_ctx 262144,
+     :n_ctx_train 262144,
+     :n_embd 2048,
+     :n_params 35505251456,
+     :size 71054950912}}]
 
-  (let [model-id (-> (get-models "http://127.0.0.1:11434" nil) first :id)]
-    (completion "http://127.0.0.1:11434" nil model-id "HI"))
+  (get-model-info base-url nil qwen)
 
-  (-> (step "http://127.0.0.1:11434" nil "nemotron-3-super:cloud" "HI")
+  (let [model-id (-> (get-models base-url nil) first :id)]
+    (completion base-url nil model-id "HI"))
+
+  (-> (step base-url nil "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:BF16"  "HI")
       (assoc :message "What is the weather in Tokyo?")
       (step)
       (assoc :message "how do you know that?")
-      (step))
-
-  )
+      (step)))

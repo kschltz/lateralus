@@ -63,7 +63,41 @@
    :model          nil
    :on-response    nil
    :on-error       nil
-   :message-queue  []})
+   :message-queue  []
+   ;; Memory config (env var fallbacks)
+   :memory-relevant-limit nil
+   :memory-recent-limit   nil
+   :memory-strategy       nil
+   :memory-embedding-dims nil})
+
+;; ---- Env Var Defaults ----
+
+(defn- env-or
+  "Get value from env var, or fall back to default. Parses integers."
+  ([env-key default]
+   (env-or env-key default nil))
+  ([env-key default parse-fn]
+   (if-let [v (System/getenv env-key)]
+     (if parse-fn
+       (try (parse-fn v) (catch Exception _ default))
+       v)
+     default)))
+
+(def ^:private memory-defaults
+  "Defaults for memory config, with env var fallbacks."
+  {:memory-relevant-limit (fn [] (env-or "LATERALUS_MEMORY_RELEVANT_LIMIT" 5 #(Integer/parseInt %)))
+   :memory-recent-limit   (fn [] (env-or "LATERALUS_MEMORY_RECENT_LIMIT" 10 #(Integer/parseInt %)))
+   :memory-strategy       (fn [] (env-or "LATERALUS_MEMORY_STRATEGY" :hybrid keyword))
+   :memory-embedding-dims (fn [] (env-or "LATERALUS_MEMORY_EMBEDDING_DIMS" 384 #(Integer/parseInt %)))})
+
+(defn- resolve-memory-config
+  "Resolve memory config: explicit opt > env var > default."
+  [opts]
+  (into {}
+    (for [[k default-fn] memory-defaults]
+      [k (if (contains? opts k)
+           (opts k)
+           (default-fn))])))
 
 ;; ---- Agent Construction ----
 
@@ -71,33 +105,41 @@
   "Create a new agent (Clojure agent reference type) holding state.
 
   Options:
-    :base-url        — LLM API base URL
-    :api-key         — API key (optional)
-    :model           — Model ID
-    :turns           — Max turns (default 100)
-    :tools           — Tool vector (optional)
-    :initial         — Initial messages (optional)
-    :session-id      — Session ID for memory (optional, enables memory)
-    :memory-backend  — Memory backend (default :datalevin)
-    :on-response     — Default handler fn, called on every response (optional)
-    :on-error        — Error handler fn (ag, exception) => anything (optional, default: stop + rethrow)
+    :base-url                  — LLM API base URL
+    :api-key                   — API key (optional)
+    :model                     — Model ID
+    :turns                     — Max turns (default 100)
+    :tools                     — Tool vector (optional)
+    :initial                   — Initial messages (optional)
+    :session-id                — Session ID for memory (optional, enables memory)
+    :memory-backend            — Memory backend (default :datalevin)
+    :memory-relevant-limit     — Relevant messages to retrieve (env: LATERALUS_MEMORY_RELEVANT_LIMIT, default 5)
+    :memory-recent-limit       — Recent context messages (env: LATERALUS_MEMORY_RECENT_LIMIT, default 10)
+    :memory-strategy           — Composition strategy (env: LATERALUS_MEMORY_STRATEGY, default :hybrid)
+    :memory-embedding-dims     — Embedding dimensions (env: LATERALUS_MEMORY_EMBEDDING_DIMS, default 384)
+    :on-response               — Default handler fn, called on every response (optional)
+    :on-error                  — Error handler fn (ag, exception) => anything (optional, default: stop + rethrow)
 
   Returns: Clojure agent reference type."
   ([]
    (make-agent {}))
   ([opts]
    (let [{:keys [base-url api-key model turns tools initial
-                 session-id memory-backend on-response on-error]
+                 session-id memory-backend on-response on-error
+                 memory-relevant-limit memory-recent-limit memory-strategy memory-embedding-dims]
           :or   {turns 100 tools [] initial [] memory-backend :datalevin}} opts
+         mem-cfg        (resolve-memory-config opts)
          memory-enabled? (contains? opts :session-id)
          session-id'     (when memory-enabled?
                            (or session-id (str "session-" (System/currentTimeMillis))))
+         embedding-dims (:memory-embedding-dims mem-cfg)
          memory-conn     (when memory-enabled?
                            (try
                              (:connection (memory/create-session
                                            {:backend memory-backend
                                             :session-id session-id'
-                                            :model model}))
+                                            :model model
+                                            :embedding-dims embedding-dims}))
                              (catch Exception e
                                (println "Warning: failed to create memory session:"
                                         (.getMessage e))
@@ -113,7 +155,11 @@
                                  :memory-conn    memory-conn
                                  :memory-backend memory-backend
                                  :on-response   on-response
-                                 :on-error      on-error})))))
+                                 :on-error      on-error
+                                 :memory-relevant-limit (:memory-relevant-limit mem-cfg)
+                                 :memory-recent-limit   (:memory-recent-limit mem-cfg)
+                                 :memory-strategy       (:memory-strategy mem-cfg)
+                                 :memory-embedding-dims (:memory-embedding-dims mem-cfg)})))))
 
 ;; ---- Memory Helpers (pure, take state map) ----
 
@@ -139,8 +185,12 @@
         memory-msgs))
 
 (defn- compose-context
-  "Build memory-augmented context for the LLM call."
-  [{:keys [session-id memory-conn memory-backend history]} user-input]
+  "Build memory-augmented context for the LLM call.
+   Uses :memory-relevant-limit and :memory-recent-limit from state."
+  [{:keys [session-id memory-conn memory-backend history
+           memory-relevant-limit memory-recent-limit]
+    :or   {memory-relevant-limit 5 memory-recent-limit 10}}
+   user-input]
   (if (and memory-conn session-id)
     (let [relevant (try
                      (memory/retrieve-relevant
@@ -148,10 +198,10 @@
                         :session-id session-id
                         :connection memory-conn
                         :query user-input
-                        :limit 5})
+                        :limit memory-relevant-limit})
                      (catch Exception _ []))
-          recent (take-last 10 history)]
-      (vec (into (memory-msgs->chat-msgs relevant) history)))
+          recent (take-last memory-recent-limit history)]
+      (vec (into (memory-msgs->chat-msgs relevant) recent)))
     (vec history)))
 
 (defn- store-exchange
@@ -370,6 +420,13 @@
   [ag]
   (:session-id @ag))
 
+(defn get-memory-config
+  "Get the current memory configuration map."
+  [ag]
+  (select-keys @ag [:memory-relevant-limit :memory-recent-limit
+                       :memory-strategy :memory-embedding-dims
+                       :memory-backend :session-id]))
+
 (defn set-on-response!
   "Set or replace the default handler fn called on every response.
    Pass nil to remove. Returns the agent."
@@ -478,6 +535,17 @@
   (agent/add-repl-eval-tool! ag)
   (agent/add-repl-nrepl-tool! ag {:port 59500})
   (agent/get-tools ag)
+
+  ;; === Memory config (env vars: LATERALUS_MEMORY_*) ===
+  (def ag (agent/make-agent {:base-url "https://api-inference.huggingface.co"
+                              :api-key (System/getenv "HF_TOKEN")
+                              :model "stepfun-ai/Step-3.5-Flash:fastest"
+                              :session-id "my-session"
+                              :memory-relevant-limit 10
+                              :memory-recent-limit   20
+                              :memory-embedding-dims 384}))
+  (agent/get-memory-config ag)
+  ;; => {:memory-relevant-limit 10, :memory-recent-limit 20, ...}
 
   ;; === Direct memory API ===
   (require '[kschltz.agent.memory :as memory])

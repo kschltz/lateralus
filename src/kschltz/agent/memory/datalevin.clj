@@ -25,8 +25,12 @@
 
 (defn create-session-store
   [session-id opts]
-  (let [db-path (str "sessions/" session-id)
-        merged-opts (merge default-opts opts)
+  (let [db-path     (str "sessions/" session-id)
+        merged-opts (cond-> (merge default-opts opts)
+                      (:embedding-dims opts) (assoc-in [:vector-opts :dimensions] (:embedding-dims opts)))
+        merged-opts (if (:embedding-dims opts)
+                      (assoc-in merged-opts [:vector-domains "messages" :dimensions] (:embedding-dims opts))
+                      merged-opts)
         conn (try
                (d/create-conn db-path schema merged-opts)
                (catch Throwable _

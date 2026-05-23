@@ -37,8 +37,9 @@
                   {:opts opts})))
 
 (defmethod create-session :datalevin
-  [{:keys [session-id model] :as opts}]
-  (let [conn (dlevin/create-session-store session-id (select-keys opts [:model]))]
+  [{:keys [session-id model embedding-dims] :as opts}]
+  (let [conn (dlevin/create-session-store session-id (cond-> (select-keys opts [:model])
+                                                embedding-dims (assoc :embedding-dims embedding-dims)))]
     {:connection conn}))
 
 (defmulti store-message

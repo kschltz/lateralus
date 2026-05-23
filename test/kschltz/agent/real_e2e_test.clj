@@ -16,7 +16,7 @@
     (catch Exception _ false)))
 
 (defn- ollama-model []
-  (or (System/getenv "OLLAMA_MODEL") "qwen3.6:35b-a3b-coding-bf16"))
+  (or (System/getenv "OLLAMA_MODEL") "deepseek-v4-flash:cloud"))
 
 (def ^:private base-url "http://localhost:11434")
 
@@ -53,7 +53,7 @@
                                            :turns    2})
             p1          (core/send-message! ag "Say the word 'banana' and nothing else.")
             loop-future (future (core/start! ag))
-            r1          (deref p1 30000 ::timeout)]
+            r1          (deref p1 120000 ::timeout)]
         (is (not= ::timeout r1) "promise should be delivered")
         (is (string? r1))
         (is (.contains (.toLowerCase ^String r1) "banana")
@@ -194,7 +194,7 @@
             p              (core/send-message! ag "Say hello."
                                  (fn [_] (swap! handler-calls inc)))
             loop-future    (future (core/start! ag))
-            result         (deref p 30000 ::timeout)]
+            result         (deref p 120000 ::timeout)]
         (is (not= ::timeout result) "promise should be delivered")
         (is (string? result))
         (Thread/sleep 500)

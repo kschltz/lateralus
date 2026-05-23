@@ -3,7 +3,7 @@
         hato/hato {:mvn/version "1.0.0"}
         org.replikativ/proximum {:mvn/version "0.1.25"}
         cheshire/cheshire {:mvn/version "6.2.0"}
-        datalevin/datalevin {:mvn/version "0.10.0"}}
+        datalevin/datalevin {:mvn/version "0.10.7"}}
  :aliases
  {:run-m {:main-opts ["-m" "kschltz.lateralus"]}
   :run-x {:ns-default kschltz.lateralus

@@ -33,6 +33,22 @@
                          (assoc :headers (auth-headers api-key))))
         :body)))
 
+(defn embed
+  "Call an OpenAI-compatible /embeddings endpoint.
+   Returns the embedding vector, or nil on failure."
+  [base-url api-key model text]
+  (try
+    (let [url  (format "%s/v1/embeddings" base-url)
+          body {:model model :input text}
+          resp (hato/post url (cond-> {:content-type :json
+                                       :form-params  body
+                                       :as           :json}
+                                api-key
+                                (assoc :headers (auth-headers api-key))))]
+      (get-in resp [:body :data 0 :embedding]))
+    (catch Exception _
+      nil)))
+
 (defn assistant-content [response]
   (get-in response [:choices 0 :message :content]))
 

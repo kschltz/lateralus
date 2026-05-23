@@ -104,7 +104,7 @@
 
       :else
       (let [base-url  (or (:base-url opts) (System/getenv "LATERALUS_BASE_URL") "http://localhost:11434")
-            model      (or (:model opts) (System/getenv "LATERALUS_MODEL") "qwen3.6:35b-a3b-coding-bf16")
+            model      (or (:model opts) (System/getenv "LATERALUS_MODEL") "deepseek-v4-flash:cloud")
             api-key    (or (:api-key opts) (System/getenv "LATERALUS_API_KEY"))
             turns      (if (:turns opts) (Integer/parseInt (:turns opts)) 5)
             session-id (or (:session opts) (System/getenv "LATERALUS_SESSION"))

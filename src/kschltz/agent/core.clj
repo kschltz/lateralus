@@ -19,13 +19,13 @@
 ;;
 ;; ;; Create and start (local Ollama)
 ;; (def ag (agent/make-agent {:base-url "http://localhost:11434"
-;;                            :model "qwen3.6:35b-a3b-coding-bf16"
+;;                            :model "deepseek-v4-flash:cloud"
 ;;                            :turns 5}))
 ;; (future (agent/start! ag))
 ;;
 ;; ;; With session memory + tools
 ;; (def ag (agent/make-agent {:base-url "http://localhost:11434"
-;;                            :model "qwen3.6:35b-a3b-coding-bf16"
+;;                            :model "deepseek-v4-flash:cloud"
 ;;                            :turns 5
 ;;                            :session-id "my-session"}))
 ;; (agent/add-repl-eval-tool! ag)
@@ -155,7 +155,9 @@
                                            {:backend memory-backend
                                             :session-id session-id'
                                             :model model
-                                            :embedding-dims embedding-dims}))
+                                            :embedding-dims embedding-dims
+                                            :base-url base-url
+                                            :api-key api-key}))
                              (catch Exception e
                                (println "Warning: failed to create memory session:"
                                         (.getMessage e))
@@ -623,14 +625,14 @@
   ;; === Create and start (local Ollama) ===
   (require '[kschltz.agent.core :as agent])
   (def ag (agent/make-agent {:base-url "http://localhost:11434"
-                              :model "qwen3.6:35b-a3b-coding-bf16"
+                              :model "deepseek-v4-flash:cloud"
                               :turns 5}))
   (agent/add-repl-eval-tool! ag)
   (future (agent/start! ag))
 
   ;; === With session memory + on-response handler ===
   (def ag (agent/make-agent {:base-url    "http://localhost:11434"
-                              :model       "qwen3.6:35b-a3b-coding-bf16"
+                              :model       "deepseek-v4-flash:cloud"
                               :turns       5
                               :session-id  "my-session"
                               :on-response (fn [r] (println "Agent:" r))}))
@@ -650,6 +652,7 @@
   ;; Non-blocking check
   (realized? p2)
 
+  
   (agent/queue-size ag)
 
   ;; === One-shot (no loop needed) ===
@@ -684,7 +687,7 @@
   ;; Env vars: LATERALUS_MEMORY_RELEVANT_LIMIT, LATERALUS_MEMORY_RECENT_LIMIT,
   ;;           LATERALUS_MEMORY_STRATEGY, LATERALUS_MEMORY_EMBEDDING_DIMS
   (def ag (agent/make-agent {:base-url  "http://localhost:11434"
-                              :model     "qwen3.6:35b-a3b-coding-bf16"
+                              :model     "deepseek-v4-flash:cloud"
                               :turns     5
                               :session-id "my-session"
                               :memory-relevant-limit 10
@@ -696,7 +699,7 @@
   (require '[kschltz.agent.memory :as memory])
   (def conn (memory/create-session {:backend    :datalevin
                                       :session-id "demo"
-                                      :model      "qwen3.6:35b-a3b-coding-bf16"}))
+                                      :model      "deepseek-v4-flash:cloud"}))
   (memory/store-message {:backend    :datalevin
                          :session-id "demo"
                          :connection (:connection conn)

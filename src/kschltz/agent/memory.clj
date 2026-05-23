@@ -37,10 +37,13 @@
                   {:opts opts})))
 
 (defmethod create-session :datalevin
-  [{:keys [session-id model embedding-dims] :as opts}]
-  (let [conn (dlevin/create-session-store session-id (cond-> (select-keys opts [:model])
-                                                embedding-dims (assoc :embedding-dims embedding-dims)))]
-    {:connection conn}))
+  [{:keys [session-id model embedding-dims base-url api-key] :as opts}]
+  (let [store (dlevin/create-session-store session-id
+                     (cond-> (select-keys opts [:model])
+                       embedding-dims (assoc :embedding-dims embedding-dims)
+                       base-url      (assoc :base-url base-url)
+                       api-key       (assoc :api-key api-key)))]
+    {:connection store}))
 
 (defmulti store-message
   "Store a message in the session."

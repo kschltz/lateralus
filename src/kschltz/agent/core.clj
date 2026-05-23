@@ -17,23 +17,35 @@
 ;;
 ;; (require '[kschltz.agent.core :as agent])
 ;;
-;; ;; Create and start
+;; ;; Create and start (local Ollama)
 ;; (def ag (agent/make-agent {:base-url "http://localhost:11434"
-;;                            :model "llama3" :turns 100}))
-;; (agent/start! ag)
+;;                            :model "qwen3.6:35b-a3b-coding-bf16"
+;;                            :turns 5}))
+;; (future (agent/start! ag))
 ;;
-;; ;; With session memory
+;; ;; With session memory + tools
 ;; (def ag (agent/make-agent {:base-url "http://localhost:11434"
-;;                            :model "llama3" :turns 100
+;;                            :model "qwen3.6:35b-a3b-coding-bf16"
+;;                            :turns 5
 ;;                            :session-id "my-session"}))
-;; (agent/start! ag)
+;; (agent/add-repl-eval-tool! ag)
+;; (future (agent/start! ag))
 ;;
 ;; ;; Send messages to the queue (loop must be running)
-;; (agent/send-message! ag "Hello, who are you?")
-;; (agent/send-message! ag "Write a haiku about Clojure")
+;; ;; Returns a promise — deref to block
+;; (def p1 (agent/send-message! ag "Hello, who are you?"))
+;; @p1
+;;
+;; ;; With handler callback (runs async on response)
+;; (def p2 (agent/send-message! ag "Evaluate (+ 1 2 3)" (fn [r] (println "Got:" r))))
+;; @p2
+;;
+;; ;; Non-blocking check
+;; (realized? p2)
+;;
 ;; (agent/queue-size ag)
 ;;
-;; ;; One-shot without the loop
+;; ;; One-shot (no loop needed)
 ;; (agent/chat! ag "What is Clojure?")
 ;;
 ;; ;; Inspect state
@@ -68,7 +80,9 @@
    :memory-relevant-limit nil
    :memory-recent-limit   nil
    :memory-strategy       nil
-   :memory-embedding-dims nil})
+   :memory-embedding-dims nil
+   ;; Tool config
+   :max-tool-calls nil})
 
 ;; ---- Env Var Defaults ----
 
@@ -83,18 +97,19 @@
        v)
      default)))
 
-(def ^:private memory-defaults
+(def ^:private config-defaults
   "Defaults for memory config, with env var fallbacks."
   {:memory-relevant-limit (fn [] (env-or "LATERALUS_MEMORY_RELEVANT_LIMIT" 5 #(Integer/parseInt %)))
    :memory-recent-limit   (fn [] (env-or "LATERALUS_MEMORY_RECENT_LIMIT" 10 #(Integer/parseInt %)))
    :memory-strategy       (fn [] (env-or "LATERALUS_MEMORY_STRATEGY" :hybrid keyword))
-   :memory-embedding-dims (fn [] (env-or "LATERALUS_MEMORY_EMBEDDING_DIMS" 384 #(Integer/parseInt %)))})
+   :memory-embedding-dims (fn [] (env-or "LATERALUS_MEMORY_EMBEDDING_DIMS" 384 #(Integer/parseInt %)))
+   :max-tool-calls       (fn [] (env-or "LATERALUS_MAX_TOOL_CALLS" 10 #(Integer/parseInt %)))})
 
-(defn- resolve-memory-config
-  "Resolve memory config: explicit opt > env var > default."
+(defn- resolve-config
+  "Resolve config: explicit opt > env var > default."
   [opts]
   (into {}
-    (for [[k default-fn] memory-defaults]
+    (for [[k default-fn] config-defaults]
       [k (if (contains? opts k)
            (opts k)
            (default-fn))])))
@@ -117,6 +132,7 @@
     :memory-recent-limit       — Recent context messages (env: LATERALUS_MEMORY_RECENT_LIMIT, default 10)
     :memory-strategy           — Composition strategy (env: LATERALUS_MEMORY_STRATEGY, default :hybrid)
     :memory-embedding-dims     — Embedding dimensions (env: LATERALUS_MEMORY_EMBEDDING_DIMS, default 384)
+    :max-tool-calls            — Max tool call rounds per message (env: LATERALUS_MAX_TOOL_CALLS, default 10)
     :on-response               — Default handler fn, called on every response (optional)
     :on-error                  — Error handler fn (ag, exception) => anything (optional, default: stop + rethrow)
 
@@ -128,11 +144,11 @@
                  session-id memory-backend on-response on-error
                  memory-relevant-limit memory-recent-limit memory-strategy memory-embedding-dims]
           :or   {turns 100 tools [] initial [] memory-backend :datalevin}} opts
-         mem-cfg        (resolve-memory-config opts)
+         cfg           (resolve-config opts)
          memory-enabled? (contains? opts :session-id)
          session-id'     (when memory-enabled?
                            (or session-id (str "session-" (System/currentTimeMillis))))
-         embedding-dims (:memory-embedding-dims mem-cfg)
+         embedding-dims (:memory-embedding-dims cfg)
          memory-conn     (when memory-enabled?
                            (try
                              (:connection (memory/create-session
@@ -156,10 +172,11 @@
                                  :memory-backend memory-backend
                                  :on-response   on-response
                                  :on-error      on-error
-                                 :memory-relevant-limit (:memory-relevant-limit mem-cfg)
-                                 :memory-recent-limit   (:memory-recent-limit mem-cfg)
-                                 :memory-strategy       (:memory-strategy mem-cfg)
-                                 :memory-embedding-dims (:memory-embedding-dims mem-cfg)})))))
+                                 :memory-relevant-limit (:memory-relevant-limit cfg)
+                                 :memory-recent-limit   (:memory-recent-limit cfg)
+                                 :memory-strategy       (:memory-strategy cfg)
+                                 :memory-embedding-dims (:memory-embedding-dims cfg)
+                                 :max-tool-calls        (:max-tool-calls cfg)})))))
 
 ;; ---- Memory Helpers (pure, take state map) ----
 
@@ -223,15 +240,94 @@
 ;; ---- LLM ----
 
 (defn- llm-call
-  "Call the LLM API. Uses memory-augmented context when available."
-  [{:keys [base-url api-key model] :as state} message]
-  (if (and base-url model)
-    (let [ctx      (compose-context state message)
-          response (http/completion base-url api-key model message
+  "Call the LLM API. Uses memory-augmented context when available.
+   When tools are registered, prepends tool manifest to the user message."
+  ([state message]
+   (llm-call state message nil))
+  ([state message manifest]
+   (if (and (:base-url state) (:model state))
+     (let [user-msg (if manifest
+                      (str manifest "\n\n" message)
+                      message)
+           ctx      (compose-context state user-msg)
+           response (http/completion (:base-url state) (:api-key state)
+                                    (:model state) user-msg
                                     :chat-history ctx)
-          content  (http/assistant-content response)]
-      (or content "No response from LLM"))
-    "LLM not configured - provide :base-url and :model to make-agent"))
+           content  (http/assistant-content response)]
+       (or content "No response from LLM"))
+     "LLM not configured - provide :base-url and :model to make-agent")))
+
+;; ---- Tool Use ----
+
+(def ^:private tool-call-regex
+  "Regex to extract tool calls from LLM responses.
+   Format: <<<tool:tool-name>>>arguments<<<end>>>
+   Supports multiline arguments."
+  #"<<<tool:(.+?)>>>(.+?)<<<end>>>")
+
+(defn tool-manifest
+  "Build a tool manifest string for the LLM context.
+   Returns nil if no tools are registered."
+  [tools]
+  (when (seq tools)
+    (str "\nYou have access to these tools:\n"
+         (str/join "\n"
+           (for [t tools]
+             (str "- " (:name t) ": " (:description t))))
+         "\n\nTo use a tool, respond with:\n"
+         "<<<tool:tool-name>>>arguments<<<end>>>\n\n"
+         "You may make multiple tool calls in one response.\n"
+         "After receiving tool results, you may respond with more tool calls or a final text answer.\n"
+         "If you need more information to use a tool correctly, ask the user.")))
+
+(defn parse-tool-calls
+  "Extract tool calls from LLM response text.
+   Returns a vector of {:tool \"name\" :args \"...\"} or nil if none found."
+  [text]
+  (when-let [matches (re-seq tool-call-regex text)]
+    (vec (for [[_ name args] matches]
+           {:tool (str/trim name)
+            :args (str/trim args)}))))
+
+(defn- execute-tool-call
+  "Execute a single tool call. Returns {:tool ... :args ... :result ... :error ...}."
+  [tools call]
+  (let [{:keys [tool name] :as _call} call
+        tool-name (:tool call)
+        tool-def  (first (filter #(= (:name %) tool-name) tools))]
+    (if tool-def
+      (try
+        (let [result (tools/tool-call tool-def (:args call))]
+          {:tool   tool-name
+           :args  (:args call)
+           :result result})
+        (catch Exception e
+          {:tool   tool-name
+           :args  (:args call)
+           :error (.getMessage e)}))
+      {:tool   tool-name
+       :args  (:args call)
+       :error (str "Unknown tool: " tool-name)})))
+
+(defn- execute-tool-calls
+  "Execute multiple tool calls in parallel. Returns vector of results."
+  [calls tools]
+  (vec (pmap #(execute-tool-call tools %) calls)))
+
+(defn- format-tool-results
+  "Format tool execution results for the next LLM call."
+  [results]
+  (str "Tool results:\n"
+       (str/join "\n"
+         (for [{:keys [tool args result error]} results]
+           (if error
+             (str tool "(" args ") => Error: " error)
+             (str tool "(" args ") => " result))))))
+
+(defn- strip-tool-calls
+  "Remove tool call markup from text, returning any surrounding text."
+  [text]
+  (str/trim (str/replace text tool-call-regex "")))
 
 ;; ---- Queue Operations ----
 
@@ -266,15 +362,42 @@
   (println (str "Agent error (stopping): " (.getMessage e)))
   (throw e))
 
+(defn- llm-turn
+  "Run one LLM call. If it contains tool calls, execute them and loop.
+   Returns the final text response after all tool calls are resolved.
+   Bounded by max-tool-calls to prevent infinite loops."
+  [ag state user-text]
+  (let [manifest (tool-manifest (:tools state))
+        max-depth (or (:max-tool-calls state) 10)]
+    (loop [ctx-text user-text
+           depth  0]
+      (let [response (llm-call state ctx-text manifest)
+            calls   (when manifest (parse-tool-calls response))]
+        (cond
+          ;; No tool calls — final text response
+          (nil? calls)
+          response
+
+          ;; Too many tool rounds — return what we have
+          (>= depth max-depth)
+          (str response "\n\n[Tool call limit reached]")
+
+          ;; Execute tool calls and continue
+          :else
+          (let [results (execute-tool-calls calls (:tools state))
+                tool-msg (format-tool-results results)]
+            (recur tool-msg (inc depth))))))))
+
 (defn- process-messages
   "Process a batch of drained queue items against the LLM.
+   Handles tool calls in a loop until a final text response.
    Delivers each item's promise and calls its handler.
    Returns updated state map. On error, calls on-error handler."
   [ag state items]
   (let [texts         (mapv :text items)
         combined-input (str/join "\n" texts)]
     (try
-      (let [response (llm-call state combined-input)
+      (let [response (llm-turn ag state combined-input)
             state'   (-> state
                         (assoc :current-response response)
                         (update :history into (map #(array-map :role "user" :content (:text %)) items))
@@ -374,19 +497,21 @@
 
 (defn chat!
   "Send a single message and return the response immediately.
-  Does not use the message queue or require the agent loop.
-  Stores the exchange in session memory if active.
+   Does not use the message queue or require the agent loop.
+   Handles tool calls internally.
+   Stores the exchange in session memory if active.
 
-  Returns: assistant response string"
+   Returns: assistant response string"
   ([ag message]
    (chat! ag message {}))
   ([ag message opts]
    (let [state    @ag
-         response (llm-call (merge state (select-keys opts [:base-url :api-key :model]))
-                           message)]
+         response (llm-turn ag (merge state (select-keys opts [:base-url :api-key :model]))
+                             message)]
      (send ag update :history conj
            {:role "user" :content message}
            {:role "assistant" :content response})
+     (await ag)
      (store-exchange state message response)
      response)))
 
@@ -424,6 +549,14 @@
   "Get the current memory configuration map."
   [ag]
   (select-keys @ag [:memory-relevant-limit :memory-recent-limit
+                       :memory-strategy :memory-embedding-dims
+                       :memory-backend :session-id]))
+
+(defn get-config
+  "Get the full agent configuration map."
+  [ag]
+  (select-keys @ag [:base-url :model :max-turns :max-tool-calls
+                       :memory-relevant-limit :memory-recent-limit
                        :memory-strategy :memory-embedding-dims
                        :memory-backend :session-id]))
 
@@ -481,31 +614,35 @@
      tool)))
 
 (comment
-  ;; === Create and start ===
+  ;; === Create and start (local Ollama) ===
   (require '[kschltz.agent.core :as agent])
-  (def ag (agent/make-agent {:base-url "https://api-inference.huggingface.co"
-                             :api-key (System/getenv "HF_TOKEN") :model "stepfun-ai/Step-3.5-Flash:fastest" :turns 100}))
+  (def ag (agent/make-agent {:base-url "http://localhost:11434"
+                              :model "qwen3.6:35b-a3b-coding-bf16"
+                              :turns 5}))
+  (agent/add-repl-eval-tool! ag)
   (future (agent/start! ag))
 
-  ;; === With session memory ===
-  (def ag (agent/make-agent {:base-url "https://api-inference.huggingface.co"
-                             :on-response (fn [r] (println "Agent:" r))
-                             :api-key (System/getenv "HF_TOKEN") :model "stepfun-ai/Step-3.5-Flash:fastest" :turns 100
-                             :session-id "my-session"}))
+  ;; === With session memory + on-response handler ===
+  (def ag (agent/make-agent {:base-url    "http://localhost:11434"
+                              :model       "qwen3.6:35b-a3b-coding-bf16"
+                              :turns       5
+                              :session-id  "my-session"
+                              :on-response (fn [r] (println "Agent:" r))}))
+  (agent/add-repl-eval-tool! ag)
   (future (agent/start! ag))
 
   ;; === Send messages to the queue ===
   ;; Returns a promise — deref to block for response
   (def p1 (agent/send-message! ag "Hello, who are you?"))
-  @p1  ;;=> "I am a Clojure agent..."
+  @p1
 
   ;; With handler callback (runs async on response)
-  (def p2 (agent/send-message! ag "Write a haiku"
-             (fn [r] (println "Got response:" r))))
-  @p2  ;; also works
+  (def p2 (agent/send-message! ag "Evaluate (+ 1 2 3)"
+             (fn [r] (println "Got:" r))))
+  @p2
 
   ;; Non-blocking check
-  (realized? p2)  ;;=> true|false
+  (realized? p2)
 
   (agent/queue-size ag)
 
@@ -516,6 +653,7 @@
   (agent/running? ag)
   (agent/get-history ag)
   (agent/get-session-id ag)
+  (agent/get-config ag)
 
   ;; === Interrupt or reset ===
   (agent/stop! ag)
@@ -523,43 +661,44 @@
 
   ;; === Default response handler (runs on every response) ===
   (agent/set-on-response! ag (fn [r] (println "Agent:" r)))
-  (agent/set-on-error! ag nil)  ;; reset default handler
+  (agent/set-on-error! ag nil)
 
   ;; === Error handler ===
   ;; Default: stop agent, log error, rethrow
   ;; Custom: e.g. log and continue
   (agent/set-on-error! ag (fn [ag e] (println "Error:" (.getMessage e))))
-  (agent/set-on-error! ag nil)  ;; restore default
+  (agent/set-on-error! ag nil)
 
   ;; === Add tools ===
   (agent/add-repl-eval-tool! ag)
   (agent/add-repl-nrepl-tool! ag {:port 59500})
   (agent/get-tools ag)
 
-  ;; === Memory config (env vars: LATERALUS_MEMORY_*) ===
-  (def ag (agent/make-agent {:base-url "https://api-inference.huggingface.co"
-                              :api-key (System/getenv "HF_TOKEN")
-                              :model "stepfun-ai/Step-3.5-Flash:fastest"
+  ;; === Memory config ===
+  ;; Env vars: LATERALUS_MEMORY_RELEVANT_LIMIT, LATERALUS_MEMORY_RECENT_LIMIT,
+  ;;           LATERALUS_MEMORY_STRATEGY, LATERALUS_MEMORY_EMBEDDING_DIMS
+  (def ag (agent/make-agent {:base-url  "http://localhost:11434"
+                              :model     "qwen3.6:35b-a3b-coding-bf16"
+                              :turns     5
                               :session-id "my-session"
                               :memory-relevant-limit 10
                               :memory-recent-limit   20
                               :memory-embedding-dims 384}))
-  (agent/get-memory-config ag)
-  ;; => {:memory-relevant-limit 10, :memory-recent-limit 20, ...}
+  (agent/get-config ag)
 
   ;; === Direct memory API ===
   (require '[kschltz.agent.memory :as memory])
-  (def conn (memory/create-session {:backend :datalevin
-                                     :session-id "demo"
-                                     :model "stepfun-ai/Step-3.5-Flash:fastest"}))
-  (memory/store-message {:backend :datalevin
+  (def conn (memory/create-session {:backend    :datalevin
+                                      :session-id "demo"
+                                      :model      "qwen3.6:35b-a3b-coding-bf16"}))
+  (memory/store-message {:backend    :datalevin
                          :session-id "demo"
                          :connection (:connection conn)
-                         :message {:role "user" :text "Hello"}})
-  (memory/retrieve-relevant {:backend :datalevin
-                            :session-id "demo"
-                            :connection (:connection conn)
-                            :query "hello" :limit 5})
-  (memory/close-session {:backend :datalevin
+                         :message    {:role "user" :text "Hello"}})
+  (memory/retrieve-relevant {:backend    :datalevin
+                              :session-id "demo"
+                              :connection (:connection conn)
+                              :query      "hello" :limit 5})
+  (memory/close-session {:backend    :datalevin
                          :connection (:connection conn)})
   )

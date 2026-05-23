@@ -358,3 +358,34 @@
         (core/reset! ag)
         (is (= [] (core/get-history ag)))
         (is (= 0 (:turns @ag)))))))
+
+;; ============================================================
+;; 13. TOOL USE
+;; ============================================================
+
+(deftest e2e-tool-manifest
+  (testing "tool-manifest returns nil when no tools"
+    (is (nil? (core/tool-manifest []))))
+  (testing "tool-manifest includes tool name and description"
+    (let [tools [(repl-tools/repl-eval-tool)]
+          manifest (core/tool-manifest tools)]
+      (is (.contains manifest "repl-eval"))
+      (is (.contains manifest "Evaluate Clojure code"))
+      (is (.contains manifest "<<<tool:")))))
+
+(deftest e2e-parse-tool-calls
+  (testing "parse-tool-calls extracts tool calls from LLM response"
+    (is (nil? (core/parse-tool-calls "Hello, no tools here.")))
+    (is (= [{:tool "repl-eval" :args "(+ 1 2 3)"}]
+           (core/parse-tool-calls "Let me compute that.
+<<<tool:repl-eval>>>(+ 1 2 3)<<<end>>>")))
+    (is (= [{:tool "repl-eval" :args "(+ 1 2)"}
+            {:tool "repl-eval" :args "(* 3 4)"}]
+           (core/parse-tool-calls "<<<tool:repl-eval>>>(+ 1 2)<<<end>>> Some text <<<tool:repl-eval>>>(* 3 4)<<<end>>>")))))
+
+(deftest e2e-tool-manifest-includes-call-format
+  (testing "tool manifest includes usage instructions"
+    (let [manifest (core/tool-manifest [(repl-tools/repl-eval-tool)])]
+      (is (.contains manifest "<<<tool:"))
+      (is (.contains manifest "<<<end>>>"))
+      (is (.contains manifest "You may make multiple tool calls")))))

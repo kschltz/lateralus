@@ -18,12 +18,12 @@
 ;; (require '[kschltz.agent.core :as agent])
 ;;
 ;; ;; Create and start
-;; (def ag (agent/make-agent {:base-url "http://localhost:11434/v1"
+;; (def ag (agent/make-agent {:base-url "http://localhost:11434"
 ;;                            :model "llama3" :turns 100}))
 ;; (agent/start! ag)
 ;;
 ;; ;; With session memory
-;; (def ag (agent/make-agent {:base-url "http://localhost:11434/v1"
+;; (def ag (agent/make-agent {:base-url "http://localhost:11434"
 ;;                            :model "llama3" :turns 100
 ;;                            :session-id "my-session"}))
 ;; (agent/start! ag)
@@ -62,6 +62,7 @@
    :api-key        nil
    :model          nil
    :on-response    nil
+   :on-error       nil
    :message-queue  []})
 
 ;; ---- Agent Construction ----
@@ -79,13 +80,14 @@
     :session-id      — Session ID for memory (optional, enables memory)
     :memory-backend  — Memory backend (default :datalevin)
     :on-response     — Default handler fn, called on every response (optional)
+    :on-error        — Error handler fn (ag, exception) => anything (optional, default: stop + rethrow)
 
   Returns: Clojure agent reference type."
   ([]
    (make-agent {}))
   ([opts]
    (let [{:keys [base-url api-key model turns tools initial
-                 session-id memory-backend on-response]
+                 session-id memory-backend on-response on-error]
           :or   {turns 100 tools [] initial [] memory-backend :datalevin}} opts
          memory-enabled? (contains? opts :session-id)
          session-id'     (when memory-enabled?
@@ -110,7 +112,8 @@
                                  :session-id     session-id'
                                  :memory-conn    memory-conn
                                  :memory-backend memory-backend
-                                 :on-response   on-response})))))
+                                 :on-response   on-response
+                                 :on-error      on-error})))))
 
 ;; ---- Memory Helpers (pure, take state map) ----
 
@@ -205,11 +208,19 @@
 
 ;; ---- Loop ----
 
+(defn- default-error-handler
+  "Default error handler: stop the agent, log the error, rethrow."
+  [ag ^Exception e]
+  (send ag assoc :running false)
+  (await ag)
+  (println (str "Agent error (stopping): " (.getMessage e)))
+  (throw e))
+
 (defn- process-messages
   "Process a batch of drained queue items against the LLM.
    Delivers each item's promise and calls its handler.
-   Returns updated state map."
-  [state items]
+   Returns updated state map. On error, calls on-error handler."
+  [ag state items]
   (let [texts         (mapv :text items)
         combined-input (str/join "\n" texts)]
     (try
@@ -224,12 +235,17 @@
         (store-exchange state' combined-input response)
         state')
       (catch Exception e
-        (let [err-str (str "Error: " (.getMessage e))]
-          (println (str "Error processing messages: " (.getMessage e)))
-          ;; Deliver error to each item's promise + handler
+        (let [on-error (:on-error state)
+              err-str (str "Error: " (.getMessage e))]
+          (when on-error
+            (try (on-error ag e) (catch Exception _)))
           (doseq [item items]
             (deliver-response (merge item (select-keys state [:on-response])) err-str))
-          (assoc state :current-response err-str))))))
+          (if on-error
+            ;; Custom handler: notify done, deliver errors, keep running
+            (assoc state :current-response err-str)
+            ;; Default handler: stop agent and rethrow
+            (default-error-handler ag e)))))))
 
 (defn- agent-loop
   "Main agent loop. Drains message queue each tick, processes as a batch.
@@ -246,7 +262,7 @@
             (do
               (queue-wait state')
               (recur turn))
-            (let [state''   (process-messages state' items)
+            (let [state''   (process-messages ag state' items)
                   next-turn (inc turn)]
               (send ag (fn [_] (assoc state'' :turns next-turn)))
               (if (:current-response state'')
@@ -264,7 +280,7 @@
   (try
     (agent-loop ag)
     (finally
-      (send ag (fn [s] (-> s (assoc :running false) close-memory)))
+      (send ag assoc :running false)
       (await ag)))
   @ag)
 
@@ -362,6 +378,15 @@
   (await ag)
   ag)
 
+(defn set-on-error!
+  "Set or replace the error handler fn. Receives (ag, exception).
+   Default: stop agent, log error, rethrow.
+   Pass nil to restore default. Returns the agent."
+  [ag handler-fn]
+  (send ag assoc :on-error handler-fn)
+  (await ag)
+  ag)
+
 ;; ---- Tool Registration ----
 
 (defn register-tool!
@@ -407,6 +432,7 @@
 
   ;; === With session memory ===
   (def ag (agent/make-agent {:base-url "https://api-inference.huggingface.co"
+                             :on-response (fn [r] (println "Agent:" r))
                              :api-key (System/getenv "HF_TOKEN") :model "stepfun-ai/Step-3.5-Flash:fastest" :turns 100
                              :session-id "my-session"}))
   (future (agent/start! ag))
@@ -437,6 +463,16 @@
   ;; === Interrupt or reset ===
   (agent/stop! ag)
   (agent/reset! ag)
+
+  ;; === Default response handler (runs on every response) ===
+  (agent/set-on-response! ag (fn [r] (println "Agent:" r)))
+  (agent/set-on-error! ag nil)  ;; reset default handler
+
+  ;; === Error handler ===
+  ;; Default: stop agent, log error, rethrow
+  ;; Custom: e.g. log and continue
+  (agent/set-on-error! ag (fn [ag e] (println "Error:" (.getMessage e))))
+  (agent/set-on-error! ag nil)  ;; restore default
 
   ;; === Add tools ===
   (agent/add-repl-eval-tool! ag)

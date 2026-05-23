@@ -261,9 +261,9 @@
 
 (def ^:private tool-call-regex
   "Regex to extract tool calls from LLM responses.
-   Format: <<<tool:tool-name>>>arguments<<<end>>>
+   Format: \u27aatool:tool-name\u27ab Arguments \u27aa/end\u27ab
    Supports multiline arguments."
-  #"<<<tool:(.+?)>>>(.+?)<<<end>>>")
+  #"\u27aatool:(.+?)\u27ab(.+?)\u27aa/end\u27ab")
 
 (defn tool-manifest
   "Build a tool manifest string for the LLM context.
@@ -274,8 +274,7 @@
          (str/join "\n"
            (for [t tools]
              (str "- " (:name t) ": " (:description t))))
-         "\n\nTo use a tool, respond with:\n"
-         "<<<tool:tool-name>>>arguments<<<end>>>\n\n"
+         "To call a tool, write: tool-name in ➪/➫ delimiters with your arguments. Example for repl-eval: ➪tool:repl-eval➫(+ 1 2 3)➪/end➫\n\n"
          "You may make multiple tool calls in one response.\n"
          "After receiving tool results, you may respond with more tool calls or a final text answer.\n"
          "If you need more information to use a tool correctly, ask the user.")))
@@ -370,8 +369,10 @@
   (let [manifest (tool-manifest (:tools state))
         max-depth (or (:max-tool-calls state) 10)]
     (loop [ctx-text user-text
-           depth  0]
-      (let [response (llm-call state ctx-text manifest)
+           depth  0
+           first-call? true]
+      (let [manifest'  (when first-call? manifest)
+            response (llm-call state ctx-text manifest')
             calls   (when manifest (parse-tool-calls response))]
         (cond
           ;; No tool calls — final text response
@@ -384,9 +385,14 @@
 
           ;; Execute tool calls and continue
           :else
-          (let [results (execute-tool-calls calls (:tools state))
-                tool-msg (format-tool-results results)]
-            (recur tool-msg (inc depth))))))))
+          (let [known-names (into #{} (map :name) (:tools state))
+                valid-calls (filterv #(contains? known-names (:tool %)) calls)]
+            (if (empty? valid-calls)
+              ;; No valid tool calls — treat as final text response
+              response
+              (let [results (execute-tool-calls valid-calls (:tools state))
+                    tool-msg (format-tool-results results)]
+                (recur tool-msg (inc depth) false)))))))))
 
 (defn- process-messages
   "Process a batch of drained queue items against the LLM.

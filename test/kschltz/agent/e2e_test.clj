@@ -96,29 +96,24 @@
 
 (deftest e2e-loop-processes-messages
   (testing "start! processes queued messages and delivers promises"
-    (let [ag (fresh-agent {:turns 5})]
-      ;; Queue 2 messages before starting
-      (let [p1 (core/send-message! ag "first")
-            p2 (core/send-message! ag "second")]
-        ;; Start loop in background, will stop after max-turns
-        (let [loop-future (future (core/start! ag))]
-          ;; Wait for promises to be delivered
-          (let [r1 (deref p1 5000 ::timeout)
-                r2 (deref p2 5000 ::timeout)]
-            (is (not= ::timeout r1) "p1 should be delivered")
-            (is (not= ::timeout r2) "p2 should be delivered")
-            (is (.startsWith ^String r1 "Mock response"))
-            (is (.startsWith ^String r2 "Mock response"))
-            ;; Verify history was recorded
-            (is (>= (count (core/get-history ag)) 3)
-                "history should have 2 user msgs + 1 assistant msg")
-            ;; Clean up — stop if still running
-            (when (core/running? ag) (core/stop! ag))
-            @loop-future))))))
+    (let [ag          (fresh-agent {:turns 5})
+          p1          (core/send-message! ag "first")
+          p2          (core/send-message! ag "second")
+          loop-future (future (core/start! ag))
+          r1          (deref p1 5000 ::timeout)
+          r2          (deref p2 5000 ::timeout)]
+      (is (not= ::timeout r1) "p1 should be delivered")
+      (is (not= ::timeout r2) "p2 should be delivered")
+      (is (.startsWith ^String r1 "Mock response"))
+      (is (.startsWith ^String r2 "Mock response"))
+      (is (>= (count (core/get-history ag)) 3)
+          "history should have 2 user msgs + 1 assistant msg")
+      (when (core/running? ag) (core/stop! ag))
+      @loop-future)))
 
 (deftest e2e-loop-increments-turns
   (testing "loop increments turns counter"
-    (let [ag (fresh-agent {:turns 2})]
+    (let [ag          (fresh-agent {:turns 2})]
       (core/send-message! ag "msg1")
       (let [loop-future (future (core/start! ag))]
         @loop-future
@@ -130,32 +125,30 @@
 
 (deftest e2e-on-response-called-on-every-response
   (testing "on-response handler is called for each response"
-    (let [responses (atom [])
-          ag       (fresh-agent {:turns       3
-                                 :on-response (fn [r] (swap! responses conj r))})]
-      (let [p1 (core/send-message! ag "msg1")
-            p2 (core/send-message! ag "msg2")]
-        (let [loop-future (future (core/start! ag))]
-          @p1 @p2
-          ;; Give handlers time to run
-          (Thread/sleep 100)
-          (is (>= (count @responses) 2) "on-response should be called at least twice")
-          (is (every? #(.startsWith ^String % "Mock response") @responses)
-              "on-response should receive mock response strings")
-          (when (core/running? ag) (core/stop! ag))
-          @loop-future)))))
+    (let [responses   (atom [])
+          ag          (fresh-agent {:turns       3
+                                   :on-response (fn [r] (swap! responses conj r))})
+          p1          (core/send-message! ag "msg1")
+          p2          (core/send-message! ag "msg2")
+          loop-future (future (core/start! ag))]
+      @p1 @p2
+      (Thread/sleep 100)
+      (is (>= (count @responses) 2) "on-response should be called at least twice")
+      (is (every? #(.startsWith ^String % "Mock response") @responses)
+          "on-response should receive mock response strings")
+      (when (core/running? ag) (core/stop! ag))
+      @loop-future)))
 
 (deftest e2e-set-on-response-replaces-handler
   (testing "set-on-response! replaces the default handler"
-    (let [calls   (atom [])
-          ag      (fresh-agent {:turns 2})]
+    (let [calls       (atom [])
+          ag          (fresh-agent {:turns 2})]
       (core/set-on-response! ag (fn [r] (swap! calls conj {:tag :first :r r})))
-      (let [p (core/send-message! ag "hello")
+      (let [p           (core/send-message! ag "hello")
             loop-future (future (core/start! ag))]
         @p
         (Thread/sleep 100)
         (is (some #(= :first (:tag %)) @calls))
-        ;; Replace handler
         (core/set-on-response! ag (fn [r] (swap! calls conj {:tag :second :r r})))
         (core/stop! ag)
         @loop-future))))
@@ -167,16 +160,16 @@
 (deftest e2e-per-message-handler-called
   (testing "per-message handler receives the response"
     (let [handler-results (atom [])
-          ag (fresh-agent {:turns 3})]
-      (let [p (core/send-message! ag "hello"
-                (fn [r] (swap! handler-results conj r)))
-            loop-future (future (core/start! ag))]
-        @p
-        (Thread/sleep 100)
-        (is (>= (count @handler-results) 1) "handler should be called")
-        (is (.startsWith ^String (first @handler-results) "Mock response"))
-        (when (core/running? ag) (core/stop! ag))
-        @loop-future))))
+          ag              (fresh-agent {:turns 3})
+          p               (core/send-message! ag "hello"
+                                (fn [r] (swap! handler-results conj r)))
+          loop-future     (future (core/start! ag))]
+      @p
+      (Thread/sleep 100)
+      (is (>= (count @handler-results) 1) "handler should be called")
+      (is (.startsWith ^String (first @handler-results) "Mock response"))
+      (when (core/running? ag) (core/stop! ag))
+      @loop-future)))
 
 ;; ============================================================
 ;; 6. ON-ERROR HANDLER
@@ -184,13 +177,13 @@
 
 (deftest e2e-custom-on-error-handler-called
   (testing "custom on-error handler receives the exception"
-    (let [errors (atom [])
-          ag    (fresh-agent {:turns    3
-                              :on-error (fn [_ag e]
-                                           (swap! errors conj (.getMessage e)))})]
+    (let [errors       (atom [])
+          ag           (fresh-agent {:turns    3
+                                     :on-error (fn [_ag e]
+                                                   (swap! errors conj (.getMessage e)))})]
       ;; Override LLM to throw
       (with-redefs [http/completion (fn [& _] (throw (Exception. "LLM connection refused")))]
-        (let [p (core/send-message! ag "trigger error")
+        (let [p           (core/send-message! ag "trigger error")
               loop-future (future (try (core/start! ag) (catch Exception _ nil)))]
           ;; The custom handler is a notification; loop continues
           (Thread/sleep 500)
@@ -206,7 +199,7 @@
   (testing "default error handler stops agent and rethrows"
     (let [ag (fresh-agent {:turns 3})]
       (with-redefs [http/completion (fn [& _] (throw (Exception. "fatal error")))]
-        (let [p (core/send-message! ag "trigger error")]
+        (let [_p (core/send-message! ag "trigger error")]
           (is (thrown? Exception (core/start! ag)))
           (is (false? (core/running? ag))))))))
 
@@ -216,17 +209,16 @@
 
 (deftest e2e-chat!-returns-response
   (testing "chat! makes a single LLM call and returns response"
-    (let [ag (fresh-agent {})]
-      (let [resp (core/chat! ag "What is 2+2?")]
-        (await ag)
-        (is (.startsWith ^String resp "Mock response"))
-        (is (>= (count (core/get-history ag)) 2))))))
+    (let [ag   (fresh-agent {})
+          resp (core/chat! ag "What is 2+2?")]
+      (await ag)
+      (is (.startsWith ^String resp "Mock response"))
+      (is (>= (count (core/get-history ag)) 2)))))
 
 (deftest e2e-chat!-records-history
   (testing "chat! adds user + assistant to history"
     (let [ag (fresh-agent {})]
       (core/chat! ag "hello")
-      (await ag)
       (await ag)
       (let [h (core/get-history ag)]
         (is (some #(= "user" (:role %)) h))
@@ -264,25 +256,23 @@
 
 (deftest e2e-memory-stores-and-retrieves
   (testing "agent loop stores exchanges in memory"
-    (let [ag (fresh-agent {:turns      3
-                           :session-id "e2e-store-test"})]
-      ;; Send a message and run the loop
-      (let [p (core/send-message! ag "remember this")]
-        (let [loop-future (future (core/start! ag))]
-          @p
-          (Thread/sleep 200)
-          ;; Check memory has stored messages
-          (let [conn (core/get-memory-conn ag)]
-            (is (some? conn) "memory connection should exist")
-            (let [results (memory/retrieve-relevant
-                            {:backend    :datalevin
-                             :session-id "e2e-store-test"
-                             :connection conn
-                             :query      "remember"
-                             :limit      5})]
-              (is (some? results) "should retrieve results from memory")))
-          (when (core/running? ag) (core/stop! ag))
-          @loop-future)))))
+    (let [ag          (fresh-agent {:turns      3
+                                     :session-id "e2e-store-test"})
+          p           (core/send-message! ag "remember this")
+          loop-future (future (core/start! ag))]
+      @p
+      (Thread/sleep 200)
+      (let [conn    (core/get-memory-conn ag)
+            results (memory/retrieve-relevant
+                       {:backend    :datalevin
+                        :session-id "e2e-store-test"
+                        :connection conn
+                        :query      "remember"
+                        :limit      5})]
+        (is (some? conn) "memory connection should exist")
+        (is (some? results) "should retrieve results from memory"))
+      (when (core/running? ag) (core/stop! ag))
+      @loop-future)))
 
 ;; ============================================================
 ;; 10. RESET
@@ -322,10 +312,10 @@
   (testing "complete agent lifecycle"
     (let [on-resp-calls (atom 0)
           handler-calls  (atom 0)
-          ag (fresh-agent {:turns       5
-                           :session-id  "lifecycle-test"
-                           :on-response (fn [_] (swap! on-resp-calls inc))
-                           :tools       [(repl-tools/repl-eval-tool)]})]
+          ag             (fresh-agent {:turns       5
+                                      :session-id  "lifecycle-test"
+                                      :on-response (fn [_] (swap! on-resp-calls inc))
+                                      :tools       [(repl-tools/repl-eval-tool)]})]
 
       ;; Phase 1: Initial state
       (is (false? (core/running? ag)))
@@ -334,39 +324,37 @@
       (is (= 1 (count (core/get-tools ag))))
 
       ;; Phase 2: Send message with handler, start loop
-      (let [p (core/send-message! ag "hello"
-                (fn [_] (swap! handler-calls inc)))
-            loop-future (future (core/start! ag))]
-        (let [result (deref p 5000 ::timeout)]
-          (is (not= ::timeout result) "promise should be delivered")
-          (is (.startsWith ^String result "Mock response"))
+      (let [p           (core/send-message! ag "hello"
+                              (fn [_] (swap! handler-calls inc)))
+            loop-future (future (core/start! ag))
+            result      (deref p 5000 ::timeout)]
+        (is (not= ::timeout result) "promise should be delivered")
+        (is (.startsWith ^String result "Mock response"))
 
-          (Thread/sleep 200)
+        (Thread/sleep 200)
 
-          ;; on-response should have been called
-          (is (>= @on-resp-calls 1) "on-response handler called")
-          ;; per-message handler should have been called
-          (is (>= @handler-calls 1) "per-message handler called")
+        (is (>= @on-resp-calls 1) "on-response handler called")
+        (is (>= @handler-calls 1) "per-message handler called")
 
-          ;; Phase 3: chat! one-shot
-          (let [resp (core/chat! ag "one-shot")]
-            (is (.startsWith ^String resp "Mock response"))
-            (is (>= (count (core/get-history ag)) 4)))
+        ;; Phase 3: chat! one-shot
+        (let [resp (core/chat! ag "one-shot")]
+          (is (.startsWith ^String resp "Mock response"))
+          (is (>= (count (core/get-history ag)) 4)))
 
-          ;; Phase 4: Verify memory was stored
-          (let [conn (core/get-memory-conn ag)]
-            (is (some? conn))
-            (let [results (memory/retrieve-relevant
-                            {:backend    :datalevin
-                             :session-id "lifecycle-test"
-                             :connection conn
-                             :query      "hello"
-                             :limit      5})]
-              (is (some? results))))
+        ;; Phase 4: Verify memory was stored
+        (let [conn    (core/get-memory-conn ag)
+              results (memory/retrieve-relevant
+                         {:backend    :datalevin
+                          :session-id "lifecycle-test"
+                          :connection conn
+                          :query      "hello"
+                          :limit      5})]
+          (is (some? conn))
+          (is (some? results)))
 
-          ;; Phase 5: Stop and reset
-          (when (core/running? ag) (core/stop! ag))
-          @loop-future
-          (core/reset! ag)
-          (is (= [] (core/get-history ag)))
-          (is (= 0 (:turns @ag))))))))
+        ;; Phase 5: Stop and reset
+        (when (core/running? ag) (core/stop! ag))
+        @loop-future
+        (core/reset! ag)
+        (is (= [] (core/get-history ag)))
+        (is (= 0 (:turns @ag)))))))

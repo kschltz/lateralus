@@ -3,6 +3,27 @@
   (:require [clojure.string :as str]
             [datalevin.core :as d]))
 
+(def ^:private embedding-available? (atom nil))
+
+(defn- check-embedding-available?
+  "Test if embedding neighbors query works. Caches result."
+  [conn session-id]
+  (when (nil? @embedding-available?)
+    (reset! embedding-available?
+      (try
+        (when-let [db (try (d/db conn) (catch Exception _ nil))]
+          (d/q '[:find ?id .
+                 :in $ ?q ?sid ?top
+                 :where
+                 [(embedding-neighbors $ :msg/text ?q {:top ?top}) [[?e _ _]]]
+                 [?e :msg/id ?id]
+                 [?e :msg/session ?sid]]
+               db "test" session-id 1))
+        true
+        (catch Exception _
+          false))))
+  @embedding-available?)
+
 (def ^:private schema
   {:session/id         {:db/valueType :db.type/string :db/unique :db.unique/identity}
    :session/model      {:db/valueType :db.type/string}
@@ -55,45 +76,53 @@
       (d/q '[:find ?e . :in $ ?ts ?txt :where [?e :msg/timestamp ?ts] [?e :msg/text ?txt]]
             db-after timestamp text))))
 
+(defn- brute-force-search
+  "Fallback search: return most recent messages for session, limited by top-y."
+  [conn session-id top-y]
+  (try
+    (let [results (d/q '[:find ?id ?text ?role ?ts
+                         :in $ ?sid
+                         :where
+                         [?e :msg/id ?id]
+                         [?e :msg/text ?text]
+                         [?e :msg/role ?role]
+                         [?e :msg/timestamp ?ts]
+                         [?e :msg/session ?sid]]
+                       (d/db conn) session-id)]
+      (->> results
+           (sort-by (fn [r] (nth r 3)))
+           (take top-y)
+           (mapv (fn [[id text role ts]]
+                   {:msg/id id :msg/role role :msg/text text :msg/timestamp ts}))))
+    (catch Exception e
+      (println "Warning: brute-force search failed:" (.getMessage e))
+      [])))
+
 (defn search-relevant!
   [conn query-text session-id top-y]
   (when (and query-text (not (str/blank? query-text)) session-id)
-    (let [top-y (or top-y 10)]
-      (try
-        (let [results (d/q '[:find ?id ?text ?role ?ts
-                             :in $ ?q ?sid ?top
-                             :where
-                             [(embedding-neighbors $ :msg/text ?q {:top ?top}) [[?e _ _]]]
-                             [?e :msg/id ?id]
-                             [?e :msg/text ?text]
-                             [?e :msg/role ?role]
-                             [?e :msg/timestamp ?ts]
-                             [?e :msg/session ?sid]]
-                           (d/db conn) query-text session-id top-y)]
-          (mapv (fn [[id text role ts]]
-                  {:msg/id id :msg/role role :msg/text text :msg/timestamp ts})
-                results))
-        (catch Exception e
-          (println "Warning: search-relevant embedding search failed:" (.getMessage e))
-          ;; Fallback to brute-force if embeddings not available
-          (try
-            (let [results (d/q '[:find ?id ?text ?role ?ts
-                                 :in $ ?sid
-                                 :where
-                                 [?e :msg/id ?id]
-                                 [?e :msg/text ?text]
-                                 [?e :msg/role ?role]
-                                 [?e :msg/timestamp ?ts]
-                                 [?e :msg/session ?sid]]
-                               (d/db conn) session-id)]
-              (->> results
-                   (sort-by (fn [r] (nth r 3)))
-                   (take top-y)
-                   (mapv (fn [[id text role ts]]
-                           {:msg/id id :msg/role role :msg/text text :msg/timestamp ts}))))
-            (catch Exception e2
-              (println "Warning: brute-force search also failed:" (.getMessage e2))
-              [])))))))
+    (let [top-y (or top-y 10)
+          use-embedding (check-embedding-available? conn session-id)]
+      (if use-embedding
+        (try
+          (let [results (d/q '[:find ?id ?text ?role ?ts
+                               :in $ ?q ?sid ?top
+                               :where
+                               [(embedding-neighbors $ :msg/text ?q {:top ?top}) [[?e _ _]]]
+                               [?e :msg/id ?id]
+                               [?e :msg/text ?text]
+                               [?e :msg/role ?role]
+                               [?e :msg/timestamp ?ts]
+                               [?e :msg/session ?sid]]
+                             (d/db conn) query-text session-id top-y)]
+            (mapv (fn [[id text role ts]]
+                    {:msg/id id :msg/role role :msg/text text :msg/timestamp ts})
+                  results))
+          (catch Exception e
+            ;; Embedding failed after initial success — cache as unavailable
+            (reset! embedding-available? false)
+            (brute-force-search conn session-id top-y)))
+        (brute-force-search conn session-id top-y)))))
 
 (defn close-session-store
   [conn]

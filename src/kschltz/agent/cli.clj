@@ -66,7 +66,7 @@
 
         :else
         (let [p (core/send-message! ag input)
-              result (deref p 120000 ::timeout)]
+              result (deref p 300000 ::timeout)]
           (if (= ::timeout result)
             (println "[timeout waiting for response]")
             (println (str "\nagent> " result)))
@@ -114,7 +114,13 @@
                                           :turns       turns
                                           :session-id  session-id
                                           :on-response (fn [r] (println (str "agent> " r)))
-                                          :on-error    (fn [_a e] (println (str "ERROR: " (.getMessage e))))})]
+                                          :on-error    (fn [_a e] (println (str "ERROR: " (.getMessage e))))
+                                          :on-thought  (fn [evt]
+                                                         (when (= :tool-call (:type evt))
+                                                           (println (str "  [tool-call] " (pr-str (:calls evt)))))
+                                                         (when (= :tool-result (:type evt))
+                                                           (doseq [r (:results evt)]
+                                                             (println (str "  [tool-result] " (:tool r) " => " (or (:error r) (:result r)))))))})]
         (core/add-repl-eval-tool! ag)
         (if (:interactive opts)
           (do

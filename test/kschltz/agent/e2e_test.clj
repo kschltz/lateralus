@@ -431,9 +431,9 @@
           "Should strip tool call and residual markup, leaving only prose"))))
 
 (deftest e2e-has-unparsed-tool-markup
-  (testing "detects ➪tool: markup even when unparseable"
-    (let [unparseable "I will ➪tool:repl-eval➫(broken"]
-      ;; This has ➪tool: but no ➪/end➫, so parse-tool-calls returns nil
+  (testing "detects \u27aatool: markup even when unparseable"
+    (let [unparseable "I will \u27aatool:repl-eval\u27ab(broken"]
+      ;; This has \u27aatool: but no \u27aa/end\u27ab, so parse-tool-calls returns nil
       (is (nil? (core/parse-tool-calls unparseable)))
       ;; But has-unparsed-tool-markup? still detects it
       (is (core/has-unparsed-tool-markup? unparseable))))

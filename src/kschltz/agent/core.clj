@@ -375,12 +375,14 @@
 ;; ---- Loop ----
 
 (defn- default-error-handler
-  "Default error handler: stop the agent, log the error, rethrow."
+  "Default error handler: log the error and continue running.
+   The agent loop catches errors so it can keep processing messages.
+   Only sets :running false if :stop-on-error is set in state."
   [ag ^Exception e]
-  (send ag assoc :running false)
-  (await ag)
-  (println (str "Agent error (stopping): " (.getMessage e)))
-  (throw e))
+  (println (str "Agent error (continuing): " (.getMessage e)))
+  (when (:stop-on-error @ag)
+    (send ag assoc :running false)
+    (await ag)))
 
 (defn- fire-on-thought
   "Fire the on-thought callback if present. Catches errors so loop continues."
@@ -428,7 +430,7 @@
   "Process a batch of drained queue items against the LLM.
    Handles tool calls in a loop until a final text response.
    Delivers each item's promise and calls its handler.
-   Returns updated state map. On error, calls on-error handler."
+   Returns updated state map. On error, delivers error messages and continues."
   [ag state items]
   (let [texts         (mapv :text items)
         combined-input (str/join "\n" texts)]
@@ -439,7 +441,6 @@
                         (update :history into (map #(array-map :role "user" :content (:text %)) items))
                         (update :history conj {:role "assistant" :content response})
                         cap-history)]
-        ;; Deliver each item's promise + handler
         (doseq [item items]
           (deliver-response (merge item (select-keys state [:on-response])) response))
         (store-exchange state' combined-input response)
@@ -451,15 +452,18 @@
             (try (on-error ag e) (catch Exception _)))
           (doseq [item items]
             (deliver-response (merge item (select-keys state [:on-response])) err-str))
-          (if on-error
-            ;; Custom handler: notify done, deliver errors, keep running
-            (assoc state :current-response err-str)
-            ;; Default handler: stop agent and rethrow
-            (default-error-handler ag e)))))))
+          (when-not on-error
+            (default-error-handler ag e))
+          (-> state
+              (assoc :current-response err-str)
+              (update :history into (map #(array-map :role "user" :content (:text %)) items))
+              (update :history conj {:role "assistant" :content err-str})))))))
+
 
 (defn- agent-loop
   "Main agent loop. Drains message queue each tick, processes as a batch.
-   Sleeps when idle. Runs until max-turns reached or interrupted."
+   Sleeps when idle. Runs until max-turns reached or interrupted.
+   Catches errors per-iteration so the loop keeps running."
   [ag]
   (loop [turn 0]
     (let [state @ag]
@@ -467,17 +471,27 @@
         (not (:running state))  :stopped
         (>= turn (:max-turns state)) :stopped
         :else
-        (let [[items state'] (drain-queue state)]
-          (if (empty? items)
-            (do
-              (queue-wait state')
-              (recur turn))
-            (let [state''   (process-messages ag state' items)
-                  next-turn (inc turn)]
-              (send ag (fn [_] (assoc state'' :turns next-turn)))
-              (if (:current-response state'')
-                (recur next-turn)
-                (recur turn)))))))))
+        (let [next-state
+              (try
+                (let [[items state'] (drain-queue state)]
+                  (if (empty? items)
+                    (do (queue-wait state')
+                        {:action :idle :turn turn})
+                    (let [result    (process-messages ag state' items)
+                          next-turn (inc turn)]
+                      (send ag (fn [_] (assoc result :turns next-turn)))
+                      {:action :processed :turn next-turn :result result})))
+                (catch Exception e
+                  (let [on-error (:on-error @ag)]
+                    (if on-error
+                      (try (on-error @ag e) (catch Exception _))
+                      (default-error-handler ag e))
+                    {:action :error :turn turn})))]
+          (cond
+            (= (:action next-state) :idle)      (recur turn)
+            (= (:action next-state) :processed)  (recur (:turn next-state))
+            (= (:action next-state) :error)      (recur (:turn next-state))))))))
+
 
 ;; ---- Public API ----
 
@@ -667,41 +681,41 @@
   ;; === Create and start (local Ollama) ===
   (require '[kschltz.agent.core :as agent])
   (def ag (agent/make-agent {:base-url "http://localhost:11434"
-                              :model "deepseek-v4-flash:cloud"
-                              :turns 5}))
+                             :model "deepseek-v4-flash:cloud"
+                             :turns 5}))
   (agent/add-repl-eval-tool! ag)
   (future (agent/start! ag))
 
   ;; === With session memory + on-response handler ===
   (def ag (agent/make-agent {:base-url    "http://localhost:11434"
-                              :model       "deepseek-v4-flash:cloud"
-                              :turns       5
-                              :session-id  "my-session"
-                              :on-response (fn [r] (println "Agent:" r))}))
+                             :model       "gemini-3-flash-preview:cloud"
+                             :turns       5
+                             :session-id  "my-session"
+                             :on-response (fn [r] (println "Agent:" r))}))
   (agent/add-repl-eval-tool! ag)
   (future (agent/start! ag))
 
   ;; === Send messages to the queue ===
   ;; Returns a promise — deref to block for response
-  (def p1 (agent/send-message! ag "Hello, who are you?"))
+  (def p1 (agent/send-message! ag "What did we talk about?"))
   (deref p1)
 
   ;; With handler callback (runs async on response)
   (def p2 (agent/send-message! ag "Evaluate (+ 1 2 3)"
-             (fn [r] (println "Got:" r))))
+                               (fn [r] (println "Got:" r))))
   (deref p2)
 
   ;; Non-blocking check
   (realized? p2)
 
-  
+
   (agent/queue-size ag)
 
   ;; === One-shot (no loop needed) ===
-  (agent/send-message! 
-   ag 
-               "eval that code")
-
+  (def r (agent/send-message!
+          ag
+          "I meant I want you to read the online docs for repl based clojure tools"))
+  (deref r 20000 ::timeout)
   ;; === Inspect state ===
   (agent/running? ag)
   (agent/get-history ag)
@@ -714,7 +728,7 @@
 
   ;; === Default response handler (runs on every response) ===
   (agent/set-on-response! ag (fn [r] (println "Agent:" r)))
-  (agent/set-on-error! ag nil)
+  (agent/set-on-error! ag (fn[ag e] (prn "Agent: " "Error:" (.getMessage e))))
 
   ;; === Error handler ===
   ;; Default: stop agent, log error, rethrow
@@ -731,27 +745,27 @@
   ;; Env vars: LATERALUS_MEMORY_RELEVANT_LIMIT, LATERALUS_MEMORY_RECENT_LIMIT,
   ;;           LATERALUS_MEMORY_STRATEGY, LATERALUS_MEMORY_EMBEDDING_DIMS
   (def ag (agent/make-agent {:base-url  "http://localhost:11434"
-                              :model     "deepseek-v4-flash:cloud"
-                              :turns     5
-                              :session-id "my-session"
-                              :memory-relevant-limit 10
-                              :memory-recent-limit   20
-                              :memory-embedding-dims 384}))
+                             :model     "deepseek-v4-flash:cloud"
+                             :turns     5
+                             :session-id "my-session"
+                             :memory-relevant-limit 10
+                             :memory-recent-limit   20
+                             :memory-embedding-dims 384}))
   (agent/get-config ag)
 
   ;; === Direct memory API ===
   (require '[kschltz.agent.memory :as memory])
   (def conn (memory/create-session {:backend    :datalevin
-                                      :session-id "demo"
-                                      :model      "deepseek-v4-flash:cloud"}))
+                                    :session-id "demo"
+                                    :model      "deepseek-v4-flash:cloud"}))
   (memory/store-message {:backend    :datalevin
                          :session-id "demo"
                          :connection (:connection conn)
                          :message    {:role "user" :text "Hello"}})
   (memory/retrieve-relevant {:backend    :datalevin
-                              :session-id "demo"
-                              :connection (:connection conn)
-                              :query      "hello" :limit 5})
+                             :session-id "demo"
+                             :connection (:connection conn)
+                             :query      "hello" :limit 5})
   (memory/close-session {:backend    :datalevin
                          :connection (:connection conn)})
   )

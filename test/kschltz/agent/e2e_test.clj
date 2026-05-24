@@ -196,12 +196,18 @@
           (try @loop-future (catch Exception _ nil)))))))
 
 (deftest e2e-default-error-handler-stops-agent
-  (testing "default error handler stops agent and rethrows"
-    (let [ag (fresh-agent {:turns 3})]
+  (testing "default error handler logs and continues; agent eventually exits after max-turns"
+    (let [ag (fresh-agent {:turns 2})]
       (with-redefs [http/completion (fn [& _] (throw (Exception. "fatal error")))]
         (let [_p (core/send-message! ag "trigger error")]
-          (is (thrown? Exception (core/start! ag)))
-          (is (false? (core/running? ag))))))))
+          ;; start! blocks until max-turns is reached
+          (let [result (core/start! ag)]
+            ;; Agent should have completed without crashing
+            (is (false? (:running result))
+                "agent should not be running after max-turns")
+            ;; The error message should be in the response
+            (is (some? (:current-response result))
+                "agent should have an error response")))))))
 
 ;; ============================================================
 ;; 7. CHAT! ONE-SHOT

@@ -52,6 +52,10 @@
 (defn assistant-content [response]
   (get-in response [:choices 0 :message :content]))
 
+(defn reasoning-content [response]
+  "Extract reasoning/thinking content from LLM response (e.g. DeepSeek V4 thinking mode)."
+  (get-in response [:choices 0 :message :reasoning_content]))
+
 (defn step
   ([base-url api-key model message]
    (step {:base-url     base-url

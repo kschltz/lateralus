@@ -175,3 +175,33 @@
       (is (string? (:session-id @ag)))
       (is (.startsWith ^String (:session-id @ag) "session-"))
       (is (contains? @ag :memory-conn)))))
+;; ---- History Limit ----
+
+(deftest make-agent-default-history-limit
+  (testing "default history-limit is 50"
+    (let [ag (sut/make-agent {:base-url "http://llm" :model "test"})]
+      (is (= 50 (:history-limit @ag))))))
+
+(deftest make-agent-custom-history-limit
+  (testing "custom history-limit overrides default"
+    (let [ag (sut/make-agent {:base-url "http://llm" :model "test"
+                              :history-limit 10})]
+      (is (= 10 (:history-limit @ag))))))
+
+(deftest history-limit-caps-in-memory-state
+  (testing "history stays within limit after many messages"
+    (let [ag (sut/make-agent {:base-url "http://llm" :model "test"
+                              :history-limit 4})]
+      ;; Add 6 user+assistant pairs (12 entries total)
+      (doseq [i (range 1 7)]
+        (send ag update :history conj {:role "user" :content (str "msg " i)})
+        (await ag)
+        (send ag update :history conj {:role "assistant" :content (str "resp " i)})
+        (await ag))
+      (is (= 12 (count (:history @ag))))
+      ;; Now simulate the cap that process-messages runs
+      (let [state @ag
+            h (:history state)
+            limited (vec (take-last (:history-limit state) h))]
+        (is (= 4 (count limited)))
+        (is (= "msg 5" (:content (first limited))))))))

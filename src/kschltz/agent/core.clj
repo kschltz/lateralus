@@ -11,7 +11,8 @@
             [kschltz.agent.tools :as tools]
             [kschltz.agent.http :as http]
             [kschltz.agent.tools.repl :as repl]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [kschltz.agent.core :as agent]))
 
 ;; ---- REPL Usage ----
 ;;
@@ -58,6 +59,7 @@
 ;; (agent/reset! ag)
 
 (def ^:const maximum-message-queue-size 1000)
+(def ^:const default-history-limit 50) ;; Keep last N messages in state; older ones live in Datalevin
 
 (def ^:private default-state
   "Initial agent state map."
@@ -81,6 +83,7 @@
    :memory-recent-limit   nil
    :memory-strategy       nil
    :memory-embedding-dims nil
+   :history-limit    nil
    ;; Tool config
    :max-tool-calls nil})
 
@@ -103,6 +106,7 @@
    :memory-recent-limit   (fn [] (env-or "LATERALUS_MEMORY_RECENT_LIMIT" 10 #(Integer/parseInt %)))
    :memory-strategy       (fn [] (env-or "LATERALUS_MEMORY_STRATEGY" :hybrid keyword))
    :memory-embedding-dims (fn [] (env-or "LATERALUS_MEMORY_EMBEDDING_DIMS" 384 #(Integer/parseInt %)))
+   :history-limit        (fn [] (env-or "LATERALUS_HISTORY_LIMIT" default-history-limit #(Integer/parseInt %)))
    :max-tool-calls       (fn [] (env-or "LATERALUS_MAX_TOOL_CALLS" 10 #(Integer/parseInt %)))})
 
 (defn- resolve-config
@@ -132,6 +136,7 @@
     :memory-recent-limit       — Recent context messages (env: LATERALUS_MEMORY_RECENT_LIMIT, default 10)
     :memory-strategy           — Composition strategy (env: LATERALUS_MEMORY_STRATEGY, default :hybrid)
     :memory-embedding-dims     — Embedding dimensions (env: LATERALUS_MEMORY_EMBEDDING_DIMS, default 384)
+    :history-limit             — Max messages kept in agent state (env: LATERALUS_HISTORY_LIMIT, default 50)
     :max-tool-calls            — Max tool call rounds per message (env: LATERALUS_MAX_TOOL_CALLS, default 10)
     :on-response               — Default handler fn, called on every response (optional)
     :on-error                  — Error handler fn (ag, exception) => anything (optional, default: stop + rethrow)
@@ -141,8 +146,8 @@
    (make-agent {}))
   ([opts]
    (let [{:keys [base-url api-key model turns tools initial
-                 session-id memory-backend on-response on-error
-                 memory-relevant-limit memory-recent-limit memory-strategy memory-embedding-dims]
+                 session-id memory-backend on-response on-error on-thought
+                 memory-relevant-limit memory-recent-limit memory-strategy memory-embedding-dims history-limit]
           :or   {turns 100 tools [] initial [] memory-backend :datalevin}} opts
          cfg           (resolve-config opts)
          memory-enabled? (contains? opts :session-id)
@@ -174,10 +179,12 @@
                                  :memory-backend memory-backend
                                  :on-response   on-response
                                  :on-error      on-error
+                                 :on-thought    on-thought
                                  :memory-relevant-limit (:memory-relevant-limit cfg)
                                  :memory-recent-limit   (:memory-recent-limit cfg)
                                  :memory-strategy       (:memory-strategy cfg)
                                  :memory-embedding-dims (:memory-embedding-dims cfg)
+                                 :history-limit         (or history-limit (:history-limit cfg))
                                  :max-tool-calls        (:max-tool-calls cfg)})))))
 
 ;; ---- Memory Helpers (pure, take state map) ----
@@ -223,6 +230,17 @@
       (vec (into (memory-msgs->chat-msgs relevant) recent)))
     (vec history)))
 
+(defn- cap-history
+  "Cap history to :history-limit messages. Older messages are persisted in
+   Datalevin and available via semantic retrieval. Returns state with :history trimmed."
+  [state]
+  (if-let [limit (:history-limit state)]
+    (let [h (:history state)]
+      (if (> (count h) limit)
+        (assoc state :history (vec (take-last limit h)))
+        state))
+    state))
+
 (defn- store-exchange
   "Store a user-assistant exchange in session memory. Returns state unchanged."
   [{:keys [session-id memory-conn memory-backend]} user-input response]
@@ -243,7 +261,8 @@
 
 (defn- llm-call
   "Call the LLM API. Uses memory-augmented context when available.
-   When tools are registered, prepends tool manifest to the user message."
+   When tools are registered, prepends tool manifest to the user message.
+   Returns a map {:content ... :reasoning ...}."
   ([state message]
    (llm-call state message nil))
   ([state message manifest]
@@ -254,10 +273,10 @@
            ctx      (compose-context state user-msg)
            response (http/completion (:base-url state) (:api-key state)
                                     (:model state) user-msg
-                                    :chat-history ctx)
-           content  (http/assistant-content response)]
-       (or content "No response from LLM"))
-     "LLM not configured - provide :base-url and :model to make-agent")))
+                                    :chat-history ctx)]
+       {:content   (or (http/assistant-content response) "No response from LLM")
+        :reasoning (http/reasoning-content response)})
+     {:content "LLM not configured" :reasoning nil})))
 
 ;; ---- Tool Use ----
 
@@ -363,10 +382,17 @@
   (println (str "Agent error (stopping): " (.getMessage e)))
   (throw e))
 
+(defn- fire-on-thought
+  "Fire the on-thought callback if present. Catches errors so loop continues."
+  [state event]
+  (when-let [on-thought (:on-thought state)]
+    (try (on-thought event) (catch Exception _))))
+
 (defn- llm-turn
   "Run one LLM call. If it contains tool calls, execute them and loop.
    Returns the final text response after all tool calls are resolved.
-   Bounded by max-tool-calls to prevent infinite loops."
+   Bounded by max-tool-calls to prevent infinite loops.
+   Fires :on-thought callback with intermediate events."
   [ag state user-text]
   (let [manifest (tool-manifest (:tools state))
         max-depth (or (:max-tool-calls state) 10)]
@@ -374,26 +400,28 @@
            depth  0
            first-call? true]
       (let [manifest'  (when first-call? manifest)
-            response (llm-call state ctx-text manifest')
-            calls   (when manifest (parse-tool-calls response))]
+            resp-map   (llm-call state ctx-text manifest')
+            response   (:content resp-map)
+            reasoning  (:reasoning resp-map)
+            _          (when reasoning
+                        (fire-on-thought state {:type :thinking :content reasoning}))
+            calls      (when manifest (parse-tool-calls response))]
         (cond
-          ;; No tool calls — final text response
           (nil? calls)
           response
 
-          ;; Too many tool rounds — return what we have
           (>= depth max-depth)
           (str response "\n\n[Tool call limit reached]")
 
-          ;; Execute tool calls and continue
           :else
           (let [known-names (into #{} (map :name) (:tools state))
                 valid-calls (filterv #(contains? known-names (:tool %)) calls)]
             (if (empty? valid-calls)
-              ;; No valid tool calls — treat as final text response
               response
-              (let [results (execute-tool-calls valid-calls (:tools state))
-                    tool-msg (format-tool-results results)]
+              (let [_         (fire-on-thought state {:type :tool-call :content response :calls valid-calls})
+                    results   (execute-tool-calls valid-calls (:tools state))
+                    _         (fire-on-thought state {:type :tool-result :results results})
+                    tool-msg  (format-tool-results results)]
                 (recur tool-msg (inc depth) false)))))))))
 
 (defn- process-messages
@@ -409,7 +437,8 @@
             state'   (-> state
                         (assoc :current-response response)
                         (update :history into (map #(array-map :role "user" :content (:text %)) items))
-                        (update :history conj {:role "assistant" :content response}))]
+                        (update :history conj {:role "assistant" :content response})
+                        cap-history)]
         ;; Deliver each item's promise + handler
         (doseq [item items]
           (deliver-response (merge item (select-keys state [:on-response])) response))
@@ -520,6 +549,8 @@
            {:role "user" :content message}
            {:role "assistant" :content response})
      (await ag)
+     (send ag cap-history)
+     (await ag)
      (store-exchange state message response)
      response)))
 
@@ -585,6 +616,17 @@
   (await ag)
   ag)
 
+(defn set-on-thought!
+  "Set or replace the thought handler fn. Called on intermediate events:
+   {:type :thinking :content reasoning-text}
+   {:type :tool-call :content llm-text :calls [...]}
+   {:type :tool-result :results [...]}
+   Pass nil to remove. Returns the agent."
+  [ag handler-fn]
+  (send ag assoc :on-thought handler-fn)
+  (await ag)
+  ag)
+
 ;; ---- Tool Registration ----
 
 (defn register-tool!
@@ -642,12 +684,12 @@
   ;; === Send messages to the queue ===
   ;; Returns a promise — deref to block for response
   (def p1 (agent/send-message! ag "Hello, who are you?"))
-  @p1
+  (deref p1)
 
   ;; With handler callback (runs async on response)
   (def p2 (agent/send-message! ag "Evaluate (+ 1 2 3)"
              (fn [r] (println "Got:" r))))
-  @p2
+  (deref p2)
 
   ;; Non-blocking check
   (realized? p2)
@@ -656,7 +698,9 @@
   (agent/queue-size ag)
 
   ;; === One-shot (no loop needed) ===
-  (agent/chat! ag "What is Clojure?")
+  (agent/send-message! 
+   ag 
+               "eval that code")
 
   ;; === Inspect state ===
   (agent/running? ag)

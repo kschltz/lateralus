@@ -283,8 +283,9 @@
 (def ^:private tool-call-regex
   "Regex to extract tool calls from LLM responses.
    Format: \u27aatool:tool-name\u27ab Arguments \u27aa/end\u27ab
-   Supports multiline arguments."
-  #"\u27aatool:(.+?)\u27ab(.+?)\u27aa/end\u27ab")
+   Allows optional text (e.g. 'store-thought') between /end and closing \u27ab
+   so LLM inventions like \u27aa/end store-thought\u27ab still parse correctly."
+  #"\u27aatool:(.+?)\u27ab(.+?)\u27aa/end[^\u27ab]*\u27ab")
 
 (defn tool-manifest
   "Build a tool manifest string for the LLM context.
@@ -295,7 +296,11 @@
          (str/join "\n"
            (for [t tools]
              (str "- " (:name t) ": " (:description t))))
-         "To call a tool, write: tool-name in ➪/➫ delimiters with your arguments. Example for repl-eval: ➪tool:repl-eval➫(+ 1 2 3)➪/end➫\n\n"
+         "\nTo call a tool, write EXACTLY: ➪tool:tool-name➫(arguments)➪/end➫\n"
+         "Example: ➪tool:repl-eval➫(+ 1 2 3)➪/end➫\n"
+         "IMPORTANT: The closing tag is ➪/end➫ — NOTHING else.\n"
+         "Do NOT add suffixes like ➪/end store-thought➫ or ➪/end➫/thought.\n"
+         "Do NOT write tool results yourself — you will receive real results.\n\n"
          "You may make multiple tool calls in one response.\n"
          "After receiving tool results, you may respond with more tool calls or a final text answer.\n"
          "If you need more information to use a tool correctly, ask the user.")))
@@ -344,10 +349,15 @@
              (str tool "(" args ") => Error: " error)
              (str tool "(" args ") => " result))))))
 
-(defn- strip-tool-calls
-  "Remove tool call markup from text, returning any surrounding text."
+(defn strip-tool-calls
+  "Remove tool call markup from text, returning any surrounding text.
+   Also strips any residual \u27aa...\u27ab fragments the LLM may emit."
   [text]
-  (str/trim (str/replace text tool-call-regex "")))
+  (let [without-calls (str/replace text tool-call-regex "")
+        ;; Strip residual ➪/end➫-like fragments the LLM may leave
+        ;; (e.g. ➪/end store-thought➫ without a matching ➪tool:...➫)
+        without-residual (str/replace without-calls #"\u27aa/end[^\u27ab]*\u27ab" "")]
+    (str/trim (str/replace without-residual #"\s{2,}" " "))))
 
 ;; ---- Queue Operations ----
 
@@ -390,11 +400,19 @@
   (when-let [on-thought (:on-thought state)]
     (try (on-thought event) (catch Exception _))))
 
+(defn has-unparsed-tool-markup?
+  "Check if text contains ➪tool:...➫ markup that wasn't parsed as tool calls.
+   This detects LLM hallucinations where it writes tool-call syntax with
+   malformed delimiters (e.g. ➪/end store-thought➫)."
+  [text]
+  (boolean (re-find #"\u27aatool:" text)))
+
 (defn- llm-turn
   "Run one LLM call. If it contains tool calls, execute them and loop.
    Returns the final text response after all tool calls are resolved.
    Bounded by max-tool-calls to prevent infinite loops.
-   Fires :on-thought callback with intermediate events."
+   Fires :on-thought callback with intermediate events.
+   Detects malformed tool calls and re-prompts the LLM with a correction."
   [ag state user-text]
   (let [manifest (tool-manifest (:tools state))
         max-depth (or (:max-tool-calls state) 10)]
@@ -409,17 +427,29 @@
                         (fire-on-thought state {:type :thinking :content reasoning}))
             calls      (when manifest (parse-tool-calls response))]
         (cond
+          ;; No tool calls found — check for malformed markup
           (nil? calls)
-          response
+          (if (has-unparsed-tool-markup? response)
+            ;; LLM wrote tool-call syntax but regex didn't match — malformed
+            ;; Re-prompt the LLM with a correction so it can retry
+            (if (>= depth max-depth)
+              (str (strip-tool-calls response) "\n\n[Malformed tool call — limit reached]")
+              (recur (str "Your previous response contained malformed tool call syntax. "
+                          "The closing tag must be EXACTLY ➪/end➫ — nothing else. "
+                          "Do NOT add suffixes like 'store-thought'. "
+                          "Please retry with correct syntax, or simply respond with text.")
+                     (inc depth) false))
+            ;; Clean text response — strip any residual markup and return
+            (strip-tool-calls response))
 
           (>= depth max-depth)
-          (str response "\n\n[Tool call limit reached]")
+          (str (strip-tool-calls response) "\n\n[Tool call limit reached]")
 
           :else
           (let [known-names (into #{} (map :name) (:tools state))
                 valid-calls (filterv #(contains? known-names (:tool %)) calls)]
             (if (empty? valid-calls)
-              response
+              (strip-tool-calls response)
               (let [_         (fire-on-thought state {:type :tool-call :content response :calls valid-calls})
                     results   (execute-tool-calls valid-calls (:tools state))
                     _         (fire-on-thought state {:type :tool-result :results results})

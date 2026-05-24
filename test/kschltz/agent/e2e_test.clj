@@ -394,4 +394,48 @@
     (let [manifest (core/tool-manifest [(repl-tools/repl-eval-tool)])]
       (is (.contains manifest "➪tool:"))
       (is (.contains manifest "➪/end➫"))
-      (is (.contains manifest "You may make multiple tool calls")))))
+      (is (.contains manifest "Do NOT add suffixes"))
+      (is (.contains manifest "EXACTLY")))))
+
+;; ============================================================
+;; 9. MALFORMED TOOL CALL DETECTION
+;; ============================================================
+
+(deftest e2e-malformed-tool-call-suffix
+  (testing "LLM-invented suffixes like 'store-thought' are tolerated"
+    (let [result (core/parse-tool-calls
+                   "➪tool:repl-eval➫(+ 1 2 3)➪/end store-thought➫")]
+      (is (= [{:tool "repl-eval" :args "(+ 1 2 3)"}] result)
+          "Should parse tool call despite 'store-thought' suffix"))))
+
+(deftest e2e-malformed-tool-call-end-slash-thought
+  (testing "LLM adds /thought after end delimiter"
+    (let [result (core/parse-tool-calls
+                   "➪tool:repl-eval➫(+ 1 2)➪/end➫/thought")]
+      (is (= [{:tool "repl-eval" :args "(+ 1 2)"}] result)
+          "Should parse tool call despite /thought suffix"))))
+
+(deftest e2e-malformed-tool-call-jammed-together
+  (testing "Two tool calls jammed together with malformed delimiter"
+    (let [text (str "➪tool:repl-eval➫(code1)➪/end store-thought➫"
+                   "➪tool:repl-eval➫(code2)➪/end➫")
+          result (core/parse-tool-calls text)]
+      (is (= 2 (count result))
+          "Should parse both tool calls"))))
+
+(deftest e2e-strip-tool-calls-residual
+  (testing "strip-tool-calls removes residual ➪/end...➫ fragments"
+    (let [text "➪tool:repl-eval➫(+ 1)➪/end store-thought➫ And the result is 1"
+          stripped (core/strip-tool-calls text)]
+      (is (= "And the result is 1" stripped)
+          "Should strip tool call and residual markup, leaving only prose"))))
+
+(deftest e2e-has-unparsed-tool-markup
+  (testing "detects ➪tool: markup even when unparseable"
+    (let [unparseable "I will ➪tool:repl-eval➫(broken"]
+      ;; This has ➪tool: but no ➪/end➫, so parse-tool-calls returns nil
+      (is (nil? (core/parse-tool-calls unparseable)))
+      ;; But has-unparsed-tool-markup? still detects it
+      (is (core/has-unparsed-tool-markup? unparseable))))
+  (testing "clean text has no unparsed markup"
+    (is (not (core/has-unparsed-tool-markup? "Hello, no tools here.")))))

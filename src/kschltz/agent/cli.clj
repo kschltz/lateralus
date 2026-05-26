@@ -24,6 +24,15 @@
         (#{"-v" "--version"} arg)
         (assoc opts :version true)
 
+        (#{"-t" "--turns"} arg)
+        (recur (assoc opts :turns (fnext rem)) (nnext rem))
+
+        (#{"-r" "--retries"} arg)
+        (recur (assoc opts :max-retries (fnext rem)) (nnext rem))
+
+        (#{"-m" "--model"} arg)
+        (recur (assoc opts :model (fnext rem)) (nnext rem))
+
         (.startsWith arg "-")
         (let [key-name (subs arg 1)]
           (recur (assoc opts (keyword key-name) (fnext rem)) (nnext rem)))
@@ -96,6 +105,7 @@
           (println "  -k, --api-key KEY   API key (env: LATERALUS_API_KEY)")
           (println "  -s, --session ID    Session ID for memory")
           (println "  -t, --turns N       Max turns (default: 5)")
+          (println "  -r, --retries N    Max retries on tool errors (default: 3)")
           (println "  -h, --help          Show this help")
           (System/exit 0))
 
@@ -107,14 +117,16 @@
             model      (or (:model opts) (System/getenv "LATERALUS_MODEL") "deepseek-v4-flash:cloud")
             api-key    (or (:api-key opts) (System/getenv "LATERALUS_API_KEY"))
             turns      (if (:turns opts) (Integer/parseInt (:turns opts)) 5)
+            retries    (if (:max-retries opts) (Integer/parseInt (:max-retries opts)) 3)
             session-id (or (:session opts) (System/getenv "LATERALUS_SESSION"))
             ag         (core/make-agent {:base-url    base-url
                                           :api-key     api-key
                                           :model       model
                                           :turns       turns
                                           :session-id  session-id
-                                          :on-response (fn [r] (println (str "agent> " r)))
-                                          :on-error    (fn [_a e] (println (str "ERROR: " (.getMessage e))))
+                                          :max-retries retries
+                                          :on-response (fn [r] (println (str "\nagent> " r)))
+                                          :on-error    (fn [_a e] (println (str "\nERROR: " (.getMessage e))))
                                           :on-thought  (fn [evt]
                                                          (when (= :tool-call (:type evt))
                                                            (println (str "  [tool-call] " (pr-str (:calls evt)))))

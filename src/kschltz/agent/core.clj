@@ -85,7 +85,9 @@
    :memory-embedding-dims nil
    :history-limit    nil
    ;; Tool config
-   :max-tool-calls nil})
+   :max-tool-calls nil
+   ;; Retry config
+   :max-retries      nil})
 
 ;; ---- Env Var Defaults ----
 
@@ -107,7 +109,8 @@
    :memory-strategy       (fn [] (env-or "LATERALUS_MEMORY_STRATEGY" :hybrid keyword))
    :memory-embedding-dims (fn [] (env-or "LATERALUS_MEMORY_EMBEDDING_DIMS" 384 #(Integer/parseInt %)))
    :history-limit        (fn [] (env-or "LATERALUS_HISTORY_LIMIT" default-history-limit #(Integer/parseInt %)))
-   :max-tool-calls       (fn [] (env-or "LATERALUS_MAX_TOOL_CALLS" 10 #(Integer/parseInt %)))})
+   :max-tool-calls       (fn [] (env-or "LATERALUS_MAX_TOOL_CALLS" 10 #(Integer/parseInt %)))
+   :max-retries          (fn [] (env-or "LATERALUS_MAX_RETRIES" 3 #(Integer/parseInt %)))})
 
 (defn- resolve-config
   "Resolve config: explicit opt > env var > default."
@@ -138,6 +141,7 @@
     :memory-embedding-dims     — Embedding dimensions (env: LATERALUS_MEMORY_EMBEDDING_DIMS, default 384)
     :history-limit             — Max messages kept in agent state (env: LATERALUS_HISTORY_LIMIT, default 50)
     :max-tool-calls            — Max tool call rounds per message (env: LATERALUS_MAX_TOOL_CALLS, default 10)
+    :max-retries               — Max retries on tool execution errors (env: LATERALUS_MAX_RETRIES, default 3)
     :on-response               — Default handler fn, called on every response (optional)
     :on-error                  — Error handler fn (ag, exception) => anything (optional, default: stop + rethrow)
 
@@ -185,7 +189,8 @@
                                  :memory-strategy       (:memory-strategy cfg)
                                  :memory-embedding-dims (:memory-embedding-dims cfg)
                                  :history-limit         (or history-limit (:history-limit cfg))
-                                 :max-tool-calls        (:max-tool-calls cfg)})))))
+                                 :max-tool-calls        (:max-tool-calls cfg)
+                                 :max-retries            (:max-retries cfg)})))))
 
 ;; ---- Memory Helpers (pure, take state map) ----
 
@@ -412,13 +417,16 @@
    Returns the final text response after all tool calls are resolved.
    Bounded by max-tool-calls to prevent infinite loops.
    Fires :on-thought callback with intermediate events.
-   Detects malformed tool calls and re-prompts the LLM with a correction."
+   When tool execution produces errors, retries the LLM with error context
+   up to :max-retries times (default 3, env LATERALUS_MAX_RETRIES)."
   [ag state user-text]
-  (let [manifest (tool-manifest (:tools state))
-        max-depth (or (:max-tool-calls state) 10)]
-    (loop [ctx-text user-text
-           depth  0
-           first-call? true]
+  (let [manifest    (tool-manifest (:tools state))
+        max-depth   (or (:max-tool-calls state) 10)
+        max-retries (or (:max-retries state) 3)]
+    (loop [ctx-text     user-text
+           depth        0
+           first-call?  true
+           retry-count  0]
       (let [manifest'  (when first-call? manifest)
             resp-map   (llm-call state ctx-text manifest')
             response   (:content resp-map)
@@ -427,17 +435,9 @@
                         (fire-on-thought state {:type :thinking :content reasoning}))
             calls      (when manifest (parse-tool-calls response))]
         (cond
-          ;; No tool calls found — check for malformed markup
+          ;; No tool calls found — silently strip any malformed markup
           (nil? calls)
-          (if (has-unparsed-tool-markup? response)
-            ;; LLM wrote tool-call syntax but regex didn't match — malformed.
-            ;; Rather than re-prompt (which causes some LLMs to give up on tools entirely),
-            ;; silently strip the malformed markup and present the prose response.
-            ;; The LLM's prose after the broken tool call may contain useful information.
-            (strip-tool-calls response)
-
-          ;; Clean text response — strip any residual markup and return
-          (strip-tool-calls response))
+          (strip-tool-calls response)
 
           (>= depth max-depth)
           (str (strip-tool-calls response) "\n\n[Tool call limit reached]")
@@ -450,8 +450,16 @@
               (let [_         (fire-on-thought state {:type :tool-call :content response :calls valid-calls})
                     results   (execute-tool-calls valid-calls (:tools state))
                     _         (fire-on-thought state {:type :tool-result :results results})
+                    errors    (filterv :error results)
                     tool-msg  (format-tool-results results)]
-                (recur tool-msg (inc depth) false)))))))))
+                (if (and (seq errors) (< retry-count max-retries))
+                  ;; Some tools failed — retry LLM with error context
+                  (recur (str tool-msg
+                               "\n\nSome tool calls produced errors. Please retry with corrected code.\nErrors:\n"
+                               (str/join "\n" (map #(str "  " (:tool %) ": " (:error %)) errors)))
+                         (inc depth) false (inc retry-count))
+                  ;; No errors or retries exhausted — continue normally
+                  (recur tool-msg (inc depth) false retry-count))))))))))
 
 (defn- process-messages
   "Process a batch of drained queue items against the LLM.
@@ -635,7 +643,7 @@
 (defn get-config
   "Get the full agent configuration map."
   [ag]
-  (select-keys @ag [:base-url :model :max-turns :max-tool-calls
+  (select-keys @ag [:base-url :model :max-turns :max-tool-calls :max-retries
                        :memory-relevant-limit :memory-recent-limit
                        :memory-strategy :memory-embedding-dims
                        :memory-backend :session-id]))

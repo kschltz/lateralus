@@ -4,8 +4,11 @@
    vector index for semantic similarity search. Embedding vectors
    are computed via an OpenAI-compatible /embeddings endpoint (e.g. Ollama)."
   (:require [clojure.string :as str]
+            [clojure.java.io :as io]
             [datalevin.core :as d]
-            [kschltz.agent.http :as http]))
+            [kschltz.agent.http :as http]
+            [kschltz.agent.memory.schemas :as schemas]
+            [malli.core :as m]))
 
 ;; ---- Schema (Datalog store) -----------------------------------------------
 
@@ -26,6 +29,49 @@
 
 (def ^:private default-embedding-dims 384)
 (def ^:private default-embedding-model "nomic-embed-text")
+(def ^:private default-sessions-dir "sessions")
+
+;; ---- Paths ----------------------------------------------------------------
+
+(defn- env-sessions-dir
+  "Sessions root directory from LATERALUS_SESSIONS_DIR or default."
+  []
+  (or (System/getenv "LATERALUS_SESSIONS_DIR") default-sessions-dir))
+
+(defn session-db-path
+  "Absolute filesystem path for a session store directory."
+  [sessions-dir session-id]
+  (.getAbsolutePath (io/file sessions-dir session-id)))
+
+(defn- rename-corrupt-dir!
+  "Rename a corrupt session directory instead of deleting it."
+  [^java.io.File dir]
+  (when (.exists dir)
+    (let [corrupt (io/file (str (.getAbsolutePath dir)
+                                ".corrupt-" (System/currentTimeMillis)))]
+      (.renameTo dir corrupt))))
+
+(defn- create-conn-with-recovery
+  "Open a Datalevin conn; on failure rename the corrupt dir and retry once."
+  [db-path session-id schema]
+  (try
+    (d/create-conn db-path schema)
+    (catch Throwable e
+      (println "Warning: corrupt session store, renaming:" db-path
+               (.getMessage e))
+      (rename-corrupt-dir! (io/file db-path))
+      (d/create-conn db-path schema))))
+
+(defn- open-kv-with-recovery
+  "Open vector KV store; on failure rename corrupt dir and retry once."
+  [kv-path session-id]
+  (try
+    (d/open-kv kv-path)
+    (catch Throwable e
+      (println "Warning: corrupt vector store, renaming:" kv-path
+               (.getMessage e))
+      (rename-corrupt-dir! (io/file kv-path))
+      (d/open-kv kv-path))))
 
 ;; ---- Session store creation -----------------------------------------------
 
@@ -37,38 +83,26 @@
      :base-url        - Ollama/API base URL (default http://localhost:11434)
      :api-key         - API key for remote providers
      :embedding-fn   - custom (fn [text] => vec) override
-     :model           - LLM model name (stored as metadata)"
+     :model           - LLM model name (stored as metadata)
+     :sessions-dir    - root directory for session stores (default sessions/ or LATERALUS_SESSIONS_DIR)"
   [session-id opts]
-  (let [db-path      (str "sessions/" session-id)
+  (let [sessions-dir (or (:sessions-dir opts) (env-sessions-dir))
+        db-path      (session-db-path sessions-dir session-id)
+        vectors-path (str db-path "/vectors")
         emb-dims     (or (:embedding-dims opts) default-embedding-dims)
         emb-model    (or (:embedding-model opts) default-embedding-model)
         base-url     (or (:base-url opts) "http://localhost:11434")
         api-key      (:api-key opts)
         embedding-fn (:embedding-fn opts)
-        conn (try
-               (d/create-conn db-path schema)
-               (catch Throwable _
-                 (try
-                   (.exec (Runtime/getRuntime) (str "rm -rf " db-path))
-                   (d/create-conn db-path schema)
-                   (catch Throwable t
-                     (throw (ex-info "Failed to create Datalevin conn"
-                                     {:session-id session-id
-                                      :error      (.getMessage t)}))))))
-        kv-store (try
-                   (d/open-kv (str db-path "/vectors"))
-                   (catch Throwable _
-                     (try
-                       (.exec (Runtime/getRuntime) (str "rm -rf " db-path "/vectors"))
-                       (d/open-kv (str db-path "/vectors"))
-                       (catch Throwable t
-                         (throw (ex-info "Failed to open vector KV store"
-                                         {:session-id session-id
-                                          :error      (.getMessage t)}))))))
-        vec-index (d/new-vector-index kv-store
-                                      {:dimensions emb-dims :metric-type :cosine})]
-    (when-let [model (get opts :model)]
-      (d/transact conn [{:session/id session-id :session/model model}]))
+        conn         (create-conn-with-recovery db-path session-id schema)
+        kv-store     (open-kv-with-recovery vectors-path session-id)
+        vec-index    (d/new-vector-index kv-store
+                                         {:dimensions emb-dims :metric-type :cosine})
+        session-meta (cond-> {:session/id session-id
+                              :session/emb-model emb-model
+                              :session/emb-method "openai-compatible-http"}
+                       (:model opts) (assoc :session/model (:model opts)))]
+    (d/transact conn [session-meta])
     {:connection     conn
      :kv-store       kv-store
      :vec-index      vec-index
@@ -77,7 +111,9 @@
      :base-url       base-url
      :api-key        api-key
      :embedding-fn   embedding-fn
-     :session-id     session-id}))
+     :session-id     session-id
+     :sessions-dir   sessions-dir
+     :db-path        db-path}))
 
 ;; ---- Embedding computation ------------------------------------------------
 
@@ -99,8 +135,11 @@
 ;; ---- Store messages -------------------------------------------------------
 
 (defn store-message!
-  "Store a message in the Datalog store and index its embedding vector."
+  "Store a message in the Datalog store and index its embedding vector.
+   Returns {:msg-id ... :stored true :indexed bool :reason ...}."
   [store message-map]
+  (when-not (m/validate schemas/StoreMessage message-map)
+    (throw (ex-info "Invalid store message" {:message message-map})))
   (let [conn       (:connection store)
         vec-index  (:vec-index store)
         msg-id     (or (:id message-map) (:msg/id message-map)
@@ -117,11 +156,26 @@
                       (not-empty (:tool-name message-map))  (assoc :msg/tool-name (:tool-name message-map))
                       (not-empty (:tool-result message-map)) (assoc :msg/tool-result (:tool-result message-map)))]
     (d/transact conn [entity])
-    (when (not (str/blank? text))
-      (when-let [emb (compute-embedding store text)]
-        (try
-          (d/add-vec vec-index msg-id emb)
-          (catch Exception _ nil))))))
+    (let [embedding (when-not (str/blank? text)
+                      (compute-embedding store text))
+          indexed?  (boolean
+                      (when embedding
+                        (try
+                          (d/add-vec vec-index msg-id embedding)
+                          true
+                          (catch Exception e
+                            (println "Warning: vector index failed for" msg-id ":"
+                                     (.getMessage e))
+                            false))))
+          result    (cond-> {:msg-id msg-id :stored true :indexed indexed?}
+                       (and (not (str/blank? text)) (not indexed?))
+                       (assoc :reason (if embedding "index-failed" "embedding-failed")))]
+      (when (and (not (str/blank? text)) (not indexed?))
+        (println "Warning: message stored without vector index:" msg-id
+                 (:reason result)))
+      (when-not (m/validate schemas/StoreResult result)
+        (throw (ex-info "Invalid store result" {:result result})))
+      result)))
 
 ;; ---- Search ---------------------------------------------------------------
 
@@ -140,7 +194,7 @@
                        (d/db conn) session-id)]
       (->> results
            (sort-by (fn [r] (nth r 3)))
-           (take top-y)
+           (take-last top-y)
            (mapv (fn [[id text role ts]]
                    {:msg/id id :msg/role role :msg/text text :msg/timestamp ts}))))
     (catch Exception e
@@ -148,7 +202,8 @@
       [])))
 
 (defn- lookup-messages
-  "Given a list of msg-ids from vector search, look up full message data."
+  "Given ordered msg-ids from vector search, look up full message data.
+   Preserves similarity ranking from HNSW search."
   [conn msg-ids]
   (let [id-set (set msg-ids)]
     (try
@@ -160,10 +215,11 @@
                            [?e :msg/role ?role]
                            [?e :msg/timestamp ?ts]
                            [(contains? ?ids ?id)]]
-                         (d/db conn) id-set)]
-        (mapv (fn [[id text role ts]]
-                {:msg/id id :msg/role role :msg/text text :msg/timestamp ts})
-              results))
+                         (d/db conn) id-set)
+            by-id   (into {} (map (fn [[id text role ts]]
+                                    [id {:msg/id id :msg/role role :msg/text text :msg/timestamp ts}])
+                                  results))]
+        (vec (keep by-id msg-ids)))
       (catch Exception _ []))))
 
 (defn search-relevant!
@@ -189,6 +245,12 @@
         ;; No embedding available: brute-force
         (brute-force-search (:connection store) session-id top-y)))))
 
+(defn load-recent-messages!
+  "Return the most recent messages for a session, sorted chronologically."
+  [store session-id limit]
+  (when (and store session-id limit (pos? limit))
+    (brute-force-search (:connection store) session-id limit)))
+
 ;; ---- Close ----------------------------------------------------------------
 
 (defn close-session-store
@@ -205,43 +267,3 @@
     (catch Exception e
       (println "Error closing Datalevin store:" (.getMessage e))
       false)))
-
-;; ---- Legacy agent-state adapter -------------------------------------------
-
-(defonce agent-state (agent nil))
-
-(defn start!
-  [session-id opts]
-  (let [store (create-session-store session-id opts)]
-    (send agent-state
-          (fn [s]
-            (when (and s (:connection s))
-              (close-session-store s))
-            store))
-    (await agent-state)
-    store))
-
-(defn store!
-  [message-map]
-  (let [store @agent-state]
-    (if (and store (:connection store))
-      (store-message! store message-map)
-      (println "Error: No active session store found"))))
-
-(defn search!
-  [query-text session-id top-y]
-  (let [store @agent-state]
-    (if (and store (:connection store))
-      (search-relevant! store query-text session-id top-y)
-      (println "Error: No active session store found"))))
-
-(defn close!
-  []
-  (let [store @agent-state]
-    (if (and store (:connection store))
-      (close-session-store store)
-      true)))
-
-(defn active-session
-  []
-  @agent-state)

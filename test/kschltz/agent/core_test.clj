@@ -1,6 +1,8 @@
 (ns kschltz.agent.core-test
   (:require [clojure.test :refer [deftest is testing]]
             [kschltz.agent.core :as sut]
+            [kschltz.agent.memory :as memory]
+            [kschltz.agent.http :as http]
             [kschltz.agent.tools.repl :as repl-tools]))
 
 ;; ---- Helper ----
@@ -23,7 +25,7 @@
       (is (= 0 (:turns @ag)))
       (is (= 100 (:max-turns @ag)))
       (is (nil? (:session-id @ag)))
-      (is (nil? (:memory-conn @ag)))
+      (is (nil? (:memory-store @ag)))
       (is (nil? (:on-response @ag))))))
 
 ;; ---- Reset ----
@@ -38,6 +40,110 @@
       (is (= [] (sut/get-history ag)))
       (is (= 0 (:turns @ag)))
       (is (= [] (:message-queue @ag))))))
+
+(deftest reset!-keeps-memory-session
+  (testing "reset! keeps memory connection and session-id"
+    (let [sid (str "reset-keep-" (System/nanoTime))
+          ag  (sut/make-agent {:base-url "http://llm" :model "test"
+                               :session-id sid
+                               :sessions-dir "test-sessions-reset"})]
+      (is (some? (sut/get-memory-store ag)))
+      (sut/reset! ag)
+      (is (some? (sut/get-memory-store ag)))
+      (is (= sid (sut/get-session-id ag))))))
+
+(deftest close-session!-clears-memory
+  (testing "close-session! closes memory and clears session keys"
+    (let [ag (sut/make-agent {:base-url "http://llm" :model "test"
+                              :session-id (str "close-" (System/nanoTime))
+                              :sessions-dir "test-sessions-close"})]
+      (is (some? (sut/get-memory-store ag)))
+      (sut/close-session! ag)
+      (is (nil? (sut/get-memory-store ag)))
+      (is (nil? (sut/get-session-id ag))))))
+
+(deftest make-agent-resumes-history-from-session
+  (testing "make-agent hydrates :history from persisted session messages"
+    (let [sid (str "resume-" (System/nanoTime))
+          dir "test-sessions-resume"
+          ag1 (sut/make-agent {:base-url "http://llm" :model "test"
+                               :session-id sid
+                               :sessions-dir dir
+                               :history-limit 10})]
+      (memory/store-message {:backend :datalevin :session-id sid
+                             :connection (sut/get-memory-store ag1)
+                             :message {:role "user" :text "hello"
+                                       :id "m1" :timestamp 100}})
+      (memory/store-message {:backend :datalevin :session-id sid
+                             :connection (sut/get-memory-store ag1)
+                             :message {:role "assistant" :text "hi there"
+                                       :id "m2" :timestamp 101}})
+      (sut/close-session! ag1)
+      (let [ag2 (sut/make-agent {:base-url "http://llm" :model "test"
+                                 :session-id sid
+                                 :sessions-dir dir
+                                 :history-limit 10})
+            h   (sut/get-history ag2)]
+        (is (= 2 (count h)))
+        (is (= "hello" (:content (first h))))
+        (is (= "hi there" (:content (second h))))
+        (is (= "m1" (:msg-id (first h))))
+        (sut/close-session! ag2)))))
+
+(deftest make-agent-embedding-model-config
+  (testing "make-agent accepts :memory-embedding-model"
+    (let [sid (str "emb-model-" (System/nanoTime))
+          ag  (sut/make-agent {:base-url "http://llm" :model "test"
+                               :session-id sid
+                               :sessions-dir "test-sessions-emb"
+                               :memory-embedding-model "custom-embed"})]
+      (is (= "custom-embed" (:memory-embedding-model @ag)))
+      (is (= "custom-embed" (:embedding-model (sut/get-memory-store ag))))
+      (sut/close-session! ag))))
+
+(deftest store-exchange-fires-memory-event-on-embed-failure
+  (testing "on-memory-event fires when embedding fails"
+    (let [events (atom [])
+          sid    (str "mem-event-" (System/nanoTime))
+          ag     (sut/make-agent {:base-url "http://llm" :model "test"
+                                  :session-id sid
+                                  :sessions-dir "test-sessions-events"
+                                  :on-memory-event #(swap! events conj %)})]
+      (with-redefs [http/completion (fn [& _] {:choices [{:message {:content "hi"}}]})
+                    http/assistant-content http/assistant-content
+                    http/embed (constantly nil)]
+        (sut/chat! ag "hello" {:base-url "http://llm" :model "test"}))
+      (is (>= (count @events) 1))
+      (is (every? #(= :memory-not-indexed (:type %)) @events))
+      (sut/close-session! ag))))
+
+(deftest chat!-persists-tool-rounds
+  (testing "chat! stores tool execution rounds in session memory"
+    (let [calls (atom 0)
+          sid   (str "tool-store-" (System/nanoTime))
+          ag    (sut/make-agent {:base-url "http://llm" :model "test"
+                                 :session-id sid
+                                 :sessions-dir "test-sessions-tools"
+                                 :tools [(repl-tools/repl-eval-tool)]})]
+      (with-redefs [http/completion (fn [& _]
+                                      (swap! calls inc)
+                                      (if (= 1 @calls)
+                                        {:choices [{:message {:content (str "\u27aatool:repl-eval\u27ab(+ 1 2)\u27aa/end\u27ab")}}]}
+                                        {:choices [{:message {:content "The answer is 3."}}]}))
+                    http/assistant-content http/assistant-content
+                    http/embed (constantly nil)]
+        (sut/chat! ag "what is (+ 1 2)?"))
+      (let [store (sut/get-memory-store ag)
+            msgs  (memory/load-recent-messages {:backend :datalevin
+                                                  :session-id sid
+                                                  :connection store
+                                                  :limit 10})]
+        (is (= 3 (count msgs)))
+        (is (= "user" (:msg/role (first msgs))))
+        (is (= "tool" (:msg/role (second msgs))))
+        (is (boolean (re-find #"repl-eval" (:msg/text (second msgs)))))
+        (is (= "assistant" (:msg/role (nth msgs 2)))))
+      (sut/close-session! ag))))
 
 ;; ---- Public API ----
 
@@ -157,24 +263,26 @@
   (testing "make-agent without :session-id has no memory state"
     (let [ag (sut/make-agent {:base-url "http://llm" :model "test"})]
       (is (nil? (:session-id @ag)))
-      (is (nil? (:memory-conn @ag))))))
+      (is (nil? (:memory-store @ag))))))
 
 (deftest make-agent-with-session-id
   (testing "make-agent with :session-id sets session and memory keys"
-    (let [ag (sut/make-agent {:base-url "http://llm"
+    (let [sid (str "core-session-" (System/nanoTime))
+          ag (sut/make-agent {:base-url "http://llm"
                               :model "test"
-                              :session-id "my-session"})]
-      (is (= "my-session" (:session-id @ag)))
-      (is (contains? @ag :memory-conn)))))
+                              :session-id sid
+                              :sessions-dir "test-sessions-core"})]
+      (is (= sid (:session-id @ag)))
+      (is (contains? @ag :memory-store))
+      (sut/close-session! ag))))
 
-(deftest make-agent-with-nil-session-id-generates-one
-  (testing "make-agent with nil :session-id auto-generates session-id"
+(deftest make-agent-with-nil-session-id-disables-memory
+  (testing "make-agent with nil :session-id does not enable memory"
     (let [ag (sut/make-agent {:base-url "http://llm"
                               :model "test"
                               :session-id nil})]
-      (is (string? (:session-id @ag)))
-      (is (.startsWith ^String (:session-id @ag) "session-"))
-      (is (contains? @ag :memory-conn)))))
+      (is (nil? (:session-id @ag)))
+      (is (nil? (:memory-store @ag))))))
 ;; ---- History Limit ----
 
 (deftest make-agent-default-history-limit
@@ -205,3 +313,29 @@
             limited (vec (take-last (:history-limit state) h))]
         (is (= 4 (count limited)))
         (is (= "msg 5" (:content (first limited))))))))
+
+(deftest compose-context-dedupes-relevant-and-recent
+  (testing "compose-context uses hybrid strategy to dedupe overlapping messages"
+    (let [state {:session-id "s1"
+                 :memory-store {}
+                 :memory-backend :datalevin
+                 :memory-relevant-limit 5
+                 :memory-recent-limit 5
+                 :memory-strategy :hybrid
+                 :history [{:role "user" :content "recent user"
+                            :msg-id "a" :timestamp 50}
+                           {:role "assistant" :content "recent reply"
+                            :msg-id "b" :timestamp 60}]}
+          relevant [{:msg/id "a" :msg/role "user" :msg/text "old user" :msg/timestamp 10}
+                    {:msg/id "c" :msg/role "user" :msg/text "rel only" :msg/timestamp 30}]]
+      (with-redefs [memory/retrieve-relevant (fn [_] relevant)]
+        (let [ctx (sut/compose-context state "query")]
+          (is (= 3 (count ctx)))
+          (is (= ["rel only" "recent user" "recent reply"]
+                 (mapv :content ctx)))))))
+
+(deftest compose-context-without-memory-returns-history
+  (testing "compose-context without memory returns in-agent history as-is"
+    (let [state {:history [{:role "user" :content "hello"}]}]
+      (is (= [{:role "user" :content "hello"}]
+             (sut/compose-context state "query")))))))

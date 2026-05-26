@@ -33,6 +33,11 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (sut/retrieve-relevant {:backend :unknown})))))
 
+(deftest load-recent-messages-default-throws
+  (testing "load-recent-messages throws on unknown backend"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (sut/load-recent-messages {:backend :unknown})))))
+
 (deftest close-session-default-throws
   (testing "close-session throws on unknown backend"
     (is (thrown? clojure.lang.ExceptionInfo
@@ -106,3 +111,10 @@
                     {:msg/id "c" :msg/timestamp 30}]]
       (let [result (sut/compose {:strategy :hybrid :relevant relevant :recent recent})]
         (is (= ["a" "c" "b"] (mapv :msg/id result)))))))
+
+(deftest compose-recent-only
+  (testing "compose :recent returns only recent messages"
+    (let [recent [{:msg/id "x" :msg/timestamp 10}
+                  {:msg/id "y" :msg/timestamp 20}]
+          relevant [{:msg/id "z" :msg/timestamp 5}]]
+      (is (= recent (sut/compose {:strategy :recent :relevant relevant :recent recent}))))))

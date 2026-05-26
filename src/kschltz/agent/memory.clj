@@ -11,6 +11,7 @@
     (create-session {:backend :datalevin :session-id \"my-session\" :model \"...\"})
     (store-message {:backend :datalevin :session-id \"my-session\" :message {...}})
     (retrieve-relevant {:backend :datalevin :session-id \"my-session\" :query \"...\" :limit 10})
+    (load-recent-messages {:backend :datalevin :session-id \"my-session\" :limit 10})
     (compose {:strategy :hybrid :relevant [...] :recent [...]})
     (close-session {:backend :datalevin :session-id \"my-session\"})"
   (:require [kschltz.agent.memory.datalevin :as dlevin]))
@@ -37,12 +38,15 @@
                   {:opts opts})))
 
 (defmethod create-session :datalevin
-  [{:keys [session-id model embedding-dims base-url api-key] :as opts}]
+  [{:keys [session-id model embedding-dims embedding-model base-url api-key sessions-dir]}]
   (let [store (dlevin/create-session-store session-id
-                     (cond-> (select-keys opts [:model])
-                       embedding-dims (assoc :embedding-dims embedding-dims)
-                       base-url      (assoc :base-url base-url)
-                       api-key       (assoc :api-key api-key)))]
+                     (cond-> {}
+                       model           (assoc :model model)
+                       embedding-dims  (assoc :embedding-dims embedding-dims)
+                       embedding-model (assoc :embedding-model embedding-model)
+                       base-url        (assoc :base-url base-url)
+                       api-key         (assoc :api-key api-key)
+                       sessions-dir    (assoc :sessions-dir sessions-dir)))]
     {:connection store}))
 
 (defmulti store-message
@@ -82,6 +86,24 @@
         top  (or limit 10)]
     (dlevin/search-relevant! conn q sid top)))
 
+(defmulti load-recent-messages
+  "Load the most recent messages for a session from persistent storage."
+  backend-dispatch)
+
+(defmethod load-recent-messages :default
+  [opts]
+  (throw (ex-info (str "Unknown memory backend: " (backend-dispatch opts))
+                  {:opts opts})))
+
+(defmethod load-recent-messages :datalevin
+  [{:keys [session-id limit connection] :as opts}]
+  (let [conn (or connection
+                 (throw (ex-info "No connection in opts" {:opts opts})))
+        sid  (or session-id
+                 (throw (ex-info "Missing :session-id" {:opts opts})))
+        n    (or limit 10)]
+    (or (dlevin/load-recent-messages! conn sid n) [])))
+
 (defmulti close-session
   "Close the session store."
   backend-dispatch)
@@ -117,3 +139,7 @@
     (->> (concat recent-items rel-items)
          (sort-by :msg/timestamp)
          (vec))))
+
+(defmethod compose :recent
+  [{:keys [recent recent-limit]}]
+  (vec (take-last (or recent-limit 10) recent)))

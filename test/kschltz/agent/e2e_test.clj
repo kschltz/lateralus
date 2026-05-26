@@ -15,8 +15,13 @@
 
 (defn- mock-completion
   "Returns a mock OpenAI-compatible completion response."
-  [_url _api-key _model _message & {:keys [chat-history]}]
-  {:choices [{:message {:content (str "Mock response " (swap! response-counter inc))}}]})
+  [_url _api-key _model _message & {:keys [chat-history messages]}]
+  (let [all-msgs (or messages
+                     (conj (vec chat-history)
+                           {:role "user" :content _message}))
+        last-content (:content (last all-msgs))]
+    {:choices [{:message {:content (str "Mock response " (swap! response-counter inc)
+                                        " re:" (subs (str last-content) 0 (min 20 (count (str last-content)))))}}]}))
 
 (defn- mock-assistant-content [response]
   (get-in response [:choices 0 :message :content]))
@@ -433,9 +438,84 @@
 (deftest e2e-has-unparsed-tool-markup
   (testing "detects \u27aatool: markup even when unparseable"
     (let [unparseable "I will \u27aatool:repl-eval\u27ab(broken"]
-      ;; This has \u27aatool: but no \u27aa/end\u27ab, so parse-tool-calls returns nil
       (is (nil? (core/parse-tool-calls unparseable)))
-      ;; But has-unparsed-tool-markup? still detects it
       (is (core/has-unparsed-tool-markup? unparseable))))
   (testing "clean text has no unparsed markup"
     (is (not (core/has-unparsed-tool-markup? "Hello, no tools here.")))))
+
+(deftest e2e-parse-unclosed-tool-calls
+  (testing "lenient parser handles missing end delimiter"
+    (is (= [{:tool "repl-eval" :args "(+ 1 2 3)"}]
+           (core/parse-tool-calls
+             "I'll compute that.\n\u27aatool:repl-eval\u27ab(+ 1 2 3)"))))
+  (testing "lenient parser strips markdown fences from args"
+    (is (= [{:tool "repl-eval" :args "(+ 1 2 3)"}]
+           (core/parse-tool-calls
+             (str "\u27aatool:repl-eval\u27ab```clojure\n(+ 1 2 3)\n```")))))
+  (testing "lenient parser extracts multi-line do forms"
+    (let [code "(do (def x 1) (inc x))"
+          parsed (core/parse-tool-calls
+                   (str "Starting server.\n\u27aatool:repl-eval\u27ab\n" code))]
+      (is (= [{:tool "repl-eval" :args code}] parsed)))))
+
+(deftest e2e-parse-markdown-tool-calls
+  (testing "markdown clojure blocks become repl-eval calls"
+    (is (= [{:tool "repl-eval" :args "(keys (methods #'tools/parse))"}]
+           (core/parse-tool-calls
+             "Let me check:\n```clojure\n(keys (methods #'tools/parse))\n```"))))
+  (testing "merges explicit tool calls with markdown blocks"
+    (let [parsed (core/parse-tool-calls
+                   (str "Loading.\n\u27aatool:repl-eval\u27ab(require '[foo.bar :as b])\u27aa/end\u27ab\n"
+                        "```clojure\n(keys (methods #'tools/run))\n```"))]
+      (is (= 2 (count parsed)))
+      (is (some #(= "(require '[foo.bar :as b])" (:args %)) parsed))
+      (is (some #(= "(keys (methods #'tools/run))" (:args %)) parsed)))))
+
+(deftest e2e-strip-unclosed-tool-markup
+  (testing "strip-tool-calls removes unclosed tool markup from final text"
+    (let [text (str "I'll start the server. \u27aatool:repl-eval\u27ab\n(do (def x 1) x)\nMore prose.")
+          stripped (core/strip-tool-calls text)]
+      (is (= "I'll start the server. More prose." stripped)
+          "Should remove unclosed tool block but keep prose"))))
+
+(deftest e2e-tool-roundtrip-preserves-context
+  (testing "second LLM call after tool execution includes original user message"
+    (let [captured-msgs (atom [])
+          tool-response "➪tool:repl-eval➫(+ 1 2 3)➪/end➫"
+          final-response "The sum is 6."
+          call-n (atom 0)]
+      (with-redefs [http/completion
+                    (fn [_url _api-key _model _message & {:keys [messages]}]
+                      (reset! captured-msgs messages)
+                      (let [n (swap! call-n inc)]
+                        {:choices [{:message {:content (if (= n 1)
+                                                        tool-response
+                                                        final-response)}}]}))
+                    http/assistant-content mock-assistant-content]
+        (let [ag (fresh-agent {:tools [(repl-tools/repl-eval-tool)]})
+              resp (core/chat! ag "What is (+ 1 2 3)?")]
+          (is (= final-response resp))
+          (is (= 2 @call-n))
+          (let [msgs @captured-msgs
+                contents (mapv :content msgs)]
+            (is (some #(.contains % "What is (+ 1 2 3)?") contents)
+                "original user question should be in API messages")
+            (is (some #(.contains % tool-response) contents)
+                "assistant tool-call should be in API messages")
+            (is (some #(.contains % "Tool results:") contents)
+                "tool results should be in API messages")))))))
+
+(deftest e2e-no-markdown-reparse-after-tool-results
+  (testing "fenced clojure in final answer is not re-executed as repl-eval"
+    (let [call-n (atom 0)]
+      (with-redefs [http/completion
+                    (fn [_url _api-key _model _message & _opts]
+                      (let [n (swap! call-n inc)]
+                        {:choices [{:message {:content (if (= n 1)
+                                                        "➪tool:repl-eval➫(+ 1 1)➪/end➫"
+                                                        "Use `(+ 1 1)` like this:\n```clojure\n(+ 1 1)\n```")}}]}))
+                    http/assistant-content mock-assistant-content]
+        (let [ag (fresh-agent {:tools [(repl-tools/repl-eval-tool)]})
+              resp (core/chat! ag "double one")]
+          (is (= 2 @call-n) "should not loop a third time for markdown block")
+          (is (.contains resp "`(+ 1 1)`")))))))

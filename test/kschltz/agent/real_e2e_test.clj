@@ -4,6 +4,7 @@
    Skipped automatically if no LLM endpoint is available."
   (:require [clojure.test :refer [deftest is testing]]
             [kschltz.agent.core :as core]
+            [kschltz.agent.http :as http]
             [kschltz.agent.memory :as memory]))
 
 (def ^:private llm-available?
@@ -224,3 +225,16 @@
         @loop-future
         (core/reset! ag)
         (is (= [] (core/get-history ag)))))))
+
+;; ============================================================
+;; 9. LIVE EMBEDDINGS (optional)
+;; ============================================================
+
+(deftest real-embed-returns-vector
+  (when-llm
+    (testing "http/embed returns a numeric vector from live endpoint"
+      (let [model (or (System/getenv "LATERALUS_EMBEDDING_MODEL") "nomic-embed-text")
+            v     (http/embed base-url nil model "hello world")]
+        (is (vector? v))
+        (is (pos? (count v)))
+        (is (every? number? v))))))

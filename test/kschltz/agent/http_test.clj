@@ -219,3 +219,26 @@
                     (mock-response :body {:choices [{:message {:content "ok"}}]}))]
       (sut/step (assoc default-step-args
                        :chat-history [{:role "user" :content "custom"}])))))
+
+;; ---- Embeddings ----
+
+(deftest embed-success
+  (testing "embed returns validated embedding vector"
+    (with-redefs [hato.client/post
+                  (fn [url opts]
+                    (is (= "http://127.0.0.1:8080/v1/embeddings" url))
+                    (is (= "nomic-embed-text" (:model (:form-params opts))))
+                    (is (= "hello" (:input (:form-params opts))))
+                    (mock-response :body {:data [{:embedding (vec (repeat 384 0.1))}]}))]
+      (let [v (sut/embed "http://127.0.0.1:8080" nil "nomic-embed-text" "hello")]
+        (is (= 384 (count v)))
+        (is (every? number? v))))))
+
+(deftest embed-failure-returns-nil
+  (testing "embed returns nil and logs on HTTP failure"
+    (with-redefs [hato.client/post (fn [_ _] (throw (Exception. "connection refused")))]
+      (is (nil? (sut/embed "http://127.0.0.1:8080" nil "nomic-embed-text" "hello"))))))
+
+(deftest embed-rejects-invalid-input
+  (testing "embed returns nil for invalid input text"
+    (is (nil? (sut/embed "http://127.0.0.1:8080" nil "nomic-embed-text" "")))))

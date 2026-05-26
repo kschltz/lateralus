@@ -5,7 +5,8 @@
         cheshire/cheshire {:mvn/version "6.2.0"}
         datalevin/datalevin {:mvn/version "0.10.7"}
         borkdude/edamame {:mvn/version "1.5.37"}
-        parinferish/parinferish {:mvn/version "0.8.0"}}
+        parinferish/parinferish {:mvn/version "0.8.0"}
+        metosin/malli {:mvn/version "0.16.4"}}
  :aliases
  {:run-m {:main-opts ["-m" "kschltz.lateralus"]}
   :run-x {:ns-default kschltz.lateralus

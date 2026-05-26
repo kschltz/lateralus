@@ -2,96 +2,122 @@
 
 ## Architecture
 
-Hybrid memory = **top-Y relevant entries** + **last-N recent messages**, deduped (chronological position wins).
+Hybrid memory = **top-Y relevant entries** + **last-N recent messages**, deduped and sorted chronologically. Implemented in `kschltz.agent.memory/compose` with strategy `:hybrid` (default).
 
 ## Storage
 
-- **One Datalevin store per session**, path: `./sessions/<session-id>/`
-- Created on `agent/start!` with session metadata
-- Single entity per message: text attrs + `:db.type/vec` on same entity
-- Single transaction per message exchange
+- **One Datalevin store per session**, absolute path: `<LATERALUS_SESSIONS_DIR>/<session-id>/`
+- Default sessions root: `./sessions/` (override with `LATERALUS_SESSIONS_DIR`)
+- Created on `make-agent` when `:session-id` is non-nil
+- **Datalog store** (`data.mdb`) for message entities
+- **Separate vector index** (`vectors/`) for HNSW semantic search
+- Embeddings computed via OpenAI-compatible `POST /v1/embeddings` (e.g. Ollama)
 
 ## Datalevin Schema
 
 ```clojure
-{:session/id       {:db/valueType :db.type/string
-                     :db/unique   :db.unique/identity}
-   :session/model    {:db/valueType :db.type/string}
-   :session/emb-method {:db/valueType :db.type/string}
-   :session/emb-model  {:db/valueType :db.type/string}
-   :msg/session      {:db/valueType :db.type/string}  ;; session-id ref
-   :msg/role         {:db/valueType :db.type/string}  ;; "user" | "assistant" | "tool"
-   :msg/text         {:db/valueType :db.type/string
-                      :db/embedding true
-                      :db.embedding/domains ["messages"]
-                      :db.embedding/autoDomain true}
-   :msg/timestamp    {:db/valueType :db.type/long}
-   :msg/msg-vec      {:db/valueType :db.type/vec
-                      :db.vec/domains ["messages"]}
-   :msg/tool-name    {:db/valueType :db.type/string}  ;; optional, for tool responses
-   :msg/tool-result  {:db/valueType :db.type/string}}  ;; optional, for tool responses
+{:session/id         {:db/valueType :db.type/string :db/unique :db.unique/identity}
+ :session/model      {:db/valueType :db.type/string}
+ :session/emb-method {:db/valueType :db.type/string}  ;; "openai-compatible-http"
+ :session/emb-model  {:db/valueType :db.type/string}
+ :msg/id             {:db/valueType :db.type/string :db/unique :db.unique/identity}
+ :msg/session        {:db/valueType :db.type/string}
+ :msg/role           {:db/valueType :db.type/string}   ;; "user" | "assistant" | "tool"
+ :msg/text           {:db/valueType :db.type/string}
+ :msg/timestamp      {:db/valueType :db.type/long}
+ :msg/tool-name      {:db/valueType :db.type/string}
+ :msg/tool-result    {:db/valueType :db.type/string}}
 ```
 
-Store opts:
-```clojure
-{:embedding-opts {:provider :default        ;; Datalevin built-in ONNX/llama.cpp
-                  :metric-type :cosine}
- :embedding-domains {"messages" {:provider :default :metric-type :cosine}}
- :vector-opts {:dimensions EMBEDDING_DIM :metric-type :cosine}
- :vector-domains {"messages" {:dimensions EMBEDDING_DIM :metric-type :cosine}}}
-```
+Vectors are **not** stored on entities. They live in a separate LMDB KV store indexed by `:msg/id`.
 
 ## Session ID
 
-- User-provided, or time-based UUID default
-- Passed to `start!` opts: `{:session-id "my-session"}`
+- User-provided via CLI `-s` / `LATERALUS_SESSION` or `make-agent {:session-id "..."}`
+- Memory is **opt-in** — omitted `:session-id` disables memory entirely
 
 ## Session Lifecycle
 
-- **Start**: `start!` creates Datalevin store, writes metadata
-- **Each message/response/tool-response**: transact to Datalevin (text + auto-embedding)
-- **LLM context assembly**: `[top-Y relevant (excluding overlap)] + [last-N recent]`
-- **Dedup**: chronological position wins — drop from top-Y if present in last-N
+| Event | Behavior |
+|-------|----------|
+| `make-agent` + `:session-id` | Open/create store, write session metadata, hydrate `:history` from last N persisted messages |
+| Each completed exchange | Store user + tool summary(s) + assistant text; embed and index when possible |
+| Each LLM call | `compose-context` → retrieve relevant + merge with in-agent history via `:hybrid` |
+| `reset!` | Clear runtime state; **keep** memory store open |
+| `close-session!` | Close Datalevin connection; disk data preserved |
 
 ## Context Assembly
 
 ```
-chat-history = dedupe(relevant_memories + recent_messages)
-             where:
-               relevant_memories = embedding-neighbors(query=current_msg, top=Y, session=scoped)
-               recent_messages   = last N messages from agent state
-               dedupe keeps chronological position, drops from relevant set
+composed = memory/compose :hybrid
+             relevant = vector-search(current_query, top=Y)
+             recent   = last N messages from agent :history (with :msg-id for dedup)
+           dedupe by :msg/id, sort by :msg/timestamp
+LLM messages = composed + current turn (tool rounds appended ephemerally in-turn)
 ```
+
+Agent state holds the memory store at `:memory-store` (access via `get-memory-store`).
+
+## Configuration
+
+| Option / Env | Default |
+|--------------|---------|
+| `LATERALUS_SESSIONS_DIR` / `:sessions-dir` | `sessions` |
+| `LATERALUS_EMBEDDING_MODEL` / `:memory-embedding-model` | `nomic-embed-text` |
+| `LATERALUS_MEMORY_EMBEDDING_DIMS` / `:memory-embedding-dims` | `384` |
+| `LATERALUS_MEMORY_RELEVANT_LIMIT` | `5` |
+| `LATERALUS_MEMORY_RECENT_LIMIT` | `10` |
+| `LATERALUS_MEMORY_STRATEGY` | `:hybrid` |
+| `LATERALUS_HISTORY_LIMIT` | `50` |
 
 ## Wiring — Multimethods
 
-### 1. Vector Storage/Search (`memory/store`)
+Namespace: `kschltz.agent.memory`
 
 ```clojure
-(defmulti store :backend)        ;; dispatch on :datalevin, future backends
-(defmulti retrieve :backend)     ;; dispatch on :backend
-(defmulti create-session :backend) ;; dispatch on :backend
+(create-session {:backend :datalevin ...})
+(store-message  {:backend :datalevin ...})
+(retrieve-relevant {:backend :datalevin ...})
+(load-recent-messages {:backend :datalevin ...})
+(close-session {:backend :datalevin ...})
+(compose {:strategy :hybrid ...})
 ```
 
-Default: `:datalevin`
+## What Gets Persisted
 
-### 2. LLM Completion (`llm/call`)
+| Stored | Not stored |
+|--------|--------------|
+| Final user message | Tool call markup / raw args |
+| Tool execution summaries (`:role "tool"`) | LLM reasoning/thinking |
+| Final assistant response | Intermediate assistant tool-call responses |
+| Embedding vector (when API succeeds) | Ephemeral in-turn tool-round API messages |
+| Session + embedding model metadata | |
 
-```clojure
-(defmulti call :provider)        ;; dispatch on :openai-compatible, :ollama, etc.
-```
+Tool summaries store compact text like `repl-eval((+ 1 2)) => 3` plus `:msg/tool-name` and `:msg/tool-result`.
 
-Default: `:openai-compatible` (current `http.clj`)
+## Embedding Failures
 
-### 3. Memory Strategy (`memory/compose`)
+When embedding or vector indexing fails:
+- Message is still written to Datalog (durable text)
+- Warning logged to stdout
+- `:on-memory-event` callback fired with `{:type :memory-not-indexed ...}`
+- Semantic search falls back to most-recent messages for that session
 
-```clojure
-(defmulti compose :strategy)     ;; dispatch on :hybrid, future strategies
-```
+## Test Coverage (Phase 5)
 
-Default: `:hybrid` (top-Y + last-N, deduped)
+| Area | Test namespace |
+|------|----------------|
+| Hybrid compose / dedup | `core-test`, `memory-e2e-test` |
+| Vector ranking order | `memory.datalevin-test` |
+| CLI session opt-in | `cli-test` |
+| Session resume in prompt | `memory-e2e-test`, `core-test` |
+| Embed failure + fallback | `http-test`, `memory.datalevin-test`, `core-test` |
+| End-to-end prompt shape | `memory-e2e-test`, `e2e-test` |
+| Stub embeddings (CI) | `memory-e2e-test`, `memory.datalevin-test` |
+| Live embed (optional) | `real-e2e-test` when Ollama is up |
 
 ## Dependencies
 
-- `datalevin/datalevin` — Datalog DB + vector search + built-in embeddings
-- `org.clojure/clojure` 1.12.5+ (already in deps.edn)
+- `datalevin/datalevin` — Datalog DB + vector search
+- `metosin/malli` — schema validation on HTTP/store boundaries
+- `hato/hato` — HTTP client for `/v1/embeddings`

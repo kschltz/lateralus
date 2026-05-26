@@ -228,3 +228,13 @@
     (let [tool (sut/repl-eval-tool)]
       (is (= "true" (tools/run tool "true")))
       (is (= "false" (tools/run tool "false"))))))
+
+(deftest run-repl-eval-strips-markdown-fences
+  (testing "eval mode accepts markdown-fenced code from LLM output"
+    (let [tool (sut/repl-eval-tool)]
+      (is (= "6" (tools/run tool "```clojure\n(+ 1 2 3)\n```"))))))
+
+(deftest run-repl-eval-multi-form
+  (testing "eval mode evaluates multiple top-level forms"
+    (let [tool (sut/repl-eval-tool)]
+      (is (= "2" (tools/run tool "(def x 1)\n(inc x)"))))))

@@ -19,7 +19,35 @@
    returns a parsed result (falls back to raw string if EDN parse fails).")
 
 (require '[kschltz.agent.tools :as tools]
-         '[kschltz.agent.delimiter-repair :as delimiter-repair])
+         '[kschltz.agent.delimiter-repair :as delimiter-repair]
+         '[clojure.string :as str]
+         '[edamame.core :as edamame])
+
+(defn- strip-markdown-fence
+  "Remove optional ```clojure fences from LLM-generated code."
+  [s]
+  (let [trimmed (str/trim (str s))]
+    (if (str/starts-with? trimmed "```")
+      (-> trimmed
+          (str/replace #"^```(?:clojure|clj)?\s*\n?" "")
+          (str/replace #"\n?```[\s\S]*$" "")
+          str/trim)
+      trimmed)))
+
+(defn- sanitize-code
+  "Normalize LLM-generated code before evaluation."
+  [code]
+  (-> code str/trim strip-markdown-fence str/trim))
+
+(defn- eval-forms
+  "Evaluate one or more Clojure forms from a code string."
+  [code]
+  (let [forms (edamame/parse-string-all code {:all true
+                                              :read-cond :allow
+                                              :auto-resolve name})]
+    (if (= 1 (count forms))
+      (clojure.core/eval (first forms))
+      (clojure.core/eval `(do ~@forms)))))
 
 ;; ---- Execution Mode Dispatch ----
 ;; These dispatch functions are defined BEFORE defmulti so the
@@ -42,10 +70,10 @@
 
 (defmethod run-repl :eval
   [tool args]
-  (let [code       (str args)
+  (let [code       (sanitize-code args)
         fixed-code (delimiter-repair/repair-or-original code)
         result     (try
-                     (clojure.core/eval (read-string fixed-code))
+                     (eval-forms fixed-code)
                      (catch Exception e
                        (str "Exception: " (.getMessage e))))]
     (pr-str result)))

@@ -18,7 +18,8 @@
    The agent passes a code string as args; the tool evaluates it and
    returns a parsed result (falls back to raw string if EDN parse fails).")
 
-(require '[kschltz.agent.tools :as tools])
+(require '[kschltz.agent.tools :as tools]
+         '[kschltz.agent.delimiter-repair :as delimiter-repair])
 
 ;; ---- Execution Mode Dispatch ----
 ;; These dispatch functions are defined BEFORE defmulti so the
@@ -41,11 +42,12 @@
 
 (defmethod run-repl :eval
   [tool args]
-  (let [code (str args)
-        result (try
-                 (clojure.core/eval (read-string code))
-                 (catch Exception e
-                   (str "Exception: " (.getMessage e))))]
+  (let [code       (str args)
+        fixed-code (delimiter-repair/repair-or-original code)
+        result     (try
+                     (clojure.core/eval (read-string fixed-code))
+                     (catch Exception e
+                       (str "Exception: " (.getMessage e))))]
     (pr-str result)))
 
 (defmethod run-repl :nrepl

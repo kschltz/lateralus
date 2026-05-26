@@ -430,17 +430,14 @@
           ;; No tool calls found — check for malformed markup
           (nil? calls)
           (if (has-unparsed-tool-markup? response)
-            ;; LLM wrote tool-call syntax but regex didn't match — malformed
-            ;; Re-prompt the LLM with a correction so it can retry
-            (if (>= depth max-depth)
-              (str (strip-tool-calls response) "\n\n[Malformed tool call — limit reached]")
-              (recur (str "Your previous response contained malformed tool call syntax. "
-                          "The closing tag must be EXACTLY ➪/end➫ — nothing else. "
-                          "Do NOT add suffixes like 'store-thought'. "
-                          "Please retry with correct syntax, or simply respond with text.")
-                     (inc depth) false))
-            ;; Clean text response — strip any residual markup and return
-            (strip-tool-calls response))
+            ;; LLM wrote tool-call syntax but regex didn't match — malformed.
+            ;; Rather than re-prompt (which causes some LLMs to give up on tools entirely),
+            ;; silently strip the malformed markup and present the prose response.
+            ;; The LLM's prose after the broken tool call may contain useful information.
+            (strip-tool-calls response)
+
+          ;; Clean text response — strip any residual markup and return
+          (strip-tool-calls response))
 
           (>= depth max-depth)
           (str (strip-tool-calls response) "\n\n[Tool call limit reached]")

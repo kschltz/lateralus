@@ -454,8 +454,10 @@
                     tool-msg  (format-tool-results results)]
                 (if (and (seq errors) (< retry-count max-retries))
                   ;; Some tools failed — retry LLM with error context
+                  ;; Be explicit: no explanations, just fix the code and call the tool again.
                   (recur (str tool-msg
-                               "\n\nSome tool calls produced errors. Please retry with corrected code.\nErrors:\n"
+                               "\n\nThe above tool calls failed. Do NOT explain or apologize. "
+                               "Call the tool again with corrected code. Errors:\n"
                                (str/join "\n" (map #(str "  " (:tool %) ": " (:error %)) errors)))
                          (inc depth) false (inc retry-count))
                   ;; No errors or retries exhausted — continue normally

@@ -1,4 +1,9 @@
-(ns kschltz.agent.tools)
+(ns kschltz.agent.tools
+  (:require [cheshire.core :as json]
+            [malli.core :as m]
+            [malli.json-schema :as json-schema]
+            [malli.transform :as mt]
+            [malli.error :as me]))
 
 ;; ---- Tool Registration ----
 ;; Uses cond-based dispatch for registration (avoids defmulti &-arg
@@ -58,6 +63,49 @@
 (defmethod parse :default
   [tool response]
   response)
+
+;; ---- OpenAI Function Calling ----
+
+(defn openai-tool-def
+  "Convert a tool map to an OpenAI function-calling tool definition.
+   Uses malli.json-schema/transform on the tool's :parameters Malli schema
+   to generate JSON Schema for the API.
+   Returns {:type \"function\" :function {:name ... :description ... :parameters ...}}."
+  [tool]
+  (let [params-schema (or (:parameters tool)
+                          (throw (ex-info "Tool missing :parameters Malli schema" {:tool (:name tool)})))]
+    {:type "function"
+     :function {:name (:name tool)
+                :description (:description tool)
+                :parameters (json-schema/transform params-schema)}}))
+
+(defn coerce-args
+  "Decode JSON args string through the tool's Malli :parameters schema.
+   Uses m/decode with JSON transformer for type coercion (string->int etc.).
+   Returns the decoded Clojure map on success, or nil on parse failure."
+  [tool args-str]
+  (when-let [params-schema (:parameters tool)]
+    (try
+      (let [parsed (json/parse-string args-str true)]
+        (m/decode params-schema parsed mt/json-transformer))
+      (catch Exception _ nil))))
+
+(defn validate-args
+  "Validate coerced args against the tool's Malli :parameters schema.
+   Returns {:ok decoded-map} if valid, or {:error humanized-errors} if invalid.
+   Accepts pre-coerced map or raw JSON string."
+  [tool arg-value]
+  (let [params-schema (:parameters tool)
+        decoded       (if (map? arg-value)
+                        arg-value
+                        (coerce-args tool arg-value))]
+    (if-not params-schema
+      {:ok decoded}
+      (if-let [explain (m/explain params-schema decoded)]
+        (if (seq (:errors explain))
+          {:error (me/humanize explain)}
+          {:ok decoded})
+        {:ok decoded}))))
 
 ;; ---- Public API ----
 (defn tool-call

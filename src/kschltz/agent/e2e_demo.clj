@@ -10,26 +10,31 @@
   (let [all-msgs (or messages
                      (conj (vec chat-history)
                            {:role "user" :content message}))
-        last-content (:content (last all-msgs))
+        last-msg  (last all-msgs)
+        last-content (:content last-msg)
         n (inc (count @call-log))]
     (swap! call-log conj n)
     (println (str "   [LLM call " n "] msgs=" (count all-msgs)
                   " last=" (subs (str/replace (str last-content) #"\n" "\\n")
                                  0 (min 60 (count (str last-content))))))
     (cond
-      ;; If last message contains tool results → give final answer
-      (.contains (str last-content) "Tool results:")
+      ;; If last message is a tool result → give final answer
+      (= "tool" (:role last-msg))
       (if (.contains (str last-content) "15")
         {:choices [{:message {:content "The sum of 1 through 5 is **15**. I used repl-eval to calculate that."}}]}
         {:choices [{:message {:content "The type is **java.lang.Long**. Clojure integers are Java longs."}}]})
 
-      ;; If message asks about sum → call tool  
+      ;; If message asks about sum → call tool (native function calling)
       (.contains (.toLowerCase (str last-content)) "sum")
-      {:choices [{:message {:content "Let me compute.\n➪tool:repl-eval➫(+ 1 2 3 4 5)➪/end➫"}}]}
+      {:choices [{:message {:tool_calls [{:id "call-sum"
+                                          :function {:name "repl-eval"
+                                                     :arguments "{\"code\": \"(+ 1 2 3 4 5)\"}"}}]}}]}
 
       ;; If message asks about type → call tool
       (.contains (.toLowerCase (str last-content)) "type")
-      {:choices [{:message {:content "Let me check.\n➪tool:repl-eval➫(class (+ 1 1))➪/end➫"}}]}
+      {:choices [{:message {:tool_calls [{:id "call-type"
+                                          :function {:name "repl-eval"
+                                                     :arguments "{\"code\": \"(class (+ 1 1))\"}"}}]}}]}
 
       ;; Generic
       :else

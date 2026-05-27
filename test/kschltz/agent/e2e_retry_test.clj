@@ -17,12 +17,13 @@
 (defn- retry-mock-completion
   [_url _api-key _model _message & {:keys [chat-history]}]
   (let [n (swap! call-count inc)]
-    {:choices [{:message {:content
-      (case n
-        ;; Call 1: tool call with code that will fail at eval
-        1 (str "Let me compute that.\n\u27aatool:repl-eval\u27ab(/ 1 0)\u27aa/end\u27ab")
-        ;; Call 2+, after retry with error context: clean text answer
-        "The result is undefined because you cannot divide by zero.")}}]}))
+    (case n
+      ;; Call 1: tool call with code that will fail at eval
+      1 {:choices [{:message {:tool_calls [{:id "call-1"
+                                            :function {:name "repl-eval"
+                                                       :arguments "{\"code\": \"(/ 1 0)\"}"}}]}}]}
+      ;; Call 2+, after retry with error context: clean text answer
+      {:choices [{:message {:content "The result is undefined because you cannot divide by zero."}}]})))
 
 (defn- mock-assistant-content [response]
   (get-in response [:choices 0 :message :content]))

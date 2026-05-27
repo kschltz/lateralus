@@ -128,9 +128,13 @@
       (with-redefs [http/completion (fn [& _]
                                       (swap! calls inc)
                                       (if (= 1 @calls)
-                                        {:choices [{:message {:content (str "\u27aatool:repl-eval\u27ab(+ 1 2)\u27aa/end\u27ab")}}]}
+                                        {:choices [{:message {:tool_calls [{:id "call-1"
+                                                                             :function {:name "repl-eval"
+                                                                                        :arguments "{\"code\": \"(+ 1 2)\"}"}}]}}]}
                                         {:choices [{:message {:content "The answer is 3."}}]}))
                     http/assistant-content http/assistant-content
+                    http/tool-calls http/tool-calls
+                    http/assistant-message http/assistant-message
                     http/embed (constantly nil)]
         (sut/chat! ag "what is (+ 1 2)?"))
       (let [store (sut/get-memory-store ag)

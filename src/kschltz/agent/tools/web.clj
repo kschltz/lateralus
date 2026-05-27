@@ -31,7 +31,7 @@
 
 (defn- normalize-query
   [args]
-  (-> args str str/trim))
+  (-> args :query str str/trim))
 
 (defn- encode-query
   [query]
@@ -94,14 +94,16 @@
 
 (defn web-search-tool
   "Create a :web tool that searches DuckDuckGo.
-   Args: search query string. Returns: EDN vector of {:title :url :snippet} maps."
+   Args: {:query string} (decoded from LLM JSON args via Malli).
+   Returns: EDN vector of {:title :url :snippet} maps."
   ([]
    (web-search-tool {}))
   ([opts]
    {:type        :web
     :name        (or (:name opts) "web-search")
     :description (or (:description opts)
-                      "Search the web via DuckDuckGo. Args: query string. Returns: vector of result maps.")}))
+                      "Search the web via DuckDuckGo. Args: {:query string}. Returns: vector of result maps.")
+    :parameters  [:map [:query :string]]}))
 
 (defmethod tools/run :web
   [_tool args]

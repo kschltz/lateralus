@@ -312,8 +312,8 @@
   "Compact text summary of a tool execution round."
   [{:keys [tool args result error]}]
   (if error
-    (str tool "(" args ") => Error: " error)
-    (str tool "(" args ") => " result)))
+    (str tool "(" (pr-str args) ") => Error: " error)
+    (str tool "(" (pr-str args) ") => " result)))
 
 (defn- tool-round-result-text
   "Stored :msg/tool-result value for a tool round."
@@ -368,244 +368,138 @@
         (println (str "Memory store error: " (.getMessage e)))
         nil))))
 
-;; ---- LLM ----
+;; ---- Tool Use (OpenAI Native Function Calling) ----
 
-(defn- llm-call
-  "Call the LLM API. Uses memory-augmented context when available.
-
-   Options map:
-     :user-text      — original user message (used for memory retrieval)
-     :manifest       — tool manifest prepended to the first user turn
-     :turn-messages  — in-turn API messages [{:role ... :content ...} ...]
-
-   Returns a map {:content ... :reasoning ...}."
-  [state {:keys [user-text manifest turn-messages]}]
-  (if (and (:base-url state) (:model state))
-    (let [ctx          (compose-context state user-text)
-          api-messages (if turn-messages
-                         (into (vec ctx) turn-messages)
-                         (let [user-msg (if manifest
-                                          (str manifest "\n\n" user-text)
-                                          user-text)]
-                           (conj (vec ctx) {:role "user" :content user-msg})))]
-      (let [response (http/completion (:base-url state) (:api-key state)
-                                      (:model state) nil
-                                      :messages api-messages)]
-        {:content   (or (http/assistant-content response) "No response from LLM")
-         :reasoning (http/reasoning-content response)}))
-    {:content "LLM not configured" :reasoning nil}))
-
-;; ---- Tool Use ----
-
-(def ^:private tool-call-regex
-  "Regex to extract tool calls from LLM responses.
-   Format: \u27aatool:tool-name\u27ab Arguments \u27aa/end\u27ab
-   Allows optional text (e.g. 'store-thought') between /end and closing \u27ab
-   so LLM inventions like \u27aa/end store-thought\u27ab still parse correctly."
-  #"\u27aatool:(.+?)\u27ab(.+?)\u27aa/end[^\u27ab]*\u27ab")
-
-(defn tool-manifest
-  "Build a tool manifest string for the LLM context.
+(defn openai-tools
+  "Build the OpenAI-format tools array from registered tools.
    Returns nil if no tools are registered."
   [tools]
   (when (seq tools)
-    (str "\nYou have access to these tools:\n"
-         (str/join "\n"
-           (for [t tools]
-             (str "- " (:name t) ": " (:description t))))
-         "\nTo call a tool, write EXACTLY: ➪tool:tool-name➫(arguments)➪/end➫\n"
-         "Example: ➪tool:repl-eval➫(+ 1 2 3)➪/end➫\n"
-         "Example: ➪tool:web-search➫Clojure multimethods➪/end➫\n"
-         "IMPORTANT: Always include ➪/end➫ after the arguments.\n"
-         "Do NOT use placeholders like (code) — pass real executable code or queries.\n"
-         "Do NOT show code in markdown fences — call the tool instead.\n"
-         "Do NOT paste code and say \"let me evaluate\" — execute it via a tool call.\n"
-         "When asked to explain tools, answer in plain text. Do NOT call repl-eval for that.\n"
-         "repl-eval runs Clojure in the JVM; it cannot register new agent tools at runtime.\n"
-         "To add tools permanently, create a namespace under kschltz.agent.tools and register it in the CLI.\n"
-         "IMPORTANT: The closing tag is ➪/end➫ — NOTHING else.\n"
-         "Do NOT add suffixes like ➪/end store-thought➫ or ➪/end➫/thought.\n"
-         "Do NOT write tool results yourself — you will receive real results.\n\n"
-         "You may make multiple tool calls in one response.\n"
-         "After receiving tool results, you may respond with more tool calls or a final text answer.\n"
-         "If you need more information to use a tool correctly, ask the user.")))
+    (vec (mapv tools/openai-tool-def tools))))
 
-(def ^:private tool-args-boundary-regex
-  "Stops arg extraction at the next tool marker or end tag."
-  #"(\u27aa/end|\u27aatool:)")
+(defn- parse-tool-calls-native
+  "Extract tool calls from an OpenAI native function-calling response.
+   Returns [{:id call-id :tool name :args json-args-string}] or nil."
+  [response]
+  (when-let [tcs (http/tool-calls response)]
+    (vec (for [tc tcs
+               :let [f (get tc :function)]]
+           {:id   (:id tc)
+            :tool (:name f)
+            :args (:arguments f)}))))
 
-(def ^:private markdown-clojure-regex
-  "Extract fenced Clojure blocks the LLM often emits instead of tool calls."
-  #"```(?:clojure|clj)?\s*\n([\s\S]*?)```")
-
-(defn- strip-markdown-fence
-  "Remove optional ```clojure fences from LLM-generated code."
-  [s]
-  (let [trimmed (str/trim s)]
-    (if (str/starts-with? trimmed "```")
-      (-> trimmed
-          (str/replace #"^```(?:clojure|clj)?\s*\n?" "")
-          (str/replace #"\n?```[\s\S]*$" "")
-          str/trim)
-      trimmed)))
-
-(defn- scan-to-close
-  "Return index of the closing delimiter matching open-char at index 0."
-  [s open-char close-char]
-  (loop [i 0 depth 0]
-    (when (< i (count s))
-      (let [c (.charAt s i)]
-        (cond
-          (= c open-char) (recur (inc i) (inc depth))
-          (and (= c close-char) (pos? depth))
-          (if (= depth 1) i (recur (inc i) (dec depth)))
-          :else (recur (inc i) depth))))))
-
-(defn- extract-balanced-arg
-  "Extract the first balanced s-expression or bracketed form from s."
-  [s]
-  (let [s (strip-markdown-fence s)]
-    (when (seq s)
-      (let [c (.charAt s 0)]
-        (cond
-          (= c \()
-          (when-let [end (scan-to-close s \( \))]
-            (subs s 0 (inc end)))
-
-          (= c \[)
-          (when-let [end (scan-to-close s \[ \])]
-            (subs s 0 (inc end)))
-
-          (= c \{)
-          (when-let [end (scan-to-close s \{ \})]
-            (subs s 0 (inc end)))
-
-          :else
-          (some-> (re-find #"^[^\u27aa]+" s) str/trim))))))
-
-(defn- extract-tool-args
-  "Extract tool arguments from text after the opener delimiter."
-  [after-opener]
-  (let [before-boundary (str/trim (or (first (str/split after-opener tool-args-boundary-regex))
-                                      after-opener))]
-    (extract-balanced-arg before-boundary)))
-
-(defn- parse-tool-calls-lenient
-  "Fallback parser for LLM output missing \u27aa/end\u27ab closers or using markdown fences."
-  [text]
-  (let [segments (str/split text #"\u27aatool:")]
-    (when (> (count segments) 1)
-      (vec (for [segment (rest segments)
-                 :let [name-end (.indexOf segment (int \u27ab))
-                       tool-name (when (pos? name-end) (str/trim (subs segment 0 name-end)))
-                       after-opener (when name-end (subs segment (inc name-end)))
-                       args (when after-opener (extract-tool-args after-opener))]
-                 :when (and tool-name args (not (str/blank? args)))]
-             {:tool tool-name
-              :args (str/trim args)})))))
-
-(defn- parse-markdown-repl-calls
-  "Fallback: treat ```clojure blocks as repl-eval calls when the LLM skips tool markup."
-  [text]
-  (when-let [blocks (seq (re-seq markdown-clojure-regex text))]
-    (vec (for [[_ code] blocks
-               :let [trimmed (str/trim code)]
-               :when (seq trimmed)]
-           {:tool "repl-eval"
-            :args trimmed}))))
-
-(defn- merge-tool-calls
-  "Combine tool calls from multiple parsers, deduping by tool+args."
-  [& groups]
-  (let [merged (mapcat (fn [g] (or g [])) groups)]
-    (not-empty
-      (vec (vals (reduce (fn [m c] (assoc m [(:tool c) (:args c)] c))
-                         {}
-                         merged))))))
-
-(defn parse-tool-calls
-  "Extract tool calls from LLM response text.
-   Returns a vector of {:tool \"name\" :args \"...\"} or nil if none found.
-
-   When markdown-fallback? is false, fenced ```clojure blocks are ignored.
-   Use false after tool results to avoid re-executing code in final answers."
-  ([text]
-   (parse-tool-calls text true))
-  ([text markdown-fallback?]
-   (merge-tool-calls
-     (when-let [matches (re-seq tool-call-regex text)]
-       (vec (for [[_ name args] matches]
-              {:tool (str/trim name)
-               :args (str/trim (strip-markdown-fence args))})))
-     (parse-tool-calls-lenient text)
-     (when markdown-fallback? (parse-markdown-repl-calls text)))))
+(defn- format-tool-results-native
+  "Build role:\"tool\" messages from tool execution results."
+  [results]
+  (vec (for [{:keys [id result error]} results]
+         {:role "tool"
+          :tool_call_id id
+          :content (if error (str "Error: " error) (str result))})))
 
 (defn- execute-tool-call
-  "Execute a single tool call. Returns {:tool ... :args ... :result ... :error ...}."
+  "Execute a single tool call with Malli validation.
+   Returns {:id call-id :tool name :args decoded-map :result output-str}
+   or {:id call-id :tool name :args raw-json :error humanized-errors}."
   [tools call]
-  (let [{:keys [tool name] :as _call} call
-        tool-name (:tool call)
-        tool-def  (first (filter #(= (:name %) tool-name) tools))]
-    (if tool-def
-      (try
-        (let [result (tools/tool-call tool-def (:args call))]
-          {:tool   tool-name
-           :args  (:args call)
-           :result result})
-        (catch Exception e
-          {:tool   tool-name
-           :args  (:args call)
-           :error (.getMessage e)}))
-      {:tool   tool-name
-       :args  (:args call)
-       :error (str "Unknown tool: " tool-name)})))
+  (let [{:keys [id tool args]} call
+        tool-def (first (filter #(= (:name %) tool) tools))]
+    (if-not tool-def
+      {:id id :tool tool :args args :error (str "Unknown tool: " tool)}
+      (let [validation (tools/validate-args tool-def args)]
+        (if-let [err (:error validation)]
+          {:id id :tool tool :args args :error (pr-str err)}
+          (try
+            (let [result (tools/tool-call tool-def (:ok validation))]
+              {:id id :tool tool :args (:ok validation) :result result})
+            (catch Exception e
+              {:id id :tool tool :args args :error (.getMessage e)})))))))
 
 (defn- execute-tool-calls
   "Execute multiple tool calls in parallel. Returns vector of results."
   [calls tools]
   (vec (pmap #(execute-tool-call tools %) calls)))
 
-(defn- format-tool-results
-  "Format tool execution results for the next LLM call."
-  [results]
-  (str "Tool results:\n"
-       (str/join "\n"
-         (for [{:keys [tool args result error]} results]
-           (if error
-             (str tool "(" args ") => Error: " error)
-             (str tool "(" args ") => " result))))))
+;; ---- LLM ----
 
-(defn- strip-unclosed-tool-markup
-  "Remove tool opener + args when the LLM omitted ➪/end➫."
-  [text]
-  (loop [s text]
-    (if-some [idx (str/index-of s "\u27aatool:")]
-      (let [after-tool (subs s (+ idx (count "\u27aatool:")))
-            name-end   (.indexOf after-tool (int \u27ab))]
-        (if (pos? name-end)
-          (let [after-opener (subs after-tool (inc name-end))
-                args         (extract-tool-args after-opener)]
-            (if (and args (pos? (count args)))
-              (let [args-start (str/index-of s args idx)
-                    end        (+ args-start (count args))
-                    before     (str/trim (subs s 0 idx))
-                    after      (str/trim (subs s end))]
-                (recur (if (seq before)
-                         (str before " " after)
-                         after)))
-              (recur (subs s (+ idx (count "\u27aatool:"))))))
-          (recur (subs s (+ idx (count "\u27aatool:"))))))
-      s)))
+(defn- llm-call
+  "Call the LLM API. Uses memory-augmented context when available.
+   Passes tools for native function calling.
+   Returns the raw API response map."
+  [state {:keys [user-text turn-messages]}]
+  (if (and (:base-url state) (:model state))
+    (let [ctx          (compose-context state user-text)
+          api-messages (if turn-messages
+                         (into (vec ctx) turn-messages)
+                         (conj (vec ctx) {:role "user" :content user-text}))
+          api-tools    (openai-tools (:tools state))]
+      (http/completion (:base-url state) (:api-key state)
+                       (:model state) nil
+                       :messages api-messages
+                       :tools api-tools))
+    {:choices [{:message {:content "LLM not configured"}}]}))
 
-(defn strip-tool-calls
-  "Remove tool call markup from text, returning any surrounding text.
-   Also strips any residual \u27aa...\u27ab fragments the LLM may emit."
-  [text]
-  (let [without-calls    (str/replace text tool-call-regex "")
-        without-unclosed (strip-unclosed-tool-markup without-calls)
-        without-markdown (str/replace without-unclosed markdown-clojure-regex "")
-        without-residual (str/replace without-markdown #"\u27aa/end[^\u27ab]*\u27ab" "")]
-    (str/trim (str/replace without-residual #"\s{2,}" " "))))
+;; ---- Loop ----
+
+(defn- llm-turn-result
+  [response tool-rounds]
+  {:response response :tool-rounds (vec tool-rounds)})
+
+(defn- llm-turn
+  "Run one LLM call. If it contains tool calls, execute them and loop.
+   Returns {:response ... :tool-rounds [...]} after all tool calls are resolved.
+   Bounded by :max-tool-calls to prevent infinite loops.
+   Fires :on-thought callback with intermediate events.
+   Retries on Malli validation errors or tool execution errors
+   up to :max-retries times (default 3, env LATERALUS_MAX_RETRIES)."
+  [ag state user-text]
+  (let [max-depth   (or (:max-tool-calls state) 10)
+        max-retries (or (:max-retries state) 3)]
+    (loop [turn-msgs    [{:role "user" :content user-text}]
+           depth        0
+           retry-count  0
+           tool-rounds  []]
+      (let [response   (llm-call state {:user-text user-text
+                                        :turn-messages turn-msgs})
+            content    (http/assistant-content response)
+            reasoning  (http/reasoning-content response)
+            _          (when reasoning
+                         (fire-on-thought state {:type :thinking :content reasoning}))
+            calls      (parse-tool-calls-native response)]
+        (cond
+          ;; No tool calls — retry if empty, otherwise return
+          (nil? calls)
+          (let [text (or content "")]
+            (if (and (str/blank? text) (< retry-count max-retries))
+              (recur (conj turn-msgs
+                           (http/assistant-message response)
+                           {:role "user"
+                            :content "Your previous response was empty. Provide a plain-text answer."})
+                     depth (inc retry-count) tool-rounds)
+              (llm-turn-result text tool-rounds)))
+
+          (>= depth max-depth)
+          (llm-turn-result (str (or content "") "\n\n[Tool call limit reached]")
+                           tool-rounds)
+
+          :else
+          (let [_         (fire-on-thought state {:type :tool-call :content (or content "")
+                                                  :calls calls})
+               results    (execute-tool-calls calls (:tools state))
+               _          (fire-on-thought state {:type :tool-result :results results})
+               errors     (filterv :error results)
+               tool-msgs  (format-tool-results-native results)
+               rounds'    (into tool-rounds results)]
+            (if (and (seq errors) (< retry-count max-retries))
+              (recur (-> turn-msgs
+                           (into [(http/assistant-message response)])
+                           (into tool-msgs)
+                           (into [{:role "user"
+                                   :content (str "The following tool calls failed. Do NOT explain or apologize. "
+                                                 "Call the tool again with corrected arguments.\nErrors:\n"
+                                                 (str/join "\n" (map #(str "  " (:tool %) ": " (:error %)) errors)))}]))
+                     (inc depth) (inc retry-count) rounds')
+              (recur (into (into turn-msgs [(http/assistant-message response)]) tool-msgs)
+                     (inc depth) retry-count rounds'))))))))
 
 ;; ---- Queue Operations ----
 
@@ -630,8 +524,6 @@
   (when handler (try (handler response) (catch Exception e
                                     (println (str "Handler error: " (.getMessage e)))))))
 
-;; ---- Loop ----
-
 (defn- default-error-handler
   "Default error handler: log the error and continue running.
    The agent loop catches errors so it can keep processing messages.
@@ -642,98 +534,6 @@
     (send ag assoc :running false)
     (await ag)))
 
-(defn has-unparsed-tool-markup?
-  "Check if text contains ➪tool:...➫ markup that wasn't parsed as tool calls.
-   This detects LLM hallucinations where it writes tool-call syntax with
-   malformed delimiters (e.g. ➪/end store-thought➫)."
-  [text]
-  (boolean (re-find #"\u27aatool:" text)))
-
-(defn- llm-turn-result
-  [response tool-rounds]
-  {:response response :tool-rounds (vec tool-rounds)})
-
-(defn- llm-turn
-  "Run one LLM call. If it contains tool calls, execute them and loop.
-   Returns {:response ... :tool-rounds [...]} after all tool calls are resolved.
-   Bounded by max-tool-calls to prevent infinite loops.
-   Fires :on-thought callback with intermediate events.
-   When tool execution produces errors, retries the LLM with error context
-   up to :max-retries times (default 3, env LATERALUS_MAX_RETRIES)."
-  [ag state user-text]
-  (let [manifest          (tool-manifest (:tools state))
-        max-depth         (or (:max-tool-calls state) 10)
-        max-retries       (or (:max-retries state) 3)
-        first-user-content (if manifest
-                             (str manifest "\n\n" user-text)
-                             user-text)]
-    (loop [turn-msgs    [{:role "user" :content first-user-content}]
-           depth        0
-           retry-count  0
-           tool-rounds  []]
-      (let [resp-map           (llm-call state {:user-text user-text
-                                              :turn-messages turn-msgs})
-            response           (:content resp-map)
-            reasoning          (:reasoning resp-map)
-            _                  (when reasoning
-                                 (fire-on-thought state {:type :thinking :content reasoning}))
-            parse-text         (if reasoning (str response "\n" reasoning) response)
-            markdown-fallback? (zero? depth)
-            calls              (when manifest (parse-tool-calls parse-text markdown-fallback?))]
-        (cond
-          ;; No tool calls found — retry if markup looks broken or response is empty
-          (nil? calls)
-          (let [stripped (strip-tool-calls response)]
-            (cond
-              (and (str/blank? stripped) (< retry-count max-retries))
-              (recur (conj turn-msgs
-                           {:role "assistant" :content response}
-                           {:role "user"
-                            :content (str "Your previous response was empty or contained only tool markup. "
-                                          "Provide a plain-text answer for the user based on the conversation above.")})
-                     depth (inc retry-count) tool-rounds)
-
-              (and (has-unparsed-tool-markup? response)
-                   (< retry-count max-retries))
-              (recur (conj turn-msgs
-                           {:role "assistant" :content response}
-                           {:role "user"
-                            :content (str "Your previous response contained malformed tool-call markup. "
-                                           "Use EXACTLY: ➪tool:tool-name➫(arguments)➪/end➫ with real code, "
-                                           "no markdown fences, and no placeholders like (code).")})
-                     depth (inc retry-count) tool-rounds)
-
-              :else (llm-turn-result stripped tool-rounds)))
-
-          (>= depth max-depth)
-          (llm-turn-result (str (strip-tool-calls response) "\n\n[Tool call limit reached]")
-                           tool-rounds)
-
-          :else
-          (let [known-names (into #{} (map :name) (:tools state))
-                valid-calls (filterv #(contains? known-names (:tool %)) calls)]
-            (if (empty? valid-calls)
-              (llm-turn-result (strip-tool-calls response) tool-rounds)
-              (let [_         (fire-on-thought state {:type :tool-call :content response :calls valid-calls})
-                    results   (execute-tool-calls valid-calls (:tools state))
-                    _         (fire-on-thought state {:type :tool-result :results results})
-                    errors    (filterv :error results)
-                    tool-msg  (format-tool-results results)
-                    rounds'   (into tool-rounds results)]
-                (if (and (seq errors) (< retry-count max-retries))
-                  (recur (into turn-msgs
-                               [{:role "assistant" :content response}
-                                {:role "user"
-                                 :content (str tool-msg
-                                               "\n\nThe above tool calls failed. Do NOT explain or apologize. "
-                                               "Call the tool again with corrected code. Errors:\n"
-                                               (str/join "\n" (map #(str "  " (:tool %) ": " (:error %)) errors)))}])
-                         (inc depth) (inc retry-count) rounds')
-                  (recur (into turn-msgs
-                               [{:role "assistant" :content response}
-                                {:role "user" :content tool-msg}])
-                         (inc depth) retry-count rounds'))))))))))
-
 (defn- history-entries-for-exchange
   "Build chat-history entries for a stored user/tool/assistant exchange."
   [items response stored tool-rounds]
@@ -743,6 +543,7 @@
         tool-entries (mapv (fn [[idx tr]]
                              (let [stored-tool (get-in stored [:tools idx])]
                                (cond-> {:role "tool" :content (tool-round-summary tr)}
+                                 (:id tr) (assoc :tool_call_id (:id tr))
                                  stored-tool (assoc :msg-id (:tool-id stored-tool)
                                                     :timestamp (:timestamp stored-tool)))))
                            (map-indexed vector tool-rounds))
@@ -818,7 +619,7 @@
           (cond
             (= (:action next-state) :idle)      (recur turn)
             (= (:action next-state) :processed)  (recur (:turn next-state))
-            (= (:action next-state) :error)      (recur (:turn next-state))))))))
+            (= (:action next-state) :error)      (recur (inc (:turn next-state)))))))))
 
 
 ;; ---- Public API ----

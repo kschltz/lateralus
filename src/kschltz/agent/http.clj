@@ -22,13 +22,14 @@
                         (assoc :headers (auth-headers api-key))))
         :body)))
 
-(defn completion [url api-key model message & {:keys [chat-history messages]
+(defn completion [url api-key model message & {:keys [chat-history messages tools]
                                                :or   {chat-history []}}]
   (let [url (format "%s/v1/chat/completions" url)
-        body {:model    model
-              :messages (or messages
-                            (conj (vec chat-history)
-                                  {:role "user" :content message}))}]
+        body (cond-> {:model    model
+                      :messages (or messages
+                                    (conj (vec chat-history)
+                                          {:role "user" :content message}))}
+               tools (assoc :tools tools))]
     (-> (hato/post url (cond-> {:content-type :json
                                 :form-params  body
                                 :as           :json}
@@ -75,6 +76,21 @@
 (defn reasoning-content [response]
   "Extract reasoning/thinking content from LLM response (e.g. DeepSeek V4 thinking mode)."
   (get-in response [:choices 0 :message :reasoning_content]))
+
+(defn tool-calls
+  "Extract tool_calls from a completion response. Returns nil if none."
+  [response]
+  (get-in response [:choices 0 :message :tool_calls]))
+
+(defn assistant-message
+  "Build a full assistant message map from a response, including content,
+   tool_calls, and reasoning_content."
+  [response]
+  (let [msg (get-in response [:choices 0 :message])]
+    (cond-> {:role "assistant"}
+      (:content msg) (assoc :content (:content msg))
+      (:tool_calls msg) (assoc :tool_calls (:tool_calls msg))
+      (:reasoning_content msg) (assoc :reasoning_content (:reasoning_content msg)))))
 
 (defn step
   ([base-url api-key model message]

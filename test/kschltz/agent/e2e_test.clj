@@ -167,7 +167,7 @@
     (let [handler-results (atom [])
           ag              (fresh-agent {:turns 3})
           p               (core/send-message! ag "hello"
-                                (fn [r] (swap! handler-results conj r)))
+                                              (fn [r] (swap! handler-results conj r)))
           loop-future     (future (core/start! ag))]
       @p
       (Thread/sleep 100)
@@ -185,7 +185,7 @@
     (let [errors       (atom [])
           ag           (fresh-agent {:turns    3
                                      :on-error (fn [_ag e]
-                                                   (swap! errors conj (.getMessage e)))})]
+                                                 (swap! errors conj (.getMessage e)))})]
       ;; Override LLM to throw
       (with-redefs [http/completion (fn [& _] (throw (Exception. "LLM connection refused")))]
         (let [p           (core/send-message! ag "trigger error")
@@ -268,18 +268,18 @@
 (deftest e2e-memory-stores-and-retrieves
   (testing "agent loop stores exchanges in memory"
     (let [ag          (fresh-agent {:turns      3
-                                     :session-id "e2e-store-test"})
+                                    :session-id "e2e-store-test"})
           p           (core/send-message! ag "remember this")
           loop-future (future (core/start! ag))]
       @p
       (Thread/sleep 200)
       (let [conn    (core/get-memory-conn ag)
             results (memory/retrieve-relevant
-                       {:backend    :datalevin
-                        :session-id "e2e-store-test"
-                        :connection conn
-                        :query      "remember"
-                        :limit      5})]
+                     {:backend    :datalevin
+                      :session-id "e2e-store-test"
+                      :connection conn
+                      :query      "remember"
+                      :limit      5})]
         (is (some? conn) "memory connection should exist")
         (is (some? results) "should retrieve results from memory"))
       (when (core/running? ag) (core/stop! ag))
@@ -336,7 +336,7 @@
 
       ;; Phase 2: Send message with handler, start loop
       (let [p           (core/send-message! ag "hello"
-                              (fn [_] (swap! handler-calls inc)))
+                                            (fn [_] (swap! handler-calls inc)))
             loop-future (future (core/start! ag))
             result      (deref p 5000 ::timeout)]
         (is (not= ::timeout result) "promise should be delivered")
@@ -355,11 +355,11 @@
         ;; Phase 4: Verify memory was stored
         (let [conn    (core/get-memory-conn ag)
               results (memory/retrieve-relevant
-                         {:backend    :datalevin
-                          :session-id "lifecycle-test"
-                          :connection conn
-                          :query      "hello"
-                          :limit      5})]
+                       {:backend    :datalevin
+                        :session-id "lifecycle-test"
+                        :connection conn
+                        :query      "hello"
+                        :limit      5})]
           (is (some? conn))
           (is (some? results)))
 
@@ -371,151 +371,105 @@
         (is (= 0 (:turns @ag)))))))
 
 ;; ============================================================
-;; 13. TOOL USE
+;; 13. NATIVE TOOL CALLING
 ;; ============================================================
 
-(deftest e2e-tool-manifest
-  (testing "tool-manifest returns nil when no tools"
-    (is (nil? (core/tool-manifest []))))
-  (testing "tool-manifest includes tool name and description"
+(deftest e2e-openai-tools-empty
+  (testing "openai-tools returns nil when no tools registered"
+    (is (nil? (core/openai-tools [])))
+    (is (nil? (core/openai-tools nil)))))
+
+(deftest e2e-openai-tools-builds-array
+  (testing "openai-tools builds OpenAI-format tools array"
     (let [tools [(repl-tools/repl-eval-tool)]
-          manifest (core/tool-manifest tools)]
-      (is (.contains manifest "repl-eval"))
-      (is (.contains manifest "Evaluate Clojure code"))
-      (is (.contains manifest "➪tool:")))))
+          result (core/openai-tools tools)]
+      (is (= 1 (count result)))
+      (is (= "function" (:type (first result))))
+      (is (= "repl-eval" (get-in (first result) [:function :name])))
+      (is (contains? (get-in (first result) [:function :parameters]) :type)))))
 
-(deftest e2e-parse-tool-calls
-  (testing "parse-tool-calls extracts tool calls from LLM response"
-    (is (nil? (core/parse-tool-calls "Hello, no tools here.")))
-    (is (= [{:tool "repl-eval" :args "(+ 1 2 3)"}]
-           (core/parse-tool-calls "Let me compute that.
-➪tool:repl-eval➫(+ 1 2 3)➪/end➫")))
-    (is (= [{:tool "repl-eval" :args "(+ 1 2)"}
-            {:tool "repl-eval" :args "(* 3 4)"}]
-           (core/parse-tool-calls "➪tool:repl-eval➫(+ 1 2)➪/end➫ Some text ➪tool:repl-eval➫(* 3 4)➪/end➫")))))
-
-(deftest e2e-tool-manifest-includes-call-format
-  (testing "tool manifest includes usage instructions"
-    (let [manifest (core/tool-manifest [(repl-tools/repl-eval-tool)])]
-      (is (.contains manifest "➪tool:"))
-      (is (.contains manifest "➪/end➫"))
-      (is (.contains manifest "Do NOT add suffixes"))
-      (is (.contains manifest "EXACTLY")))))
-
-;; ============================================================
-;; 9. MALFORMED TOOL CALL DETECTION
-;; ============================================================
-
-(deftest e2e-malformed-tool-call-suffix
-  (testing "LLM-invented suffixes like 'store-thought' are tolerated"
-    (let [result (core/parse-tool-calls
-                   "➪tool:repl-eval➫(+ 1 2 3)➪/end store-thought➫")]
-      (is (= [{:tool "repl-eval" :args "(+ 1 2 3)"}] result)
-          "Should parse tool call despite 'store-thought' suffix"))))
-
-(deftest e2e-malformed-tool-call-end-slash-thought
-  (testing "LLM adds /thought after end delimiter"
-    (let [result (core/parse-tool-calls
-                   "➪tool:repl-eval➫(+ 1 2)➪/end➫/thought")]
-      (is (= [{:tool "repl-eval" :args "(+ 1 2)"}] result)
-          "Should parse tool call despite /thought suffix"))))
-
-(deftest e2e-malformed-tool-call-jammed-together
-  (testing "Two tool calls jammed together with malformed delimiter"
-    (let [text (str "➪tool:repl-eval➫(code1)➪/end store-thought➫"
-                   "➪tool:repl-eval➫(code2)➪/end➫")
-          result (core/parse-tool-calls text)]
-      (is (= 2 (count result))
-          "Should parse both tool calls"))))
-
-(deftest e2e-strip-tool-calls-residual
-  (testing "strip-tool-calls removes residual ➪/end...➫ fragments"
-    (let [text "➪tool:repl-eval➫(+ 1)➪/end store-thought➫ And the result is 1"
-          stripped (core/strip-tool-calls text)]
-      (is (= "And the result is 1" stripped)
-          "Should strip tool call and residual markup, leaving only prose"))))
-
-(deftest e2e-has-unparsed-tool-markup
-  (testing "detects \u27aatool: markup even when unparseable"
-    (let [unparseable "I will \u27aatool:repl-eval\u27ab(broken"]
-      (is (nil? (core/parse-tool-calls unparseable)))
-      (is (core/has-unparsed-tool-markup? unparseable))))
-  (testing "clean text has no unparsed markup"
-    (is (not (core/has-unparsed-tool-markup? "Hello, no tools here.")))))
-
-(deftest e2e-parse-unclosed-tool-calls
-  (testing "lenient parser handles missing end delimiter"
-    (is (= [{:tool "repl-eval" :args "(+ 1 2 3)"}]
-           (core/parse-tool-calls
-             "I'll compute that.\n\u27aatool:repl-eval\u27ab(+ 1 2 3)"))))
-  (testing "lenient parser strips markdown fences from args"
-    (is (= [{:tool "repl-eval" :args "(+ 1 2 3)"}]
-           (core/parse-tool-calls
-             (str "\u27aatool:repl-eval\u27ab```clojure\n(+ 1 2 3)\n```")))))
-  (testing "lenient parser extracts multi-line do forms"
-    (let [code "(do (def x 1) (inc x))"
-          parsed (core/parse-tool-calls
-                   (str "Starting server.\n\u27aatool:repl-eval\u27ab\n" code))]
-      (is (= [{:tool "repl-eval" :args code}] parsed)))))
-
-(deftest e2e-parse-markdown-tool-calls
-  (testing "markdown clojure blocks become repl-eval calls"
-    (is (= [{:tool "repl-eval" :args "(keys (methods #'tools/parse))"}]
-           (core/parse-tool-calls
-             "Let me check:\n```clojure\n(keys (methods #'tools/parse))\n```"))))
-  (testing "merges explicit tool calls with markdown blocks"
-    (let [parsed (core/parse-tool-calls
-                   (str "Loading.\n\u27aatool:repl-eval\u27ab(require '[foo.bar :as b])\u27aa/end\u27ab\n"
-                        "```clojure\n(keys (methods #'tools/run))\n```"))]
-      (is (= 2 (count parsed)))
-      (is (some #(= "(require '[foo.bar :as b])" (:args %)) parsed))
-      (is (some #(= "(keys (methods #'tools/run))" (:args %)) parsed)))))
-
-(deftest e2e-strip-unclosed-tool-markup
-  (testing "strip-tool-calls removes unclosed tool markup from final text"
-    (let [text (str "I'll start the server. \u27aatool:repl-eval\u27ab\n(do (def x 1) x)\nMore prose.")
-          stripped (core/strip-tool-calls text)]
-      (is (= "I'll start the server. More prose." stripped)
-          "Should remove unclosed tool block but keep prose"))))
-
-(deftest e2e-tool-roundtrip-preserves-context
-  (testing "second LLM call after tool execution includes original user message"
-    (let [captured-msgs (atom [])
-          tool-response "➪tool:repl-eval➫(+ 1 2 3)➪/end➫"
-          final-response "The sum is 6."
-          call-n (atom 0)]
+(deftest e2e-native-tool-call-roundtrip
+  (testing "chat! handles native tool_calls and returns final response"
+    (let [call-n (atom 0)
+          captured-msgs (atom [])]
       (with-redefs [http/completion
                     (fn [_url _api-key _model _message & {:keys [messages]}]
                       (reset! captured-msgs messages)
                       (let [n (swap! call-n inc)]
-                        {:choices [{:message {:content (if (= n 1)
-                                                        tool-response
-                                                        final-response)}}]}))
-                    http/assistant-content mock-assistant-content]
+                        (if (= n 1)
+                          {:choices [{:message {:tool_calls [{:id "call-1"
+                                                              :function {:name "repl-eval"
+                                                                         :arguments "{\"code\": \"(+ 1 2 3)\"}"}}]}}]}
+                          {:choices [{:message {:content "The sum is 6."}}]})))
+                    http/assistant-content mock-assistant-content
+                    http/tool-calls http/tool-calls
+                    http/assistant-message http/assistant-message]
         (let [ag (fresh-agent {:tools [(repl-tools/repl-eval-tool)]})
               resp (core/chat! ag "What is (+ 1 2 3)?")]
-          (is (= final-response resp))
-          (is (= 2 @call-n))
-          (let [msgs @captured-msgs
-                contents (mapv :content msgs)]
-            (is (some #(.contains % "What is (+ 1 2 3)?") contents)
-                "original user question should be in API messages")
-            (is (some #(.contains % tool-response) contents)
-                "assistant tool-call should be in API messages")
-            (is (some #(.contains % "Tool results:") contents)
-                "tool results should be in API messages")))))))
+          (is (= "The sum is 6." resp))
+          (is (= 2 @call-n) "should make 2 LLM calls (tool + final)")
+          (let [msgs @captured-msgs]
+            (is (some #(= "tool" (:role %)) msgs)
+                "second call should include tool result message")
+            (is (some #(= "call-1" (:tool_call_id %)) msgs)
+                "tool result should include tool_call_id")))))))
 
-(deftest e2e-no-markdown-reparse-after-tool-results
-  (testing "fenced clojure in final answer is not re-executed as repl-eval"
+(deftest e2e-native-tool-call-validation-error
+  (testing "Malli validation error triggers retry with humanized feedback"
+    (let [call-n (atom 0)
+          retry-prompts (atom [])]
+      (with-redefs [http/completion
+                    (fn [_url _api-key _model _message & {:keys [messages]}]
+                      (let [n (swap! call-n inc)
+                            last-msg (:content (last messages))]
+                        (when (> n 1)
+                          (reset! retry-prompts last-msg))
+                        (if (= n 1)
+                          {:choices [{:message {:tool_calls [{:id "call-1"
+                                                              :function {:name "repl-eval"
+                                                                         :arguments "{\"code\": 123}"}}]}}]}
+                          {:choices [{:message {:content "Fixed: (+ 1 2 3) = 6."}}]})))
+                    http/assistant-content mock-assistant-content
+                    http/tool-calls http/tool-calls
+                    http/assistant-message http/assistant-message]
+        (let [ag (fresh-agent {:tools [(repl-tools/repl-eval-tool)]})
+              resp (core/chat! ag "eval (+ 1 2 3)")]
+          (is (= 2 @call-n) "should retry after validation error")
+          (is (.contains (str @retry-prompts) "failed")
+              "retry prompt should mention failure"))))))
+
+(deftest e2e-native-tool-call-unknown-tool
+  (testing "unknown tool in tool_calls produces error"
     (let [call-n (atom 0)]
       (with-redefs [http/completion
                     (fn [_url _api-key _model _message & _opts]
                       (let [n (swap! call-n inc)]
-                        {:choices [{:message {:content (if (= n 1)
-                                                        "➪tool:repl-eval➫(+ 1 1)➪/end➫"
-                                                        "Use `(+ 1 1)` like this:\n```clojure\n(+ 1 1)\n```")}}]}))
-                    http/assistant-content mock-assistant-content]
+                        (if (= n 1)
+                          {:choices [{:message {:tool_calls [{:id "call-1"
+                                                              :function {:name "nonexistent"
+                                                                         :arguments "{}"}}]}}]}
+                          {:choices [{:message {:content "I cannot use that tool."}}]})))
+                    http/assistant-content mock-assistant-content
+                    http/tool-calls http/tool-calls
+                    http/assistant-message http/assistant-message]
         (let [ag (fresh-agent {:tools [(repl-tools/repl-eval-tool)]})
-              resp (core/chat! ag "double one")]
-          (is (= 2 @call-n) "should not loop a third time for markdown block")
-          (is (.contains resp "`(+ 1 1)`")))))))
+              resp (core/chat! ag "use a bad tool")]
+          (is (some? resp)))))))
+
+(deftest e2e-native-tool-call-max-depth
+  (testing "tool call loop stops at max-tool-calls limit"
+    (let [call-n (atom 0)]
+      (with-redefs [http/completion
+                    (fn [_url _api-key _model _message & _opts]
+                      (swap! call-n inc)
+                      {:choices [{:message {:tool_calls [{:id (str "call-" @call-n)
+                                                          :function {:name "repl-eval"
+                                                                     :arguments "{\"code\": \"1\"}"}}]}}]})
+                    http/assistant-content mock-assistant-content
+                    http/tool-calls http/tool-calls
+                    http/assistant-message http/assistant-message]
+        (let [ag (fresh-agent {:tools [(repl-tools/repl-eval-tool)]
+                               :max-tool-calls 2})
+              resp (core/chat! ag "loop forever")]
+          (is (.contains resp "[Tool call limit reached]"))
+          (is (<= @call-n 3)))))))

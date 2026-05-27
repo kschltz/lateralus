@@ -69,8 +69,8 @@
 (defmulti run-repl mode-dispatch)
 
 (defmethod run-repl :eval
-  [tool args]
-  (let [code       (sanitize-code args)
+  [tool {:keys [code]}]
+  (let [code       (sanitize-code code)
         fixed-code (delimiter-repair/repair-or-original code)
         result     (try
                      (eval-forms fixed-code)
@@ -79,9 +79,8 @@
     (pr-str result)))
 
 (defmethod run-repl :nrepl
-  [tool args]
-  (let [port (:port tool)
-        code (str args)]
+  [tool {:keys [code]}]
+  (let [port (:port tool)]
     ;; TODO: Add nrepl library dependency to deps.edn for nREPL support.
     ;; Until then, this mode is a stub.
     (throw (ex-info "nREPL mode requires [nrepl/nrepl] dependency"
@@ -130,7 +129,7 @@
 ;; to decode the string returned by run-repl.
 
 (defn- make-repl-tool
-  "Build a REPL tool map.  Args are passed as a code string at call time."
+  "Build a REPL tool map. Args are passed as a decoded map from the LLM's JSON args."
   ([mode name desc]
    (make-repl-tool mode name desc nil nil))
   ([mode name desc port]
@@ -141,13 +140,14 @@
     :name       name
     :result-type (or result-type :string)
     :description desc
-    :port       port}))
+    :port       port
+    :parameters [:map [:code :string]]}))
 
 (defn repl-eval-tool
   "Create a :repl tool that evaluates Clojure code locally via
    clojure.core/eval.
 
-   Args: a code string (e.g. \\\"(+ 1 2 3)\\\").
+   Args: {:code \\\"(+ 1 2 3)\\\"} (decoded from LLM JSON args via Malli).
    Returns: parsed result (falls back to raw string on parse failure).
 
    Options:
@@ -156,10 +156,10 @@
      :description  — tool description"
   ([]
    (make-repl-tool :eval "repl-eval"
-                   "Evaluate Clojure code locally. Args: code string. Returns: parsed result."))
+                   "Evaluate Clojure code locally. Args: {:code string}. Returns: parsed result."))
   ([opts]
    (make-repl-tool :eval (or (:name opts) "repl-eval")
-                   (or (:description opts) "Evaluate Clojure code locally. Args: code string. Returns: parsed result.")
+                   (or (:description opts) "Evaluate Clojure code locally. Args: {:code string}. Returns: parsed result.")
                    nil (or (:result-type opts) :string))))
 
 (defn repl-nrepl-tool

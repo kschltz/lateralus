@@ -3,6 +3,16 @@
             [kschltz.agent.memory.schemas :as mem-schemas]
             [malli.core :as m]))
 
+(def ^:private default-connect-timeout-ms 2000)
+(def ^:private default-timeout-ms 5000)
+
+(defn- http-opts
+  "Base hato opts with timeouts so unreachable LLM/embed hosts fail fast."
+  [extra]
+  (merge {:connect-timeout default-connect-timeout-ms
+          :timeout         default-timeout-ms}
+         extra))
+
 (defn auth-headers [api-key]
   (when (and api-key (not= api-key ""))
     {"Authorization" (str "Bearer " api-key)}))
@@ -30,11 +40,11 @@
                                     (conj (vec chat-history)
                                           {:role "user" :content message}))}
                tools (assoc :tools tools))]
-    (-> (hato/post url (cond-> {:content-type :json
-                                :form-params  body
-                                :as           :json}
-                         api-key
-                         (assoc :headers (auth-headers api-key))))
+    (-> (hato/post url (http-opts (cond-> {:content-type :json
+                                           :form-params  body
+                                           :as           :json}
+                                    api-key
+                                    (assoc :headers (auth-headers api-key)))))
         :body)))
 
 (defn- embed-request
@@ -49,11 +59,11 @@
     (throw (ex-info "Invalid embed text" {:text text})))
   (let [url  (format "%s/v1/embeddings" base-url)
         body {:model model :input text}
-        resp (hato/post url (cond-> {:content-type :json
-                                     :form-params  body
-                                     :as           :json}
-                              api-key
-                              (assoc :headers (auth-headers api-key))))]
+        resp (hato/post url (http-opts (cond-> {:content-type :json
+                                                :form-params  body
+                                                :as           :json}
+                                         api-key
+                                         (assoc :headers (auth-headers api-key)))))]
     (get-in resp [:body :data 0 :embedding])))
 
 (defn embed

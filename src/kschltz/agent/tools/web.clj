@@ -30,8 +30,13 @@
   (search [this query]))
 
 (defn- normalize-query
+  "Accept native tool args map {:query ...} or a bare query string."
   [args]
-  (-> args :query str str/trim))
+  (str/trim
+    (str (cond
+           (string? args) args
+           (map? args) (:query args)
+           :else args))))
 
 (defn- encode-query
   [query]

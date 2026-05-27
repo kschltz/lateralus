@@ -34,10 +34,19 @@
           str/trim)
       trimmed)))
 
+(defn- normalize-code
+  "Accept native tool args map {:code ...} or a bare code string."
+  [args]
+  (str/trim
+    (str (cond
+           (string? args) args
+           (map? args) (:code args)
+           :else args))))
+
 (defn- sanitize-code
   "Normalize LLM-generated code before evaluation."
   [code]
-  (-> code str/trim strip-markdown-fence str/trim))
+  (-> code normalize-code strip-markdown-fence str/trim))
 
 (defn- eval-forms
   "Evaluate one or more Clojure forms from a code string."
@@ -69,8 +78,8 @@
 (defmulti run-repl mode-dispatch)
 
 (defmethod run-repl :eval
-  [tool {:keys [code]}]
-  (let [code       (sanitize-code code)
+  [tool args]
+  (let [code       (sanitize-code args)
         fixed-code (delimiter-repair/repair-or-original code)
         result     (try
                      (eval-forms fixed-code)
@@ -79,8 +88,9 @@
     (pr-str result)))
 
 (defmethod run-repl :nrepl
-  [tool {:keys [code]}]
-  (let [port (:port tool)]
+  [tool args]
+  (let [code (sanitize-code args)
+        port (:port tool)]
     ;; TODO: Add nrepl library dependency to deps.edn for nREPL support.
     ;; Until then, this mode is a stub.
     (throw (ex-info "nREPL mode requires [nrepl/nrepl] dependency"

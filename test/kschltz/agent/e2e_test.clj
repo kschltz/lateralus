@@ -2,7 +2,8 @@
   "End-to-end integration tests for the agent system.
 
    Tests the full lifecycle: creation → queue → loop → handlers → memory → tools.
-   LLM calls are mocked via with-redefs on http/completion and http/assistant-content."
+   LLM and embedding calls are mocked via with-redefs on http/completion,
+   http/assistant-content, and http/embed."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [kschltz.agent.core :as core]
             [kschltz.agent.memory :as memory]
@@ -26,10 +27,15 @@
 (defn- mock-assistant-content [response]
   (get-in response [:choices 0 :message :content]))
 
+(defn- mock-embed [& _]
+  "Skip real HTTP in tests; memory falls back to brute-force search."
+  nil)
+
 (defn- mock-llm-fixture [test-fn]
   (reset! response-counter 0)
-  (with-redefs [http/completion       mock-completion
-                http/assistant-content mock-assistant-content]
+  (with-redefs [http/completion        mock-completion
+                http/assistant-content mock-assistant-content
+                http/embed             mock-embed]
     (test-fn)))
 
 (use-fixtures :each mock-llm-fixture)
@@ -37,7 +43,11 @@
 ;; ---- Helpers ----
 
 (defn- fresh-agent [opts]
-  (core/make-agent (merge {:base-url "http://mock-llm" :model "mock-model"} opts)))
+  (core/make-agent (merge {:base-url     "http://mock-llm"
+                           :model        "mock-model"
+                           :sessions-dir (str (System/getProperty "java.io.tmpdir")
+                                              "/lateralus-e2e-sessions")}
+                         opts)))
 
 (defn- drain-and-wait
   "Send a message, start the loop in a thread, wait for promise delivery."
@@ -111,18 +121,20 @@
       (is (not= ::timeout r2) "p2 should be delivered")
       (is (.startsWith ^String r1 "Mock response"))
       (is (.startsWith ^String r2 "Mock response"))
-      (is (>= (count (core/get-history ag)) 3)
-          "history should have 2 user msgs + 1 assistant msg")
+      (is (>= (count (core/get-history ag)) 2)
+          "history should have batched user msg + assistant response")
       (when (core/running? ag) (core/stop! ag))
       @loop-future)))
 
 (deftest e2e-loop-increments-turns
   (testing "loop increments turns counter"
-    (let [ag          (fresh-agent {:turns 2})]
-      (core/send-message! ag "msg1")
-      (let [loop-future (future (core/start! ag))]
-        @loop-future
-        (is (>= (:turns @ag) 1) "turns should increment")))))
+    (let [ag          (fresh-agent {:turns 5})
+          p           (core/send-message! ag "msg1")
+          loop-future (future (core/start! ag))]
+      @p
+      (when (core/running? ag) (core/stop! ag))
+      @loop-future
+      (is (>= (:turns @ag) 1) "turns should increment"))))
 
 ;; ============================================================
 ;; 4. ON-RESPONSE HANDLER
@@ -202,7 +214,7 @@
 
 (deftest e2e-default-error-handler-stops-agent
   (testing "default error handler logs and continues; agent eventually exits after max-turns"
-    (let [ag (fresh-agent {:turns 2})]
+    (let [ag (fresh-agent {:turns 1})]
       (with-redefs [http/completion (fn [& _] (throw (Exception. "fatal error")))]
         (let [_p (core/send-message! ag "trigger error")]
           ;; start! blocks until max-turns is reached

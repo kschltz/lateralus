@@ -1,5 +1,5 @@
 (ns kschltz.agent.tools.web
-  "Web search tool — DuckDuckGo instant answers via a malli-instrumented protocol."
+  "Web search tool — DuckDuckGo Lite HTML results with Wikipedia fallback."
   (:require
    [cheshire.core :as json]
    [clojure.string :as str]
@@ -24,6 +24,21 @@
   "Vector of search hits."
   [:vector SearchHit])
 
+(def ^:private max-hits 8)
+
+(def ^:private http-user-agent
+  "Mozilla/5.0 (compatible; Lateralus-Agent/1.0)")
+
+(def ^:private ddg-lite-url "https://lite.duckduckgo.com/lite/")
+
+(def ^:private wiki-api-url "https://en.wikipedia.org/w/api.php")
+
+(def ^:private result-link-re
+  #"<a rel=\"nofollow\" href=\"([^\"]+)\" class='result-link'>([^<]+)</a>")
+
+(def ^:private result-snippet-re
+  #"<td class='result-snippet'>\s*([\s\S]*?)\s*</td>")
+
 ;; ---- Protocol ----
 
 (defprotocol WebSearch
@@ -42,63 +57,106 @@
   [query]
   (java.net.URLEncoder/encode query "UTF-8"))
 
-(defn- related-topic->hit
-  [{:keys [Text FirstURL]}]
-  (when (and (seq Text) (seq FirstURL))
-    {:title (first (str/split Text #"\n" 2))
-     :url   FirstURL
-     :snippet Text}))
+(defn- http-timeout-ms
+  []
+  (or (some-> (System/getenv "LATERALUS_HTTP_TIMEOUT_MS") parse-long)
+      15000))
 
-(defn- flatten-related-topics
-  [topics]
-  (mapcat (fn [topic]
-            (if (:Topics topic)
-              (flatten-related-topics (:Topics topic))
-              (when-let [hit (related-topic->hit topic)]
-                [hit])))
-          topics))
+(defn- http-get
+  [url]
+  (:body (hato/get url {:as      :string
+                        :timeout (http-timeout-ms)
+                        :headers {"User-Agent" http-user-agent}})))
 
-(defn- parse-ddg-json
+(defn- http-post-form
+  [url form-params]
+  (:body (hato/post url {:as           :string
+                         :timeout      (http-timeout-ms)
+                         :headers      {"User-Agent"   http-user-agent
+                                        "Content-Type" "application/x-www-form-urlencoded"}
+                         :form-params  form-params})))
+
+(defn- html-unescape
+  [s]
+  (-> s
+      (str/replace "&amp;" "&")
+      (str/replace "&lt;" "<")
+      (str/replace "&gt;" ">")
+      (str/replace "&quot;" "\"")
+      (str/replace "&#39;" "'")
+      (str/replace "&nbsp;" " ")))
+
+(defn- strip-html-tags
+  [s]
+  (-> s
+      (str/replace #"<[^>]+>" "")
+      html-unescape
+      str/trim))
+
+(defn parse-ddg-lite-html
+  "Extract {:title :url :snippet} hits from DuckDuckGo Lite HTML."
   [body]
-  (let [data (json/parse-string body true)
-        instant (when-let [text (:AbstractText data)]
-                  (when (seq text)
-                    [{:title (or (:Heading data) "Instant Answer")
-                      :url   (or (:AbstractURL data) "")
-                      :snippet text}]))
-        related (flatten-related-topics (or (:RelatedTopics data) []))]
-    (into (or instant [])
-          (take 8 related))))
+  (let [links (for [[_ href title] (re-seq result-link-re body)]
+                {:url   (html-unescape href)
+                 :title (strip-html-tags title)})
+        snippets (map strip-html-tags (map second (re-seq result-snippet-re body)))]
+    (vec (take max-hits
+               (map (fn [link snippet]
+                      (assoc link :snippet (or snippet "")))
+                    links
+                    (concat snippets (repeat "")))))))
 
-(defn- ddg-search-url
+(defn- wiki-title->url
+  [title]
+  (str "https://en.wikipedia.org/wiki/"
+       (java.net.URLEncoder/encode (str/replace (str/trim title) " " "_")
+                                   "UTF-8")))
+
+(defn- wikipedia-search
   [query]
-  (str "https://api.duckduckgo.com/?q="
-       (encode-query query)
-       "&format=json&no_redirect=1&no_html=1&skip_disambig=1"))
+  (let [url  (str wiki-api-url
+                  "?action=query&list=search&format=json&utf8=1&srlimit="
+                  max-hits "&srsearch=" (encode-query query))
+        body (http-get url)
+        items (get-in (json/parse-string body true) [:query :search])]
+    (vec (for [{:keys [title snippet]} items]
+           {:title   title
+            :url     (wiki-title->url title)
+            :snippet (strip-html-tags snippet)}))))
 
-(defn- fetch-ddg-hits
+(defn- fetch-ddg-lite-hits
   [query]
-  (let [url  (ddg-search-url query)
-        body (:body (hato/get url {:as :string}))]
-    (parse-ddg-json body)))
+  (parse-ddg-lite-html (http-post-form ddg-lite-url {:q query})))
 
-(defn duckduckgo-search
-  "Search DuckDuckGo with malli-validated input and output."
+(defn- fetch-wikipedia-hits
+  [query]
+  (wikipedia-search query))
+
+(defn web-search
+  "Search the web. Uses DuckDuckGo Lite; falls back to Wikipedia when DDG has no hits."
   [query]
   (when-not (m/validate SearchQuery query)
     (throw (ex-info "Invalid search query" {:query query :schema SearchQuery})))
-  (let [result (vec (fetch-ddg-hits query))]
+  (let [ddg    (try (fetch-ddg-lite-hits query)
+                    (catch Exception _ []))
+        hits   (if (seq ddg) ddg (try (fetch-wikipedia-hits query) (catch Exception _ [])))
+        result (vec hits)]
     (when-not (m/validate SearchResponse result)
       (throw (ex-info "Invalid search response" {:result result :schema SearchResponse})))
     result))
 
+(defn duckduckgo-search
+  "Backward-compatible alias for web-search."
+  [query]
+  (web-search query))
+
 (defrecord DuckDuckGoClient []
   WebSearch
   (search [_ query]
-    (duckduckgo-search query)))
+    (web-search query)))
 
 (defn web-search-tool
-  "Create a :web tool that searches DuckDuckGo.
+  "Create a :web tool that searches the web.
    Args: {:query string} (decoded from LLM JSON args via Malli).
    Returns: EDN vector of {:title :url :snippet} maps."
   ([]
@@ -107,7 +165,7 @@
    {:type        :web
     :name        (or (:name opts) "web-search")
     :description (or (:description opts)
-                      "Search the web via DuckDuckGo. Args: {:query string}. Returns: vector of result maps.")
+                      "Search the web. Args: {:query string}. Returns up to 8 maps with :title, :url, :snippet.")
     :parameters  [:map [:query :string]]}))
 
 (defmethod tools/run :web
@@ -116,7 +174,7 @@
     (if (str/blank? query)
       (pr-str [])
       (try
-        (pr-str (duckduckgo-search query))
+        (pr-str (web-search query))
         (catch Exception e
           (pr-str {:error (.getMessage e)}))))))
 

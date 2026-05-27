@@ -30,7 +30,9 @@
    [:timestamp {:optional true} int?]
    [:session-id {:optional true} :string]
    [:tool-name {:optional true} :string]
-   [:tool-result {:optional true} :string]])
+   [:tool-result {:optional true} :string]
+   [:tool-calls {:optional true} :string]
+   [:tool-call-id {:optional true} :string]])
 
 (def StoreResult
   "Result of storing and optionally indexing a message."

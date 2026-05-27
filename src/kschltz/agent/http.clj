@@ -6,11 +6,17 @@
 (def ^:private default-connect-timeout-ms 2000)
 (def ^:private default-timeout-ms 5000)
 
+(defn- timeout-ms
+  "Request timeout (ms). Override with LATERALUS_HTTP_TIMEOUT_MS for slow cloud models."
+  []
+  (or (some-> (System/getenv "LATERALUS_HTTP_TIMEOUT_MS") parse-long)
+      default-timeout-ms))
+
 (defn- http-opts
   "Base hato opts with timeouts so unreachable LLM/embed hosts fail fast."
   [extra]
   (merge {:connect-timeout default-connect-timeout-ms
-          :timeout         default-timeout-ms}
+          :timeout         (timeout-ms)}
          extra))
 
 (defn auth-headers [api-key]

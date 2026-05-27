@@ -19,6 +19,8 @@
                        cider/cider-nrepl {:mvn/version "0.52.0"}}
           :jvm-opts ["-Drepl.port=59500"]}
   :cli {:main-opts ["-m" "kschltz.agent.cli"]}
+  :sim {:extra-paths ["scripts"]
+        :exec-fn simulate-complex-tool-session/-main}
   :test {:extra-paths ["test"]
          :extra-deps {org.clojure/test.check {:mvn/version "1.1.3"}
                       io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}}}}}

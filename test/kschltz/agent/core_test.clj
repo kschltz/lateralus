@@ -1,5 +1,6 @@
 (ns kschltz.agent.core-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [kschltz.agent.core :as sut]
             [kschltz.agent.memory :as memory]
             [kschltz.agent.http :as http]
@@ -142,11 +143,13 @@
                                                   :session-id sid
                                                   :connection store
                                                   :limit 10})]
-        (is (= 3 (count msgs)))
-        (is (= "user" (:msg/role (first msgs))))
-        (is (= "tool" (:msg/role (second msgs))))
-        (is (boolean (re-find #"repl-eval" (:msg/text (second msgs)))))
-        (is (= "assistant" (:msg/role (nth msgs 2)))))
+        (is (= 4 (count msgs)) "user, assistant+tool_calls, tool, assistant")
+        (is (= "user" (:msg/role (nth msgs 0))))
+        (is (= "assistant" (:msg/role (nth msgs 1))))
+        (is (some? (:msg/tool-calls (nth msgs 1))))
+        (is (= "tool" (:msg/role (nth msgs 2))))
+        (is (some? (:msg/tool-call-id (nth msgs 2))))
+        (is (= "assistant" (:msg/role (nth msgs 3)))))
       (sut/close-session! ag))))
 
 ;; ---- Public API ----
@@ -317,6 +320,30 @@
             limited (vec (take-last (:history-limit state) h))]
         (is (= 4 (count limited)))
         (is (= "msg 5" (:content (first limited))))))))
+
+(deftest memory-stores-full-text-truncates-llm-context
+  (testing "database keeps full messages; compose-context truncates for the LLM"
+    (let [long-text (apply str (repeat 200 "x"))
+          sid       (str "truncate-" (System/nanoTime))
+          ag        (sut/make-agent {:base-url "http://llm" :model "test"
+                                     :session-id sid
+                                     :sessions-dir "test-sessions-truncate"
+                                     :memory-max-chars 32})]
+      (with-redefs [http/completion (fn [& _] {:choices [{:message {:content "ok"}}]})
+                    http/assistant-content http/assistant-content
+                    http/embed (constantly nil)]
+        (sut/chat! ag long-text))
+      (let [store (sut/get-memory-store ag)
+            msgs  (memory/load-recent-messages {:backend :datalevin
+                                                :session-id sid
+                                                :connection store
+                                                :limit 5})
+            user  (first msgs)
+            ctx   (sut/compose-context @ag "follow-up")]
+        (is (= long-text (:msg/text user)) "persisted text is not truncated")
+        (is (<= (count (:content (first ctx))) 32))
+        (is (str/ends-with? (:content (first ctx)) "…")))
+      (sut/close-session! ag))))
 
 (deftest compose-context-dedupes-relevant-and-recent
   (testing "compose-context uses hybrid strategy to dedupe overlapping messages"

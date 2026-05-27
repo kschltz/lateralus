@@ -23,7 +23,9 @@
    :msg/text           {:db/valueType :db.type/string}
    :msg/timestamp      {:db/valueType :db.type/long}
    :msg/tool-name      {:db/valueType :db.type/string}
-   :msg/tool-result    {:db/valueType :db.type/string}})
+   :msg/tool-result    {:db/valueType :db.type/string}
+   :msg/tool-calls     {:db/valueType :db.type/string}
+   :msg/tool-call-id   {:db/valueType :db.type/string}})
 
 ;; ---- Defaults -------------------------------------------------------------
 
@@ -152,9 +154,11 @@
                        (:session-id store))
         entity     (cond-> {:msg/id msg-id :msg/role role :msg/text text
                             :msg/timestamp timestamp}
-                      session-id                            (assoc :msg/session session-id)
-                      (not-empty (:tool-name message-map))  (assoc :msg/tool-name (:tool-name message-map))
-                      (not-empty (:tool-result message-map)) (assoc :msg/tool-result (:tool-result message-map)))]
+                      session-id                              (assoc :msg/session session-id)
+                      (not-empty (:tool-name message-map))    (assoc :msg/tool-name (:tool-name message-map))
+                      (not-empty (:tool-result message-map))  (assoc :msg/tool-result (:tool-result message-map))
+                      (not-empty (:tool-calls message-map))   (assoc :msg/tool-calls (:tool-calls message-map))
+                      (not-empty (:tool-call-id message-map)) (assoc :msg/tool-call-id (:tool-call-id message-map)))]
     (d/transact conn [entity])
     (let [embedding (when-not (str/blank? text)
                       (compute-embedding store text))
@@ -179,24 +183,26 @@
 
 ;; ---- Search ---------------------------------------------------------------
 
+(def ^:private msg-pull-pattern
+  [:msg/id :msg/role :msg/text :msg/timestamp :msg/tool-calls :msg/tool-call-id
+   :msg/tool-name :msg/tool-result])
+
+(defn- sort-memory-msgs [msgs]
+  (vec (sort-by :msg/timestamp msgs)))
+
 (defn- brute-force-search
   "Fallback search: return most recent messages for session, limited by top-y."
   [conn session-id top-y]
   (try
-    (let [results (d/q '[:find ?id ?text ?role ?ts
-                         :in $ ?sid
-                         :where
-                         [?e :msg/id ?id]
-                         [?e :msg/text ?text]
-                         [?e :msg/role ?role]
-                         [?e :msg/timestamp ?ts]
-                         [?e :msg/session ?sid]]
-                       (d/db conn) session-id)]
-      (->> results
-           (sort-by (fn [r] (nth r 3)))
+    (let [msgs (d/q '[:find (pull ?e msg-pull-pattern)
+                      :in $ ?sid msg-pull-pattern
+                      :where
+                      [?e :msg/session ?sid]]
+                    (d/db conn) session-id msg-pull-pattern)]
+      (->> (map first msgs)
+           sort-memory-msgs
            (take-last top-y)
-           (mapv (fn [[id text role ts]]
-                   {:msg/id id :msg/role role :msg/text text :msg/timestamp ts}))))
+           vec))
     (catch Exception e
       (println "Warning: brute-force search failed:" (.getMessage e))
       [])))
@@ -205,20 +211,14 @@
   "Given ordered msg-ids from vector search, look up full message data.
    Preserves similarity ranking from HNSW search."
   [conn msg-ids]
-  (let [id-set (set msg-ids)]
+  (when (seq msg-ids)
     (try
-      (let [results (d/q '[:find ?id ?text ?role ?ts
-                           :in $ ?ids
-                           :where
-                           [?e :msg/id ?id]
-                           [?e :msg/text ?text]
-                           [?e :msg/role ?role]
-                           [?e :msg/timestamp ?ts]
-                           [(contains? ?ids ?id)]]
-                         (d/db conn) id-set)
-            by-id   (into {} (map (fn [[id text role ts]]
-                                    [id {:msg/id id :msg/role role :msg/text text :msg/timestamp ts}])
-                                  results))]
+      (let [id-set (set msg-ids)
+            pulls  (d/q '[:find (pull ?e msg-pull-pattern)
+                           :in $ ?ids msg-pull-pattern
+                           :where [?e :msg/id ?id] [(contains? ?ids ?id)]]
+                         (d/db conn) id-set msg-pull-pattern)
+            by-id  (into {} (map (fn [[m]] [(:msg/id m) m]) pulls))]
         (vec (keep by-id msg-ids)))
       (catch Exception _ []))))
 

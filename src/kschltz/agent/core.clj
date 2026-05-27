@@ -8,7 +8,8 @@
   Memory is optional: pass :session-id to make-agent to enable
   Datalevin-backed hybrid memory (semantic search + recent context)."
   (:refer-clojure :exclude [reset!])
-  (:require [kschltz.agent.memory :as memory]
+  (:require [cheshire.core :as json]
+            [kschltz.agent.memory :as memory]
             [kschltz.agent.tools :as tools]
             [kschltz.agent.http :as http]
             [kschltz.agent.tools.repl :as repl]
@@ -61,6 +62,8 @@
 
 (def ^:const maximum-message-queue-size 1000)
 (def ^:const default-history-limit 50) ;; Keep last N messages in state; older ones live in Datalevin
+(def ^:const default-memory-max-chars 500)
+(def ^:const truncation-suffix "…")
 
 (def ^:private default-state
   "Initial agent state map."
@@ -87,6 +90,7 @@
    :memory-embedding-dims nil
    :memory-embedding-model nil
    :history-limit    nil
+   :memory-max-chars nil
    :sessions-dir     nil
    ;; Tool config
    :max-tool-calls nil
@@ -114,6 +118,7 @@
    :memory-embedding-dims (fn [] (env-or "LATERALUS_MEMORY_EMBEDDING_DIMS" 384 #(Integer/parseInt %)))
    :memory-embedding-model (fn [] (env-or "LATERALUS_EMBEDDING_MODEL" "nomic-embed-text"))
    :history-limit        (fn [] (env-or "LATERALUS_HISTORY_LIMIT" default-history-limit #(Integer/parseInt %)))
+   :memory-max-chars     (fn [] (env-or "LATERALUS_MEMORY_MAX_CHARS" default-memory-max-chars #(Integer/parseInt %)))
    :sessions-dir         (fn [] (env-or "LATERALUS_SESSIONS_DIR" "sessions"))
    :max-tool-calls       (fn [] (env-or "LATERALUS_MAX_TOOL_CALLS" 10 #(Integer/parseInt %)))
    :max-retries          (fn [] (env-or "LATERALUS_MAX_RETRIES" 3 #(Integer/parseInt %)))})
@@ -127,14 +132,65 @@
            (opts k)
            (default-fn))])))
 
+(defn- truncate-text
+  "Truncate text to max-chars (including suffix). nil max-chars disables truncation."
+  [text max-chars]
+  (if (and max-chars (pos? max-chars) (string? text) (> (count text) max-chars))
+    (let [keep (max 1 (- max-chars (count truncation-suffix)))]
+      (str (subs text 0 keep) truncation-suffix))
+    text))
+
+(defn- truncate-tool-calls
+  [tool-calls max-chars]
+  (when (seq tool-calls)
+    (mapv (fn [tc]
+            (if-let [f (:function tc)]
+              (update tc :function #(update % :arguments truncate-text max-chars))
+              tc))
+          tool-calls)))
+
+(defn- truncate-chat-message
+  "Truncate :content and tool :arguments in an OpenAI-format chat message."
+  [msg max-chars]
+  (cond-> msg
+    (contains? msg :content)
+    (update :content truncate-text max-chars)
+    (:tool_calls msg)
+    (update :tool_calls truncate-tool-calls max-chars)))
+
+(defn- serialize-tool-calls
+  [tool-calls]
+  (when (seq tool-calls)
+    (json/generate-string tool-calls)))
+
+(defn- deserialize-tool-calls
+  [s]
+  (when (and (string? s) (not (str/blank? s)))
+    (try (json/parse-string s true)
+         (catch Exception _ nil))))
+
+(defn- chat-msg->memory-msg
+  "Convert an OpenAI chat message to Datalevin storage format (full text, no truncation)."
+  [{:keys [role content tool_calls tool_call_id]}]
+  (cond-> {:role (or role "user")
+           :text (or content "")}
+    (seq tool_calls) (assoc :tool-calls (serialize-tool-calls tool_calls))
+    tool_call_id (assoc :tool-call-id tool_call_id)))
+
+(defn- memory-msg->chat-msg
+  [{:msg/keys [id role text timestamp tool-calls tool-call-id]}]
+  (let [chat (cond-> {:role (or role "user") :content (or text "")}
+               id (assoc :msg-id id)
+               timestamp (assoc :timestamp timestamp)
+               tool-call-id (assoc :tool_call_id tool-call-id))]
+    (if-let [tcs (deserialize-tool-calls tool-calls)]
+      (assoc chat :tool_calls tcs)
+      chat)))
+
 (defn- memory-msgs->chat-msgs
-  "Convert memory-format messages to chat-history format."
+  "Convert memory-format messages to chat-history format (chronological)."
   [memory-msgs]
-  (mapv (fn [{:msg/keys [id role text timestamp]}]
-          (cond-> {:role (or role "user") :content (or text "")}
-            id (assoc :msg-id id)
-            timestamp (assoc :timestamp timestamp)))
-        memory-msgs))
+  (mapv memory-msg->chat-msg memory-msgs))
 
 ;; ---- Agent Construction ----
 
@@ -156,6 +212,7 @@
     :memory-embedding-dims     — Embedding dimensions (env: LATERALUS_MEMORY_EMBEDDING_DIMS, default 384)
     :memory-embedding-model    — Embedding model (env: LATERALUS_EMBEDDING_MODEL, default nomic-embed-text)
     :history-limit             — Max messages kept in agent state (env: LATERALUS_HISTORY_LIMIT, default 50)
+    :memory-max-chars          — Truncate messages in LLM context only (env: LATERALUS_MEMORY_MAX_CHARS, default 500)
     :sessions-dir              — Session storage root (env: LATERALUS_SESSIONS_DIR, default sessions/)
     :max-tool-calls            — Max tool call rounds per message (env: LATERALUS_MAX_TOOL_CALLS, default 10)
     :max-retries               — Max retries on tool execution errors (env: LATERALUS_MAX_RETRIES, default 3)
@@ -169,7 +226,8 @@
    (let [{:keys [base-url api-key model turns tools initial
                  session-id memory-backend on-response on-error on-thought
                  memory-relevant-limit memory-recent-limit memory-strategy memory-embedding-dims
-                 memory-embedding-model history-limit sessions-dir on-memory-event]
+                 memory-embedding-model history-limit memory-max-chars sessions-dir
+                 on-memory-event]
           :or   {turns 100 tools [] initial [] memory-backend :datalevin}} opts
          cfg           (resolve-config opts)
          memory-enabled? (some? session-id)
@@ -225,6 +283,7 @@
                                  :memory-embedding-dims (:memory-embedding-dims cfg)
                                  :memory-embedding-model (:memory-embedding-model cfg)
                                  :history-limit         history-limit'
+                                 :memory-max-chars      (or memory-max-chars (:memory-max-chars cfg))
                                  :max-tool-calls        (:max-tool-calls cfg)
                                  :max-retries            (:max-retries cfg)})))))
 
@@ -247,18 +306,23 @@
   "Convert in-agent chat history to memory-format messages for composition."
   [history]
   (vec
-    (map-indexed (fn [idx {:keys [role content msg-id timestamp]}]
-                   (cond-> {:msg/role role :msg/text content}
-                     msg-id (assoc :msg/id msg-id)
-                     timestamp (assoc :msg/timestamp timestamp)
-                     (and (not timestamp) (not msg-id)) (assoc :msg/timestamp idx)))
+    (map-indexed (fn [idx msg]
+                   (let [{:keys [role text tool-calls tool-call-id]}
+                         (chat-msg->memory-msg msg)
+                         {:keys [msg-id timestamp]} msg]
+                     (cond-> {:msg/role role :msg/text text}
+                       msg-id (assoc :msg/id msg-id)
+                       timestamp (assoc :msg/timestamp timestamp)
+                       tool-calls (assoc :msg/tool-calls tool-calls)
+                       tool-call-id (assoc :msg/tool-call-id tool-call-id)
+                       (and (not timestamp) (not msg-id)) (assoc :msg/timestamp idx))))
                  history)))
 
 (defn compose-context
   "Build memory-augmented context for the LLM call.
    Retrieves semantically relevant messages, merges with recent in-agent
    history via :memory-strategy (default :hybrid), deduped and sorted."
-  [{:keys [session-id memory-store memory-backend history
+  [{:keys [session-id memory-store memory-backend history memory-max-chars
            memory-relevant-limit memory-recent-limit memory-strategy]
     :or   {memory-relevant-limit 5 memory-recent-limit 10 memory-strategy :hybrid}}
    user-input]
@@ -277,8 +341,9 @@
                                     :recent recent
                                     :relevant-limit memory-relevant-limit
                                     :recent-limit memory-recent-limit})]
-      (memory-msgs->chat-msgs composed))
-    (vec history)))
+      (mapv #(truncate-chat-message % memory-max-chars)
+            (memory-msgs->chat-msgs composed)))
+    (mapv #(truncate-chat-message % memory-max-chars) history)))
 
 (defn- cap-history
   "Cap history to :history-limit messages. Older messages are persisted in
@@ -308,62 +373,51 @@
   (when (and result (not (:indexed result)))
     (fire-memory-event state (assoc result :type :memory-not-indexed :role role))))
 
-(defn- tool-round-summary
-  "Compact text summary of a tool execution round."
-  [{:keys [tool args result error]}]
-  (if error
-    (str tool "(" (pr-str args) ") => Error: " error)
-    (str tool "(" (pr-str args) ") => " result)))
-
-(defn- tool-round-result-text
-  "Stored :msg/tool-result value for a tool round."
-  [{:keys [result error]}]
-  (if error (str "Error: " error) (str result)))
+(defn- store-memory-chat-msg
+  "Persist one OpenAI-format chat message. Returns {:msg-id :timestamp :chat-msg}."
+  [state session-id memory-store memory-backend ts-suffix memory-msg]
+  (let [ts         (or (:timestamp memory-msg) (System/currentTimeMillis))
+        msg-id     (str "msg-" ts "-" ts-suffix "-" (rand-int 100000))
+        stored-msg (assoc memory-msg :id msg-id :timestamp ts)
+        store-result (memory/store-message {:backend memory-backend
+                                            :session-id session-id
+                                            :connection memory-store
+                                            :message stored-msg})]
+    (notify-store-result state (:role memory-msg) store-result)
+    {:msg-id    msg-id
+     :timestamp ts
+     :chat-msg  (memory-msg->chat-msg
+                  {:msg/id msg-id
+                   :msg/role (:role memory-msg)
+                   :msg/text (:text memory-msg)
+                   :msg/timestamp ts
+                   :msg/tool-calls (:tool-calls memory-msg)
+                   :msg/tool-call-id (:tool-call-id memory-msg)})}))
 
 (defn- store-exchange
-  "Store a user-assistant exchange in session memory, including any tool rounds.
-   Returns {:user-id ... :assistant-id ... :tools [...] ...}
-   or nil when memory is inactive or storage fails."
-  [state user-input response & {:keys [tool-rounds]}]
+  "Store a user message and chronological turn transcript (tool calls included).
+   Returns {:user-id :user-timestamp :stored-msgs} or nil when memory is inactive."
+  [state user-input & {:keys [transcript]}]
   (when (and (:memory-store state) (:session-id state))
     (try
       (let [{:keys [session-id memory-store memory-backend]} state
             ts           (System/currentTimeMillis)
             user-id      (str "msg-" ts "-u-" (rand-int 100000))
-            rounds       (vec (or tool-rounds []))
+            user-memory  (chat-msg->memory-msg {:role "user" :content user-input})
             user-result  (memory/store-message {:backend memory-backend
                                                 :session-id session-id
                                                 :connection memory-store
-                                                :message {:role "user" :text user-input
-                                                          :id user-id :timestamp ts}})
-            tool-stored  (mapv (fn [[idx tr]]
-                                 (let [tool-ts (inc (+ ts idx))
-                                       tool-id (str "msg-" tool-ts "-t-" (rand-int 100000))
-                                       store-result (memory/store-message
-                                                      {:backend memory-backend
-                                                       :session-id session-id
-                                                       :connection memory-store
-                                                       :message {:role "tool"
-                                                                 :text (tool-round-summary tr)
-                                                                 :tool-name (:tool tr)
-                                                                 :tool-result (tool-round-result-text tr)
-                                                                 :id tool-id
-                                                                 :timestamp tool-ts}})]
-                                   (notify-store-result state "tool" store-result)
-                                   {:tool-id tool-id :timestamp tool-ts}))
-                               (map-indexed vector rounds))
-            assistant-ts (+ ts 1 (count rounds))
-            assistant-id (str "msg-" assistant-ts "-a-" (rand-int 100000))
-            asst-result  (memory/store-message {:backend memory-backend
-                                                :session-id session-id
-                                                :connection memory-store
-                                                :message {:role "assistant" :text response
-                                                          :id assistant-id :timestamp assistant-ts}})]
-        (notify-store-result state "user" user-result)
-        (notify-store-result state "assistant" asst-result)
-        {:user-id user-id :assistant-id assistant-id
-         :user-timestamp ts :assistant-timestamp assistant-ts
-         :tools tool-stored})
+                                                :message (assoc user-memory
+                                                           :id user-id
+                                                           :timestamp ts)})
+            _            (notify-store-result state "user" user-result)
+            stored-msgs  (mapv (fn [[idx msg]]
+                                 (let [memory-msg (assoc (chat-msg->memory-msg msg)
+                                                    :timestamp (+ ts 1 idx))]
+                                   (store-memory-chat-msg state session-id memory-store memory-backend
+                                                          (str "x" idx) memory-msg)))
+                               (map-indexed vector (or transcript [])))]
+        {:user-id user-id :user-timestamp ts :stored-msgs stored-msgs})
       (catch Exception e
         (println (str "Memory store error: " (.getMessage e)))
         nil))))
@@ -427,10 +481,15 @@
    Returns the raw API response map."
   [state {:keys [user-text turn-messages]}]
   (if (and (:base-url state) (:model state))
-    (let [ctx          (compose-context state user-text)
-          api-messages (if turn-messages
-                         (into (vec ctx) turn-messages)
-                         (conj (vec ctx) {:role "user" :content user-text}))
+    (let [max-chars    (:memory-max-chars state)
+          ctx          (compose-context state user-text)
+          turn-msgs'   (when turn-messages
+                         (mapv #(truncate-chat-message % max-chars) turn-messages))
+          api-messages (if turn-msgs'
+                         (into (vec ctx) turn-msgs')
+                         (conj (vec ctx) (truncate-chat-message
+                                           {:role "user" :content user-text}
+                                           max-chars)))
           api-tools    (openai-tools (:tools state))]
       (http/completion (:base-url state) (:api-key state)
                        (:model state) nil
@@ -441,12 +500,12 @@
 ;; ---- Loop ----
 
 (defn- llm-turn-result
-  [response tool-rounds]
-  {:response response :tool-rounds (vec tool-rounds)})
+  [response transcript]
+  {:response response :transcript (vec transcript)})
 
 (defn- llm-turn
   "Run one LLM call. If it contains tool calls, execute them and loop.
-   Returns {:response ... :tool-rounds [...]} after all tool calls are resolved.
+   Returns {:response ... :transcript [...]} — chronological assistant/tool messages.
    Bounded by :max-tool-calls to prevent infinite loops.
    Fires :on-thought callback with intermediate events.
    Retries on Malli validation errors or tool execution errors
@@ -457,7 +516,7 @@
     (loop [turn-msgs    [{:role "user" :content user-text}]
            depth        0
            retry-count  0
-           tool-rounds  []]
+           transcript   []]
       (let [response   (llm-call state {:user-text user-text
                                         :turn-messages turn-msgs})
             content    (http/assistant-content response)
@@ -474,12 +533,14 @@
                            (http/assistant-message response)
                            {:role "user"
                             :content "Your previous response was empty. Provide a plain-text answer."})
-                     depth (inc retry-count) tool-rounds)
-              (llm-turn-result text tool-rounds)))
+                     depth (inc retry-count) transcript)
+              (llm-turn-result text (conj transcript {:role "assistant" :content text}))))
 
           (>= depth max-depth)
           (llm-turn-result (str (or content "") "\n\n[Tool call limit reached]")
-                           tool-rounds)
+                           (conj transcript {:role "assistant"
+                                             :content (str (or content "")
+                                                           "\n\n[Tool call limit reached]")}))
 
           :else
           (let [_         (fire-on-thought state {:type :tool-call :content (or content "")
@@ -487,19 +548,20 @@
                results    (execute-tool-calls calls (:tools state))
                _          (fire-on-thought state {:type :tool-result :results results})
                errors     (filterv :error results)
+               asst-msg   (http/assistant-message response)
                tool-msgs  (format-tool-results-native results)
-               rounds'    (into tool-rounds results)]
+               transcript' (into transcript (into [asst-msg] tool-msgs))]
             (if (and (seq errors) (< retry-count max-retries))
               (recur (-> turn-msgs
-                           (into [(http/assistant-message response)])
+                           (into [asst-msg])
                            (into tool-msgs)
                            (into [{:role "user"
                                    :content (str "The following tool calls failed. Do NOT explain or apologize. "
                                                  "Call the tool again with corrected arguments.\nErrors:\n"
                                                  (str/join "\n" (map #(str "  " (:tool %) ": " (:error %)) errors)))}]))
-                     (inc depth) (inc retry-count) rounds')
-              (recur (into (into turn-msgs [(http/assistant-message response)]) tool-msgs)
-                     (inc depth) retry-count rounds'))))))))
+                     (inc depth) (inc retry-count) transcript')
+              (recur (into turn-msgs (into [asst-msg] tool-msgs))
+                     (inc depth) retry-count transcript'))))))))
 
 ;; ---- Queue Operations ----
 
@@ -535,22 +597,19 @@
     (await ag)))
 
 (defn- history-entries-for-exchange
-  "Build chat-history entries for a stored user/tool/assistant exchange."
-  [items response stored tool-rounds]
+  "Build chronological chat-history entries for a completed exchange."
+  [items stored]
   (let [user-entry (cond-> {:role "user" :content (str/join "\n" (mapv :text items))}
                       stored (assoc :msg-id (:user-id stored)
                                     :timestamp (:user-timestamp stored)))
-        tool-entries (mapv (fn [[idx tr]]
-                             (let [stored-tool (get-in stored [:tools idx])]
-                               (cond-> {:role "tool" :content (tool-round-summary tr)}
-                                 (:id tr) (assoc :tool_call_id (:id tr))
-                                 stored-tool (assoc :msg-id (:tool-id stored-tool)
-                                                    :timestamp (:timestamp stored-tool)))))
-                           (map-indexed vector tool-rounds))
-        assistant-entry (cond-> {:role "assistant" :content response}
-                          stored (assoc :msg-id (:assistant-id stored)
-                                        :timestamp (:assistant-timestamp stored)))]
-    (into [user-entry] (concat tool-entries [assistant-entry]))))
+        transcript-entries (if stored
+                             (mapv (fn [{:keys [msg-id timestamp chat-msg]}]
+                                     (cond-> chat-msg
+                                       msg-id (assoc :msg-id msg-id)
+                                       timestamp (assoc :timestamp timestamp)))
+                                   (:stored-msgs stored))
+                             [])]
+    (into [user-entry] transcript-entries)))
 
 (defn- process-messages
   "Process a batch of drained queue items against the LLM.
@@ -561,9 +620,9 @@
   (let [texts         (mapv :text items)
         combined-input (str/join "\n" texts)]
     (try
-      (let [{:keys [response tool-rounds]} (llm-turn ag state combined-input)
-            stored   (store-exchange state combined-input response :tool-rounds tool-rounds)
-            entries  (history-entries-for-exchange items response stored tool-rounds)
+      (let [{:keys [response transcript]} (llm-turn ag state combined-input)
+            stored   (store-exchange state combined-input :transcript transcript)
+            entries  (history-entries-for-exchange items stored)
             state'   (-> state
                         (assoc :current-response response)
                         (update :history into entries)
@@ -686,10 +745,10 @@
    (chat! ag message {}))
   ([ag message opts]
    (let [state    @ag
-         {:keys [response tool-rounds]} (llm-turn ag (merge state (select-keys opts [:base-url :api-key :model]))
+         {:keys [response transcript]} (llm-turn ag (merge state (select-keys opts [:base-url :api-key :model]))
                                                    message)
-         stored   (store-exchange state message response :tool-rounds tool-rounds)
-         entries  (history-entries-for-exchange [{:text message}] response stored tool-rounds)]
+         stored   (store-exchange state message :transcript transcript)
+         entries  (history-entries-for-exchange [{:text message}] stored)]
      (send ag update :history into entries)
      (await ag)
      (send ag cap-history)
@@ -742,9 +801,9 @@
   "Get the current memory configuration map."
   [ag]
   (select-keys @ag [:memory-relevant-limit :memory-recent-limit
-                       :memory-strategy :memory-embedding-dims
-                       :memory-embedding-model
-                       :memory-backend :session-id :sessions-dir]))
+                    :memory-strategy :memory-embedding-dims
+                    :memory-embedding-model :memory-max-chars
+                    :memory-backend :session-id :sessions-dir]))
 
 (defn get-config
   "Get the full agent configuration map."

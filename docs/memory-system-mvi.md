@@ -26,7 +26,9 @@ Hybrid memory = **top-Y relevant entries** + **last-N recent messages**, deduped
  :msg/text           {:db/valueType :db.type/string}
  :msg/timestamp      {:db/valueType :db.type/long}
  :msg/tool-name      {:db/valueType :db.type/string}
- :msg/tool-result    {:db/valueType :db.type/string}}
+ :msg/tool-result    {:db/valueType :db.type/string}
+ :msg/tool-calls     {:db/valueType :db.type/string}  ;; JSON OpenAI tool_calls
+ :msg/tool-call-id   {:db/valueType :db.type/string}}
 ```
 
 Vectors are **not** stored on entities. They live in a separate LMDB KV store indexed by `:msg/id`.
@@ -69,6 +71,7 @@ Agent state holds the memory store at `:memory-store` (access via `get-memory-st
 | `LATERALUS_MEMORY_RECENT_LIMIT` | `10` |
 | `LATERALUS_MEMORY_STRATEGY` | `:hybrid` |
 | `LATERALUS_HISTORY_LIMIT` | `50` |
+| `LATERALUS_MEMORY_MAX_CHARS` / `:memory-max-chars` | `500` (LLM prompt only; DB stores full text) |
 
 ## Wiring — Multimethods
 
@@ -85,15 +88,20 @@ Namespace: `kschltz.agent.memory`
 
 ## What Gets Persisted
 
-| Stored | Not stored |
+Chronological order per exchange:
+
+1. User message (`:role "user"`)
+2. Assistant message with `tool_calls` when the model invoked tools (`:msg/tool-calls` JSON)
+3. Tool result message(s) (`:role "tool"`, `:msg/tool-call-id`, full `:msg/text`)
+4. Final assistant text response (`:role "assistant"`)
+
+| Stored (full text in Datalevin) | Not stored |
 |--------|--------------|
-| Final user message | Tool call markup / raw args |
-| Tool execution summaries (`:role "tool"`) | LLM reasoning/thinking |
-| Final assistant response | Intermediate assistant tool-call responses |
-| Embedding vector (when API succeeds) | Ephemeral in-turn tool-round API messages |
+| Full chronological transcript above | LLM reasoning/thinking |
+| Embedding vector (when API succeeds) | Ephemeral retry nudges inside a turn |
 | Session + embedding model metadata | |
 
-Tool summaries store compact text like `repl-eval((+ 1 2)) => 3` plus `:msg/tool-name` and `:msg/tool-result`.
+When building the LLM prompt (`compose-context`, in-turn messages), text longer than `LATERALUS_MEMORY_MAX_CHARS` (default 500) is truncated with a `…` suffix. The database always keeps the full message.
 
 ## Embedding Failures
 

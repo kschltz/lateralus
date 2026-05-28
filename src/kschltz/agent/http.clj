@@ -15,8 +15,9 @@
 (defn- http-opts
   "Base hato opts with timeouts so unreachable LLM/embed hosts fail fast."
   [extra]
-  (merge {:connect-timeout default-connect-timeout-ms
-          :timeout         (timeout-ms)}
+  (merge {:connect-timeout   default-connect-timeout-ms
+          :timeout           (timeout-ms)
+          :throw-exceptions  false}
          extra))
 
 (defn auth-headers [api-key]
@@ -24,19 +25,22 @@
     {"Authorization" (str "Bearer " api-key)}))
 
 (defn get-models [base-url api-key]
-  (let [url (format "%s/v1/models" base-url)]
-    (-> (hato/get url (cond-> {:as :json}
+  (let [url (format "%s/v1/models" base-url)
+        resp (hato/get url (cond-> {:as :json :throw-exceptions false}
                         api-key
-                        (assoc :headers (auth-headers api-key))))
-        :body
-        :data)))
+                        (assoc :headers (auth-headers api-key))))]
+    (if (and (:status resp) (>= (:status resp) 400))
+      (throw (ex-info (str "API error: status: " (:status resp)) {:status (:status resp) :body (:body resp)}))
+      (get-in resp [:body :data]))))
 
 (defn get-model-info [base-url api-key model-id]
-  (let [url (format "%s/v1/models/%s" base-url model-id)]
-    (-> (hato/get url (cond-> {:as :json}
+  (let [url (format "%s/v1/models/%s" base-url model-id)
+        resp (hato/get url (cond-> {:as :json :throw-exceptions false}
                         api-key
-                        (assoc :headers (auth-headers api-key))))
-        :body)))
+                        (assoc :headers (auth-headers api-key))))]
+    (if (and (:status resp) (>= (:status resp) 400))
+      (throw (ex-info (str "API error: status: " (:status resp)) {:status (:status resp) :body (:body resp)}))
+      (:body resp))))
 
 (defn completion [url api-key model message & {:keys [chat-history messages tools]
                                                :or   {chat-history []}}]
@@ -45,13 +49,22 @@
                       :messages (or messages
                                     (conj (vec chat-history)
                                           {:role "user" :content message}))}
-               tools (assoc :tools tools))]
-    (-> (hato/post url (http-opts (cond-> {:content-type :json
-                                           :form-params  body
-                                           :as           :json}
-                                    api-key
-                                    (assoc :headers (auth-headers api-key)))))
-        :body)))
+               tools (assoc :tools tools))
+        resp (hato/post url (http-opts (cond-> {:content-type :json
+                                               :form-params  body
+                                               :as           :json}
+                                        api-key
+                                        (assoc :headers (auth-headers api-key)))))
+        status (:status resp)]
+    (if (and status (>= status 400))
+      ;; HTTP error — extract error body for diagnosis and throw
+      (let [error-body (or (:body resp) {:error {:message (str "HTTP " status)}})
+            error-msg  (or (get-in error-body [:error :message])
+                           (get-in error-body [:error])
+                           (str error-body))]
+        (throw (ex-info (str "LLM API error: status: " status ", message: " error-msg)
+                        {:status status :body error-body :url url})))
+      (:body resp))))
 
 (defn- embed-request
   [base-url api-key model text]
@@ -69,8 +82,12 @@
                                                 :form-params  body
                                                 :as           :json}
                                          api-key
-                                         (assoc :headers (auth-headers api-key)))))]
-    (get-in resp [:body :data 0 :embedding])))
+                                         (assoc :headers (auth-headers api-key)))))
+        status (:status resp)]
+    (if (and status (>= status 400))
+      (throw (ex-info (str "Embed API error: status: " status)
+                      {:status status :body (:body resp)}))
+      (get-in resp [:body :data 0 :embedding]))))
 
 (defn embed
   "Call an OpenAI-compatible /embeddings endpoint.

@@ -606,13 +606,17 @@
               (catch Exception e
                 ;; LLM API error (400, timeout, connection refused, etc.)
                 ;; Fire on-error for logging, then tell the LLM so it can self-correct
-                (when-let [on-error (:on-error state)]
-                  (try (on-error ag e) (catch Exception _)))
-                (fire-on-thought state {:type :error :content (.getMessage e)})
-                {:response {:choices [{:message
-                              {:content (str "LLM API error: " (.getMessage e))}}]}
-                 :api-error? true
-                 :api-error-msg (.getMessage e)}))
+                (let [msg   (.getMessage e)
+                      data  (ex-data e)
+                      short (or (get-in data [:body :error :message])
+                                (get-in data [:body :error])
+                                msg)]
+                  (when-let [on-error (:on-error state)]
+                    (try (on-error ag e) (catch Exception _)))
+                  (fire-on-thought state {:type :error :content (str "ERROR: " short)})
+                  {:response {:choices [{:message {:content (str "LLM API error: " short)}}]}
+                   :api-error? true
+                   :api-error-msg short})))
             content    (http/assistant-content response)
             reasoning  (http/reasoning-content response)
             _          (when reasoning

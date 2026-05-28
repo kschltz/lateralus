@@ -7,6 +7,7 @@
 (def extra-paren "(let [x 1] (inc x)))")
 (def valid-code "(let [x 1] (inc x))")
 (def complex-missing "(defn foo [x] (if (> x 0) (inc x)")
+(def broken-add "(+ 1 2 3")
 
 (deftest delimiter-error-detection
   (testing "valid code has no delimiter errors"
@@ -39,7 +40,18 @@
     (is (= "not code at all" (dr/repair-or-original "not code at all"))))
 
   (testing "returns repaired when successful"
-    (is (= "(+ 1 2 3)" (dr/repair-or-original "(+ 1 2 3"))))
+    (is (= "(+ 1 2 3)" (dr/repair-or-original broken-add))))
 
   (testing "returns original when already valid"
     (is (= "(+ 1 2 3)" (dr/repair-or-original "(+ 1 2 3)")))))
+
+(deftest prepare-for-eval-flags-repair
+  (testing "prepare-for-eval marks repaired code"
+    (let [{:keys [code repaired?]} (dr/prepare-for-eval "(let [x 1] (inc x")]
+      (is (= "(let [x 1] (inc x))" code))
+      (is repaired?)))
+
+  (testing "prepare-for-eval leaves valid code unchanged"
+    (let [{:keys [code repaired?]} (dr/prepare-for-eval "(inc 1)")]
+      (is (= "(inc 1)" code))
+      (is (not repaired?)))))

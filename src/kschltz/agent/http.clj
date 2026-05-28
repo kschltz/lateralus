@@ -4,7 +4,7 @@
             [malli.core :as m]))
 
 (def ^:private default-connect-timeout-ms 2000)
-(def ^:private default-timeout-ms 5000)
+(def ^:private default-timeout-ms 60000)
 
 (defn- timeout-ms
   "Request timeout (ms). Override with LATERALUS_HTTP_TIMEOUT_MS for slow cloud models."

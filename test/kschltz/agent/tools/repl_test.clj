@@ -238,3 +238,22 @@
   (testing "eval mode evaluates multiple top-level forms"
     (let [tool (sut/repl-eval-tool)]
       (is (= "2" (tools/run tool "(def x 1)\n(inc x)"))))))
+
+(deftest run-repl-eval-repairs-missing-paren
+  (testing "eval mode auto-repairs missing closing delimiter"
+    (let [tool (sut/repl-eval-tool)
+          raw (tools/run tool {:code "(let [x 1] (inc x"})]
+      (is (string? raw))
+      (is (= "2\n; delimiter repair applied before eval" raw)))))
+
+(deftest run-repl-eval-repairs-extra-paren
+  (testing "eval mode auto-repairs extra closing delimiter"
+    (let [tool (sut/repl-eval-tool)]
+      (is (= "6\n; delimiter repair applied before eval"
+             (tools/run tool "(+ 1 2 3))")))))
+
+(deftest run-repl-eval-repairs-thread-macro
+  (testing "eval mode auto-repairs broken threading forms"
+    (let [tool (sut/repl-eval-tool)]
+      (is (= "3\n; delimiter repair applied before eval"
+             (tools/run tool "(-> 1 inc inc")))))))

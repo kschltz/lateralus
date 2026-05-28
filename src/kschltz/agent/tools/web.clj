@@ -1,5 +1,12 @@
 (ns kschltz.agent.tools.web
-  "Web search tool — DuckDuckGo Lite HTML results with Wikipedia fallback."
+  "Web search tool — Mojeek primary, Startpage fallback, Wikipedia last resort.
+
+   Search backend priority:
+     1. Mojeek          — independent search index, clean HTML, no API key
+     2. Startpage       — Google results via privacy proxy, no API key
+     3. Wikipedia API   — always available, Wikipedia-only results
+
+   DDG was removed: both Lite and HTML endpoints now serve CAPTCHAs (2026)."
   (:require
    [cheshire.core :as json]
    [clojure.string :as str]
@@ -27,22 +34,35 @@
 (def ^:private max-hits 8)
 
 (def ^:private http-user-agent
-  "Mozilla/5.0 (compatible; Lateralus-Agent/1.0)")
+  "Browser-like UA. Many sites reject bot-like agents with 403."
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-(def ^:private ddg-lite-url "https://lite.duckduckgo.com/lite/")
-
+(def ^:private mojeek-url "https://www.mojeek.com/search")
+(def ^:private startpage-url "https://www.startpage.com/sp/search")
 (def ^:private wiki-api-url "https://en.wikipedia.org/w/api.php")
 
-(def ^:private result-link-re
-  #"<a rel=\"nofollow\" href=\"([^\"]+)\" class='result-link'>([^<]+)</a>")
+;; ---- Mojeek selectors ----
+;; <a class="abs" href="URL">Title</a>   — older pages
+;; <a class="title" href="URL">Title</a> — newer pages
+;; Both patterns handled.
 
-(def ^:private result-snippet-re
-  #"<td class='result-snippet'>\s*([\s\S]*?)\s*</td>")
+(def ^:private mojeek-title-re
+  #"<a[^>]+class=\"(?:title|abs)\"[^>]+href=\"([^\"]+)\"[^>]*>([^<]+)</a>")
+
+(def ^:private mojeek-snippet-re
+  #"<p[^>]+class=\"s\"[^>]*>([\s\S]*?)</p>")
+
+;; ---- Startpage selectors ----
+
+(def ^:private startpage-link-re
+  #"<a[^>]+class=\"result-title result-link[^\"]*\"[^>]+href=\"([^\"]+)\"[^>]*>([\s\S]*?)</a>")
 
 ;; ---- Protocol ----
 
 (defprotocol WebSearch
   (search [this query]))
+
+;; ---- Helpers ----
 
 (defn- normalize-query
   "Accept native tool args map {:query ...} or a bare query string."
@@ -60,30 +80,29 @@
 (defn- http-timeout-ms
   []
   (or (some-> (System/getenv "LATERALUS_HTTP_TIMEOUT_MS") parse-long)
-      15000))
+      60000))
 
 (defn- http-get
-  [url]
-  (:body (hato/get url {:as      :string
-                        :timeout (http-timeout-ms)
-                        :headers {"User-Agent" http-user-agent}})))
-
-(defn- http-post-form
-  [url form-params]
-  (:body (hato/post url {:as           :string
-                         :timeout      (http-timeout-ms)
-                         :headers      {"User-Agent"   http-user-agent
-                                        "Content-Type" "application/x-www-form-urlencoded"}
-                         :form-params  form-params})))
+  ([url]
+   (http-get url nil))
+  ([url extra-headers]
+   (:body (hato/get url {:as      :string
+                         :timeout (http-timeout-ms)
+                         :headers (merge {"User-Agent" http-user-agent}
+                                        extra-headers)}))))
 
 (defn- html-unescape
+  "Decode common HTML entities including numeric like &#039; and &#x27;."
   [s]
   (-> s
       (str/replace "&amp;" "&")
       (str/replace "&lt;" "<")
       (str/replace "&gt;" ">")
       (str/replace "&quot;" "\"")
-      (str/replace "&#39;" "'")
+      (str/replace #"&#(\d+);"
+        (fn [[_ code]] (str (char (Integer/parseInt code)))))
+      (str/replace #"&#x([0-9a-fA-F]+);"
+        (fn [[_ hex]] (str (char (Integer/parseInt hex 16)))))
       (str/replace "&nbsp;" " ")))
 
 (defn- strip-html-tags
@@ -93,18 +112,48 @@
       html-unescape
       str/trim))
 
-(defn parse-ddg-lite-html
-  "Extract {:title :url :snippet} hits from DuckDuckGo Lite HTML."
-  [body]
-  (let [links (for [[_ href title] (re-seq result-link-re body)]
-                {:url   (html-unescape href)
-                 :title (strip-html-tags title)})
-        snippets (map strip-html-tags (map second (re-seq result-snippet-re body)))]
+;; ---- Mojeek Search ----
+
+(defn- fetch-mojeek-hits
+  "Search via Mojeek. Clean HTML, independent index, no API key."
+  [query]
+  (let [url  (str mojeek-url "?q=" (encode-query query))
+        body (http-get url)
+        links   (for [[_ href title] (re-seq mojeek-title-re body)]
+                  {:url   (html-unescape href)
+                   :title (strip-html-tags title)})
+        snippets (map strip-html-tags
+                      (map second (re-seq mojeek-snippet-re body)))]
     (vec (take max-hits
                (map (fn [link snippet]
                       (assoc link :snippet (or snippet "")))
                     links
                     (concat snippets (repeat "")))))))
+
+;; ---- Startpage Search ----
+
+(defn- fetch-startpage-hits
+  "Search via Startpage (Google results via privacy proxy). No API key."
+  [query]
+  (let [url  (str startpage-url "?q=" (encode-query query))
+        body (http-get url {"Accept" "text/html,application/xhtml+xml"})
+        links   (for [[_ href title-html] (re-seq startpage-link-re body)]
+                  {:url   (html-unescape href)
+                   :title (strip-html-tags title-html)})
+        ;; Startpage snippets live in <p> blocks near results.
+        ;; Fallback: extract text from <p> tags with 30+ printable chars.
+        snippet-texts (->> (re-seq #"<p[^>]*>([^<]{30,})</p>" body)
+                           (map second)
+                           (map strip-html-tags)
+                           (remove #(str/starts-with? % "{"))
+                           (remove #(str/starts-with? % ".")))]
+    (vec (take max-hits
+               (map (fn [link snippet]
+                      (assoc link :snippet (or snippet "")))
+                    links
+                    (concat snippet-texts (repeat "")))))))
+
+;; ---- Wikipedia Search ----
 
 (defn- wiki-title->url
   [title]
@@ -117,36 +166,37 @@
   (let [url  (str wiki-api-url
                   "?action=query&list=search&format=json&utf8=1&srlimit="
                   max-hits "&srsearch=" (encode-query query))
-        body (http-get url)
+        body (http-get url {"Accept" "application/json"})
         items (get-in (json/parse-string body true) [:query :search])]
     (vec (for [{:keys [title snippet]} items]
            {:title   title
             :url     (wiki-title->url title)
             :snippet (strip-html-tags snippet)}))))
 
-(defn- fetch-ddg-lite-hits
-  [query]
-  (parse-ddg-lite-html (http-post-form ddg-lite-url {:q query})))
-
 (defn- fetch-wikipedia-hits
   [query]
   (wikipedia-search query))
 
+;; ---- Public API ----
+
 (defn web-search
-  "Search the web. Uses DuckDuckGo Lite; falls back to Wikipedia when DDG has no hits."
+  "Search the web. Priority: Mojeek → Startpage → Wikipedia."
   [query]
   (when-not (m/validate SearchQuery query)
     (throw (ex-info "Invalid search query" {:query query :schema SearchQuery})))
-  (let [ddg    (try (fetch-ddg-lite-hits query)
-                    (catch Exception _ []))
-        hits   (if (seq ddg) ddg (try (fetch-wikipedia-hits query) (catch Exception _ [])))
-        result (vec hits)]
+  (let [mojeek    (try (fetch-mojeek-hits query) (catch Exception _ nil))
+        startpage (try (fetch-startpage-hits query) (catch Exception _ nil))
+        hits      (cond
+                   (seq mojeek)    mojeek
+                   (seq startpage) startpage
+                   :else          (try (fetch-wikipedia-hits query) (catch Exception _ [])))
+        result    (vec hits)]
     (when-not (m/validate SearchResponse result)
       (throw (ex-info "Invalid search response" {:result result :schema SearchResponse})))
     result))
 
 (defn duckduckgo-search
-  "Backward-compatible alias for web-search."
+  "Deprecated. Use web-search instead."
   [query]
   (web-search query))
 

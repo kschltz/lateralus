@@ -58,6 +58,31 @@
       (clojure.core/eval (first forms))
       (clojure.core/eval `(do ~@forms)))))
 
+(defn- format-eval-result
+  "pr-str the value; note when delimiter repair ran before eval."
+  [value repaired?]
+  (let [base (pr-str value)]
+    (if repaired?
+      (str base "\n; delimiter repair applied before eval")
+      base)))
+
+(defn- eval-with-delimiter-repair
+  "Sanitize, repair delimiters, eval; retry once with forced repair on failure."
+  [raw-code]
+  (let [code (sanitize-code raw-code)
+        {:keys [code repaired?]} (delimiter-repair/prepare-for-eval code)]
+    (try
+      {:value (eval-forms code) :repaired? repaired?}
+      (catch Exception first-e
+        (if repaired?
+          (throw first-e)
+          (if-some [retry (delimiter-repair/force-repair code)]
+            (try
+              {:value (eval-forms retry) :repaired? true}
+              (catch Exception e
+                (throw e)))
+            (throw first-e)))))))
+
 ;; ---- Execution Mode Dispatch ----
 ;; These dispatch functions are defined BEFORE defmulti so the
 ;; compiler can resolve them.  The :repl multimethods dispatch on
@@ -78,14 +103,12 @@
 (defmulti run-repl mode-dispatch)
 
 (defmethod run-repl :eval
-  [tool args]
-  (let [code       (sanitize-code args)
-        fixed-code (delimiter-repair/repair-or-original code)
-        result     (try
-                     (eval-forms fixed-code)
-                     (catch Exception e
-                       (str "Exception: " (.getMessage e))))]
-    (pr-str result)))
+  [_tool args]
+  (try
+    (let [{:keys [value repaired?]} (eval-with-delimiter-repair args)]
+      (format-eval-result value repaired?))
+    (catch Exception e
+      (str "Exception: " (.getMessage e)))))
 
 (defmethod run-repl :nrepl
   [tool args]
@@ -166,10 +189,11 @@
      :description  — tool description"
   ([]
    (make-repl-tool :eval "repl-eval"
-                   "Evaluate Clojure code locally. Args: {:code string}. Returns: parsed result."))
+                   "Evaluate Clojure code locally. Unbalanced delimiters are auto-repaired before eval. Args: {:code string}. Returns: parsed result."))
   ([opts]
    (make-repl-tool :eval (or (:name opts) "repl-eval")
-                   (or (:description opts) "Evaluate Clojure code locally. Args: {:code string}. Returns: parsed result.")
+                   (or (:description opts)
+                       "Evaluate Clojure code locally. Unbalanced delimiters are auto-repaired before eval. Args: {:code string}. Returns: parsed result.")
                    nil (or (:result-type opts) :string))))
 
 (defn repl-nrepl-tool

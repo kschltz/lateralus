@@ -4,6 +4,25 @@
             [kschltz.agent.cli :as cli]
             [kschltz.agent.core :as core]))
 
+(deftest parse-args-timeout-flag
+  (testing "--timeout sets :timeout-ms"
+    (is (= 90000 (:timeout-ms (#'cli/parse-args ["--timeout" "90000" "hi"]))))))
+
+(deftest resolve-response-timeout-ms-defaults
+  (testing "default response timeout is 1 minute"
+    (is (= 60000 (#'cli/resolve-response-timeout-ms {} :env-getter (constantly nil))))
+    (is (= 60000 cli/default-response-timeout-ms))))
+
+(deftest resolve-response-timeout-ms-precedence
+  (testing "CLI --timeout beats LATERALUS_TIMEOUT_MS env"
+    (let [env-getter (fn [k] (when (= k "LATERALUS_TIMEOUT_MS") "120000"))]
+      (is (= 45000
+             (#'cli/resolve-response-timeout-ms
+               {:timeout-ms 45000}
+               :env-getter env-getter)))
+      (is (= 120000
+             (#'cli/resolve-response-timeout-ms {} :env-getter env-getter))))))
+
 (deftest parse-args-session-flag
   (testing "-s / --session sets :session"
     (is (= "my-session" (:session (#'cli/parse-args ["-s" "my-session" "hello"]))))
@@ -92,13 +111,69 @@
     (is (nil? (#'cli/resolve-embedding-method {} (fn [_] nil)))
         "nil when neither CLI nor env is set")))
 
+(deftest parse-args-extended-flags
+  (testing "all optional CLI flags parse correctly"
+    (let [opts (#'cli/parse-args
+                ["-u" "http://llm" "-k" "key" "-m" "m" "-s" "sid"
+                 "-E" "langchain4j" "--embedding-model" "emb" "--embedding-dims" "512"
+                 "--sessions-dir" "data/sessions"
+                 "--memory-relevant-limit" "7"
+                 "--memory-recent-limit" "12"
+                 "--memory-strategy" "hybrid"
+                 "--history-limit" "40"
+                 "--memory-max-chars" "600"
+                 "--max-tool-calls" "8"
+                 "-t" "10" "-r" "2" "hello"])]
+      (is (= "http://llm" (:base-url opts)))
+      (is (= "key" (:api-key opts)))
+      (is (= "emb" (:embedding-model opts)))
+      (is (= 512 (:embedding-dims opts)))
+      (is (= "data/sessions" (:sessions-dir opts)))
+      (is (= 7 (:memory-relevant-limit opts)))
+      (is (= :hybrid (:memory-strategy opts)))
+      (is (= "hello" (:prompt opts))))))
+
+(deftest parse-args-no-memory
+  (testing "--no-memory disables session memory"
+    (let [opts (#'cli/parse-args ["--no-memory" "hi"])]
+      (is (= false (:memory-enabled opts)))
+      (is (nil? (:session opts))))))
+
+(deftest build-make-agent-opts-defaults-langchain4j
+  (testing "build-make-agent-opts defaults to LangChain4j in-process embeddings"
+    (let [opts (cli/build-make-agent-opts {} :env-getter (constantly nil))]
+      (is (= :langchain4j (:memory-embedding-method opts)))
+      (is (= "all-minilm-l6-v2-q" (:memory-embedding-model opts))))))
+
+(deftest build-make-agent-opts-cli-over-env
+  (testing "build-make-agent-opts applies CLI over env"
+    (let [opts (cli/build-make-agent-opts
+                 {:embedding-method :langchain4j
+                  :memory-relevant-limit 9}
+                 :env-getter (fn [k]
+                               (when (= k "LATERALUS_EMBEDDING_METHOD") "http")))]
+      (is (= :langchain4j (:memory-embedding-method opts)))
+      (is (= 9 (:memory-relevant-limit opts))))))
+
+(deftest build-make-agent-opts-defaults-langchain4j
+  (testing "build-make-agent-opts defaults to langchain4j in-process when no -E and no env"
+    (let [opts (cli/build-make-agent-opts {} :env-getter (constantly nil))]
+      (is (= :langchain4j (:memory-embedding-method opts)))
+      (is (= "all-minilm-l6-v2-q" (:memory-embedding-model opts))))))
+
 (deftest cli-memory-opt-in
-  (testing "memory is disabled without -s or LATERALUS_SESSION (CLI default)"
-    (let [session-id (or nil (System/getenv "LATERALUS_SESSION"))]
-      (when (nil? session-id)
-        (let [ag (core/make-agent {:base-url "http://mock" :model "mock" :session-id nil})]
-          (is (nil? (core/get-memory-store ag))
-              "make-agent with explicit nil session-id should not open memory")))))
+  (testing "build-make-agent-opts enables default session when no -s"
+    (let [opts (cli/build-make-agent-opts {} :env-getter (constantly nil))]
+      (is (not (contains? opts :session-id))
+          "omit session-id so make-agent uses default")
+      (let [ag (core/make-agent (assoc opts :base-url "http://mock" :model "mock"))]
+        (is (= "default" (core/get-session-id ag)))
+        (is (some? (core/get-memory-store ag)))
+        (core/close-session! ag))))
+  (testing "memory is disabled with --no-memory"
+    (let [opts (cli/build-make-agent-opts {:memory-enabled false} :env-getter (constantly nil))]
+      (is (false? (:memory-enabled opts)))
+      (is (nil? (:session-id opts)))))
   (testing "memory is enabled when session-id is provided like CLI -s"
     (let [sid (str "cli-opt-in-" (System/nanoTime))
           ag  (core/make-agent {:base-url    "http://mock"

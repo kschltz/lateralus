@@ -1,52 +1,49 @@
 (ns kschltz.agent.delimiter-repair
   "Automatic Clojure delimiter repair for LLM-generated code.
-   
-   Based on clojure-mcp-light's approach by Bruce Hauman:
-   1. Detect errors with edamame parser
+
+   Pipeline (aligned with clojure-mcp-light):
+   1. Detect delimiter errors with edamame
    2. Repair with parinferish (indent mode)
-   3. Validate repaired code parses clean
-   
-   Usage in repl-eval:
-     (let [fixed (repair-code code)]
-       (eval-string (or fixed code)))"
+   3. Validate repaired code parses clean"
   (:require [edamame.core :as edamame]
             [parinferish.core :as parinferish]))
 
+(def ^:private edamame-opts
+  {:all true
+   :read-cond :allow
+   :readers (fn [_tag] (fn [data] data))
+   :auto-resolve name})
+
+(defn- parse-all
+  [s]
+  (edamame/parse-string-all s edamame-opts))
+
 (defn delimiter-error?
-  "Returns true if the code string has unbalanced delimiters.
-   Uses edamame's tolerant parser which reports :edamame/error with
-   delimiter info when parens/brackets/braces don't match."
+  "True when edamame reports an :edamame/error with opened-delimiter info,
+   or when parsing fails in a way that may be delimiter-related."
   [s]
   (try
-    (edamame/parse-string-all s {:all true
-                                  :read-cond :allow
-                                  :readers (fn [_tag] (fn [data] data))
-                                  :auto-resolve name})
+    (parse-all s)
     false
     (catch clojure.lang.ExceptionInfo ex
       (let [data (ex-data ex)]
-        (= :edamame/error (:type data))))
+        (or (and (= :edamame/error (:type data))
+                 (contains? data :edamame/opened-delimiter))
+            (= :edamame/error (:type data)))))
     (catch Exception _
-      ;; If we can't parse at all, assume it might have delimiter issues
-      ;; and let parinferish try to fix it
       true)))
 
 (defn repair-with-parinferish
-  "Attempt to repair delimiter errors using parinferish (indent mode).
-   Returns repaired code string or nil if repair failed."
+  "Run parinferish indent repair. Returns repaired code when parinfer succeeds."
   [s]
   (try
-    (let [repaired (parinferish/flatten
-                     (parinferish/parse s {:mode :indent}))]
-      (when (and repaired (not= repaired s))
-        repaired))
+    (parinferish/flatten (parinferish/parse s {:mode :indent}))
     (catch Exception _
       nil)))
 
 (defn repair-code
-  "Attempt to repair delimiter errors in Clojure code.
-   Returns the repaired code string if successful, nil if unfixable.
-   If no errors exist, returns the original code."
+  "Repair delimiter errors when detected. Returns repaired string, or
+   the original when already valid, or nil when repair fails."
   [s]
   (if (delimiter-error? s)
     (let [repaired (repair-with-parinferish s)]
@@ -54,8 +51,21 @@
         repaired))
     s))
 
+(defn force-repair
+  "Always attempt parinferish repair; accept result when it parses cleanly."
+  [s]
+  (let [repaired (repair-with-parinferish s)]
+    (when (and repaired (not (delimiter-error? repaired)))
+      repaired)))
+
 (defn repair-or-original
-  "Repair code, falling back to original if repair fails.
-   Always returns a string — never nil."
+  "Repair code, falling back to original when repair fails or is unnecessary."
   [s]
   (or (repair-code s) s))
+
+(defn prepare-for-eval
+  "Return {:code string :repaired? boolean} ready for eval."
+  [s]
+  (let [code (repair-or-original s)]
+    {:code code
+     :repaired? (not= code s)}))

@@ -476,19 +476,30 @@
           (is (some? resp)))))))
 
 (deftest e2e-native-tool-call-max-depth
-  (testing "tool call loop stops at max-tool-calls limit"
-    (let [call-n (atom 0)]
+  (testing "tool call loop stops at max-tool-calls limit and gives LLM a final turn"
+    (let [call-n (atom 0)
+          last-prompt (atom nil)]
       (with-redefs [http/completion
-                    (fn [_url _api-key _model _message & _opts]
+                    (fn [_url _api-key _model _msg & {:keys [messages]}]
                       (swap! call-n inc)
-                      {:choices [{:message {:tool_calls [{:id (str "call-" @call-n)
-                                                          :function {:name "repl-eval"
-                                                                     :arguments "{\"code\": \"1\"}"}}]}}]})
+                      (let [last-msg (-> messages last :content)]
+                        (reset! last-prompt last-msg)
+                        (if (and (string? last-msg) (.contains ^String last-msg "maximum number of tool"))
+                          ;; Wrap-up call: return text, not a tool call
+                          {:choices [{:message {:content "I've summarized what I found from the tools."}}]}
+                          ;; Normal call: return tool call
+                          {:choices [{:message {:tool_calls [{:id (str "call-" @call-n)
+                                                              :function {:name "repl-eval"
+                                                                         :arguments "{\"code\": \"1\"}"}}]}}]})))
                     http/assistant-content mock-assistant-content
                     http/tool-calls http/tool-calls
                     http/assistant-message http/assistant-message]
         (let [ag (fresh-agent {:tools [(repl-tools/repl-eval-tool)]
                                :max-tool-calls 2})
               resp (core/chat! ag "loop forever")]
-          (is (.contains resp "[Tool call limit reached]"))
-          (is (<= @call-n 3)))))))
+          ;; LLM gets a final turn to synthesize after hitting the limit
+          (is (.contains resp "summarized"))
+          ;; The wrap-up prompt tells the LLM no more tool calls
+          (is (.contains ^String @last-prompt "maximum number of tool"))
+          ;; 2 tool-call rounds + 1 limit-hit round + 1 final wrap-up call = 4
+          (is (= 4 @call-n)))))))

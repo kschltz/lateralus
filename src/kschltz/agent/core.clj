@@ -604,10 +604,27 @@
               (llm-turn-result text (conj transcript {:role "assistant" :content text}))))
 
           (>= depth max-depth)
-          (llm-turn-result (str (or content "") "\n\n[Tool call limit reached]")
-                           (conj transcript {:role "assistant"
-                                             :content (str (or content "")
-                                                           "\n\n[Tool call limit reached]")}))
+          ;; Give the LLM one final turn to synthesize a response
+          ;; instead of just appending [Tool call limit reached].
+          ;; We inject a system-like user message telling the model to wrap up,
+          ;; then call the LLM one more time and return THAT response.
+          (let [wrap-up-prompt (str "You have reached the maximum number of tool calls ("
+                                   max-depth "). "
+                                   "You cannot make any more tool calls. "
+                                   "Using only the information you already have from previous tool results, "
+                                   "provide the best possible answer to the user now. "
+                                   "Do not attempt any more tool calls.")
+                final-turn  (conj (into turn-msgs
+                                        (into [(http/assistant-message response)]
+                                              (format-tool-results-native
+                                            (execute-tool-calls calls (:tools state)))))
+                                   {:role "user" :content wrap-up-prompt})
+                final-resp  (llm-call state {:user-text user-text
+                                            :turn-messages final-turn})
+                final-text  (or (http/assistant-content final-resp) "")]
+            (fire-on-thought state {:type :thinking :content (or (http/reasoning-content final-resp) "")})
+            (llm-turn-result final-text
+                             (conj transcript {:role "assistant" :content final-text})))
 
           :else
           (let [_         (fire-on-thought state {:type :tool-call :content (or content "")

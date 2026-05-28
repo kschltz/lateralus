@@ -1,70 +1,65 @@
 # kschltz/lateralus
 
-FIXME: my new application.
+Clojure agent with session memory (Datalevin + LangChain4j embeddings), REPL eval, web search, and explicit `remember` facts.
 
-## Installation
+## Quick start
 
-Download from https://github.com/kschltz/lateralus
+```bash
+cd lateralus
 
-## Usage
+# One-shot prompt (default session "default", memory on)
+clojure -M:run-m "What is 2+2?"
 
-FIXME: explanation
+# Interactive
+clojure -M:run-m -i
 
-Run the project directly, via `:exec-fn`:
+# Named session
+clojure -M:run-m -s my-project -i
 
-    $ clojure -X:run-x
-    Hello, Clojure!
+# Same CLI via :cli alias
+clojure -M:cli -h
+```
 
-Run the project, overriding the name to be greeted:
+`clojure -M:run-m` and `clojure -M:cli` both use `kschltz.lateralus/-main`, which delegates to the agent CLI.
 
-    $ clojure -X:run-x :name '"Someone"'
-    Hello, Someone!
+## CLI options
 
-Run the project directly, via `:main-opts` (`-m kschltz.lateralus`):
+| Flag | Env var | Description |
+|------|---------|-------------|
+| `-m`, `--model` | `LATERALUS_MODEL` | LLM model |
+| `-u`, `--base-url` | `LATERALUS_BASE_URL` | API base URL |
+| `-k`, `--api-key` | `LATERALUS_API_KEY` | API key |
+| `-s`, `--session` | `LATERALUS_SESSION` | Session id (overrides default) |
+| `--no-memory` | — | Disable memory |
+| `-E`, `--embedding-method` | `LATERALUS_EMBEDDING_METHOD` | `langchain4j` or `http` |
+| `--embedding-model` | `LATERALUS_EMBEDDING_MODEL` | Embedding model name |
+| `--embedding-dims` | `LATERALUS_MEMORY_EMBEDDING_DIMS` | Vector dimensions |
+| `--sessions-dir` | `LATERALUS_SESSIONS_DIR` | Session storage root |
+| `--memory-relevant-limit` | `LATERALUS_MEMORY_RELEVANT_LIMIT` | Relevant recall count |
+| `--memory-recent-limit` | `LATERALUS_MEMORY_RECENT_LIMIT` | Recent message count |
+| `--memory-strategy` | `LATERALUS_MEMORY_STRATEGY` | e.g. `hybrid` |
+| `--history-limit` | `LATERALUS_HISTORY_LIMIT` | In-agent history cap |
+| `--memory-max-chars` | `LATERALUS_MEMORY_MAX_CHARS` | Prompt truncation (not DB) |
+| `--max-tool-calls` | `LATERALUS_MAX_TOOL_CALLS` | Tool rounds per message |
+| `-t`, `--turns` | — | Max turns (default 5) |
+| `-r`, `--retries` | — | Tool error retries (default 3) |
+| `-i`, `--interactive` | — | Interactive loop |
+| `-h`, `--help` | — | Help |
+| `-v`, `--version` | — | Version |
 
-    $ clojure -M:run-m
-    Hello, World!
+Precedence: CLI flag → environment variable → core default.
 
-Run the project, overriding the name to be greeted:
+Without `-s`, `make-agent` uses session `"default"` and enables memory. Use `--no-memory` to disable.
 
-    $ clojure -M:run-m Via-Main
-    Hello, Via-Main!
+Default tools: `repl-eval`, `web-search`, `remember` (when memory is on).
 
-Run the project's tests (they'll fail until you edit them):
+## Development
 
-    $ clojure -T:build test
+```bash
+clojure -T:build test
+```
 
-Run the project's CI pipeline and build an uberjar (this will fail until you edit the tests to pass):
-
-    $ clojure -T:build ci
-
-This will produce an updated `pom.xml` file with synchronized dependencies inside the `META-INF`
-directory inside `target/classes` and the uberjar in `target`. You can update the version (and SCM tag)
-information in generated `pom.xml` by updating `build.clj`.
-
-If you don't want the `pom.xml` file in your project, you can remove it. The `ci` task will
-still generate a minimal `pom.xml` as part of the `uber` task, unless you remove `version`
-from `build.clj`.
-
-Run that uberjar:
-
-    $ java -jar target/net.clojars.kschltz/lateralus-0.1.0-SNAPSHOT.jar
-
-## Options
-
-FIXME: listing of options this app accepts.
-
-## Examples
-
-...
-
-### Bugs
-
-...
-
-### Any Other Sections
-### That You Think
-### Might be Useful
+Memory system details: [docs/memory-system-mvi.md](docs/memory-system-mvi.md).
 
 ## License
 

@@ -48,15 +48,43 @@
   [code]
   (-> code normalize-code strip-markdown-fence str/trim))
 
+(import (java.util.concurrent Executors TimeUnit ThreadFactory))
+
+(def ^:private eval-timeout-ms
+  "Timeout for eval-forms. Override with LATERALUS_EVAL_TIMEOUT_MS."
+  (or (some-> (System/getenv "LATERALUS_EVAL_TIMEOUT_MS") parse-long)
+      30000))
+
+(def ^:private eval-executor
+  "Daemon thread pool for eval-forms. Daemon threads let the JVM exit cleanly."
+  (Executors/newCachedThreadPool
+    (proxy [ThreadFactory] []
+      (newThread [r]
+        (doto (Thread. r)
+          (.setDaemon true))))))
+
 (defn- eval-forms
-  "Evaluate one or more Clojure forms from a code string."
+  "Evaluate one or more Clojure forms from a code string.
+   Runs in a daemon thread with a timeout to prevent blocking the agent."
   [code]
   (let [forms (edamame/parse-string-all code {:all true
-                                              :read-cond :allow
-                                              :auto-resolve name})]
-    (if (= 1 (count forms))
-      (clojure.core/eval (first forms))
-      (clojure.core/eval `(do ~@forms)))))
+                                                :read-cond :allow
+                                                :auto-resolve name})
+        task  (fn []
+                (if (= 1 (count forms))
+                  (clojure.core/eval (first forms))
+                  (clojure.core/eval `(do ~@forms))))
+        fut   (.submit eval-executor ^Callable task)
+        result (try (.get fut eval-timeout-ms TimeUnit/MILLISECONDS)
+                    (catch java.util.concurrent.TimeoutException _
+                      (.cancel fut true)
+                      (throw (ex-info (str "Eval timed out after " eval-timeout-ms "ms. "
+                                          "Use a future/thread for long-running code.")
+                                      {:timeout-ms eval-timeout-ms})))
+                    (catch Exception e
+                      (.cancel fut true)
+                      (throw e)))]
+    result))
 
 (defn- format-eval-result
   "pr-str the value; note when delimiter repair ran before eval."

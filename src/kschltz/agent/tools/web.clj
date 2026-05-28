@@ -105,10 +105,22 @@
         (fn [[_ hex]] (str (char (Integer/parseInt hex 16)))))
       (str/replace "&nbsp;" " ")))
 
+(defn- strip-style-blocks
+  "Remove <style>...</style> blocks before tag stripping."
+  [s]
+  (str/replace s #"<style[^>]*>[\s\S]*?</style>" ""))
+
+(defn- strip-css-text
+  "Remove inline CSS that leaks into text (e.g. .css-xxxx{...} patterns from Startpage)."
+  [s]
+  (str/replace s #"\.[a-zA-Z][\w-]*\{[^}]*\}" ""))
+
 (defn- strip-html-tags
   [s]
   (-> s
+      strip-style-blocks
       (str/replace #"<[^>]+>" "")
+      strip-css-text
       html-unescape
       str/trim))
 
@@ -137,16 +149,15 @@
   [query]
   (let [url  (str startpage-url "?q=" (encode-query query))
         body (http-get url {"Accept" "text/html,application/xhtml+xml"})
-        links   (for [[_ href title-html] (re-seq startpage-link-re body)]
+        ;; Strip <style> blocks first to prevent CSS leaking into titles
+        clean   (strip-style-blocks body)
+        links   (for [[_ href title-html] (re-seq startpage-link-re clean)]
                   {:url   (html-unescape href)
                    :title (strip-html-tags title-html)})
-        ;; Startpage snippets live in <p> blocks near results.
-        ;; Fallback: extract text from <p> tags with 30+ printable chars.
-        snippet-texts (->> (re-seq #"<p[^>]*>([^<]{30,})</p>" body)
+        snippet-texts (->> (re-seq #"<p[^>]*>([^<]{30,})</p>" clean)
                            (map second)
                            (map strip-html-tags)
-                           (remove #(str/starts-with? % "{"))
-                           (remove #(str/starts-with? % ".")))]
+                           (remove str/blank?))]
     (vec (take max-hits
                (map (fn [link snippet]
                       (assoc link :snippet (or snippet "")))

@@ -26,8 +26,8 @@
 (use-fixtures :each cleanup-fixture)
 
 (defn- stub-embed
-  "Deterministic embedding vectors for CI (matches datalevin_test pattern)."
-  [text]
+  "Deterministic embedding vectors for CI (matches http/embed arity)."
+  [_base-url _api-key _model text]
   (let [h (hash text)]
     (vec (for [i (range 384)]
            (double (+ 0.01 (* (mod (+ h i) 1000) 0.001)))))))
@@ -38,7 +38,8 @@
 (defn- fresh-memory-agent [opts]
   (core/make-agent (merge {:base-url     "http://mock-llm"
                            :model        "mock-model"
-                           :sessions-dir test-sessions-dir}
+                           :sessions-dir test-sessions-dir
+                           :memory-embedding-method :http}
                           opts)))
 
 (deftest e2e-memory-prompt-shape-hybrid-dedup

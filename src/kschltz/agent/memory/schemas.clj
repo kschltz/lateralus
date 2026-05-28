@@ -9,6 +9,10 @@
   "Embedding model identifier."
   [:string {:min 1}])
 
+(def EmbeddingMethod
+  "Embedding backend selection."
+  [:enum :langchain4j :http])
+
 (def BaseUrl
   "OpenAI-compatible API base URL."
   [:string {:min 1}])

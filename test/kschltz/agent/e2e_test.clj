@@ -46,8 +46,9 @@
   (core/make-agent (merge {:base-url     "http://mock-llm"
                            :model        "mock-model"
                            :sessions-dir (str (System/getProperty "java.io.tmpdir")
-                                              "/lateralus-e2e-sessions")}
-                         opts)))
+                                              "/lateralus-e2e-sessions")
+                           :memory-embedding-method :http}
+                          opts)))
 
 (defn- drain-and-wait
   "Send a message, start the loop in a thread, wait for promise delivery."
@@ -144,7 +145,7 @@
   (testing "on-response handler is called for each response"
     (let [responses   (atom [])
           ag          (fresh-agent {:turns       3
-                                   :on-response (fn [r] (swap! responses conj r))})
+                                    :on-response (fn [r] (swap! responses conj r))})
           p1          (core/send-message! ag "msg1")
           p2          (core/send-message! ag "msg2")
           loop-future (future (core/start! ag))]
@@ -336,9 +337,9 @@
     (let [on-resp-calls (atom 0)
           handler-calls  (atom 0)
           ag             (fresh-agent {:turns       5
-                                      :session-id  "lifecycle-test"
-                                      :on-response (fn [_] (swap! on-resp-calls inc))
-                                      :tools       [(repl-tools/repl-eval-tool)]})]
+                                       :session-id  "lifecycle-test"
+                                       :on-response (fn [_] (swap! on-resp-calls inc))
+                                       :tools       [(repl-tools/repl-eval-tool)]})]
 
       ;; Phase 1: Initial state
       (is (false? (core/running? ag)))

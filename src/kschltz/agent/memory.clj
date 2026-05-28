@@ -38,15 +38,17 @@
                   {:opts opts})))
 
 (defmethod create-session :datalevin
-  [{:keys [session-id model embedding-dims embedding-model base-url api-key sessions-dir]}]
+  [{:keys [session-id model embedding-dims embedding-model embedding-method
+           base-url api-key sessions-dir]}]
   (let [store (dlevin/create-session-store session-id
-                     (cond-> {}
-                       model           (assoc :model model)
-                       embedding-dims  (assoc :embedding-dims embedding-dims)
-                       embedding-model (assoc :embedding-model embedding-model)
-                       base-url        (assoc :base-url base-url)
-                       api-key         (assoc :api-key api-key)
-                       sessions-dir    (assoc :sessions-dir sessions-dir)))]
+                                           (cond-> {}
+                                             model            (assoc :model model)
+                                             embedding-method (assoc :embedding-method embedding-method)
+                                             embedding-dims   (assoc :embedding-dims embedding-dims)
+                                             embedding-model  (assoc :embedding-model embedding-model)
+                                             base-url         (assoc :base-url base-url)
+                                             api-key          (assoc :api-key api-key)
+                                             sessions-dir     (assoc :sessions-dir sessions-dir)))]
     {:connection store}))
 
 (defmulti store-message
@@ -78,7 +80,7 @@
 (defmethod retrieve-relevant :datalevin
   [{:keys [session-id query limit connection] :as opts}]
   (let [conn (or connection
-                (throw (ex-info "No connection in opts" {:opts opts})))
+                 (throw (ex-info "No connection in opts" {:opts opts})))
         q    (or query
                  (throw (ex-info "Missing :query" {:opts opts})))
         sid  (or session-id

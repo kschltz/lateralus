@@ -6,7 +6,8 @@
         datalevin/datalevin {:mvn/version "0.10.7"}
         borkdude/edamame {:mvn/version "1.5.37"}
         parinferish/parinferish {:mvn/version "0.8.0"}
-        metosin/malli {:mvn/version "0.16.4"}}
+        metosin/malli {:mvn/version "0.16.4"}
+        dev.langchain4j/langchain4j-embeddings-all-minilm-l6-v2-q {:mvn/version "1.12.2-beta22"}}
  :aliases
  {:run-m {:main-opts ["-m" "kschltz.lateralus"]}
   :run-x {:ns-default kschltz.lateralus

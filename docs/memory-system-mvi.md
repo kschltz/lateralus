@@ -11,14 +11,15 @@ Hybrid memory = **top-Y relevant entries** + **last-N recent messages**, deduped
 - Created on `make-agent` when `:session-id` is non-nil
 - **Datalog store** (`data.mdb`) for message entities
 - **Separate vector index** (`vectors/`) for HNSW semantic search
-- Embeddings computed via OpenAI-compatible `POST /v1/embeddings` (e.g. Ollama)
+- Embeddings computed in-process via LangChain4j ONNX models (default: `all-minilm-l6-v2-q`)
+- Optional HTTP embedding via OpenAI-compatible `POST /v1/embeddings` (`LATERALUS_EMBEDDING_METHOD=http`)
 
 ## Datalevin Schema
 
 ```clojure
 {:session/id         {:db/valueType :db.type/string :db/unique :db.unique/identity}
  :session/model      {:db/valueType :db.type/string}
- :session/emb-method {:db/valueType :db.type/string}  ;; "openai-compatible-http"
+ :session/emb-method {:db/valueType :db.type/string}  ;; "langchain4j-in-process" | "openai-compatible-http"
  :session/emb-model  {:db/valueType :db.type/string}
  :msg/id             {:db/valueType :db.type/string :db/unique :db.unique/identity}
  :msg/session        {:db/valueType :db.type/string}
@@ -65,7 +66,8 @@ Agent state holds the memory store at `:memory-store` (access via `get-memory-st
 | Option / Env | Default |
 |--------------|---------|
 | `LATERALUS_SESSIONS_DIR` / `:sessions-dir` | `sessions` |
-| `LATERALUS_EMBEDDING_MODEL` / `:memory-embedding-model` | `nomic-embed-text` |
+| `LATERALUS_EMBEDDING_METHOD` / `:memory-embedding-method` | `:langchain4j` (or `:http`) |
+| `LATERALUS_EMBEDDING_MODEL` / `:memory-embedding-model` | `all-minilm-l6-v2-q` |
 | `LATERALUS_MEMORY_EMBEDDING_DIMS` / `:memory-embedding-dims` | `384` |
 | `LATERALUS_MEMORY_RELEVANT_LIMIT` | `5` |
 | `LATERALUS_MEMORY_RECENT_LIMIT` | `10` |
@@ -98,7 +100,7 @@ Chronological order per exchange:
 | Stored (full text in Datalevin) | Not stored |
 |--------|--------------|
 | Full chronological transcript above | LLM reasoning/thinking |
-| Embedding vector (when API succeeds) | Ephemeral retry nudges inside a turn |
+| Embedding vector (when embed succeeds) | Ephemeral retry nudges inside a turn |
 | Session + embedding model metadata | |
 
 When building the LLM prompt (`compose-context`, in-turn messages), text longer than `LATERALUS_MEMORY_MAX_CHARS` (default 500) is truncated with a `…` suffix. The database always keeps the full message.
@@ -122,10 +124,12 @@ When embedding or vector indexing fails:
 | Embed failure + fallback | `http-test`, `memory.datalevin-test`, `core-test` |
 | End-to-end prompt shape | `memory-e2e-test`, `e2e-test` |
 | Stub embeddings (CI) | `memory-e2e-test`, `memory.datalevin-test` |
-| Live embed (optional) | `real-e2e-test` when Ollama is up |
+| Live embed HTTP (optional) | `real-e2e-test` when Ollama is up |
+| LangChain4j in-process | `memory.embedding-test` |
 
 ## Dependencies
 
 - `datalevin/datalevin` — Datalog DB + vector search
+- `dev.langchain4j/langchain4j-embeddings-all-minilm-l6-v2-q` — default in-process embeddings
 - `metosin/malli` — schema validation on HTTP/store boundaries
-- `hato/hato` — HTTP client for `/v1/embeddings`
+- `hato/hato` — HTTP client for optional `/v1/embeddings`

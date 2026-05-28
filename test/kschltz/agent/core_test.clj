@@ -35,7 +35,7 @@
   (testing "reset! clears history, turns, queue"
     (let [ag (fresh-agent)]
       (send ag assoc :history [{:role "user" :content "hi"}]
-                       :turns 5 :message-queue [{:text "pending" :promise (promise)}])
+            :turns 5 :message-queue [{:text "pending" :promise (promise)}])
       (await ag)
       (sut/reset! ag)
       (is (= [] (sut/get-history ag)))
@@ -109,6 +109,7 @@
           ag     (sut/make-agent {:base-url "http://llm" :model "test"
                                   :session-id sid
                                   :sessions-dir "test-sessions-events"
+                                  :memory-embedding-method :http
                                   :on-memory-event #(swap! events conj %)})]
       (with-redefs [http/completion (fn [& _] {:choices [{:message {:content "hi"}}]})
                     http/assistant-content http/assistant-content
@@ -125,13 +126,14 @@
           ag    (sut/make-agent {:base-url "http://llm" :model "test"
                                  :session-id sid
                                  :sessions-dir "test-sessions-tools"
+                                 :memory-embedding-method :http
                                  :tools [(repl-tools/repl-eval-tool)]})]
       (with-redefs [http/completion (fn [& _]
                                       (swap! calls inc)
                                       (if (= 1 @calls)
                                         {:choices [{:message {:tool_calls [{:id "call-1"
-                                                                             :function {:name "repl-eval"
-                                                                                        :arguments "{\"code\": \"(+ 1 2)\"}"}}]}}]}
+                                                                            :function {:name "repl-eval"
+                                                                                       :arguments "{\"code\": \"(+ 1 2)\"}"}}]}}]}
                                         {:choices [{:message {:content "The answer is 3."}}]}))
                     http/assistant-content http/assistant-content
                     http/tool-calls http/tool-calls
@@ -140,9 +142,9 @@
         (sut/chat! ag "what is (+ 1 2)?"))
       (let [store (sut/get-memory-store ag)
             msgs  (memory/load-recent-messages {:backend :datalevin
-                                                  :session-id sid
-                                                  :connection store
-                                                  :limit 10})]
+                                                :session-id sid
+                                                :connection store
+                                                :limit 10})]
         (is (= 4 (count msgs)) "user, assistant+tool_calls, tool, assistant")
         (is (= "user" (:msg/role (nth msgs 0))))
         (is (= "assistant" (:msg/role (nth msgs 1))))
@@ -185,7 +187,7 @@
   (testing "send-message! delivers ::dropped when queue is at capacity"
     (let [ag (fresh-agent)]
       (send ag assoc :message-queue (vec (repeat sut/maximum-message-queue-size
-                                                  {:text "x" :promise (promise)})))
+                                                 {:text "x" :promise (promise)})))
       (await ag)
       (let [p (sut/send-message! ag "overflow")]
         (is (realized? p))
@@ -328,6 +330,7 @@
           ag        (sut/make-agent {:base-url "http://llm" :model "test"
                                      :session-id sid
                                      :sessions-dir "test-sessions-truncate"
+                                     :memory-embedding-method :http
                                      :memory-max-chars 32})]
       (with-redefs [http/completion (fn [& _] {:choices [{:message {:content "ok"}}]})
                     http/assistant-content http/assistant-content
@@ -365,8 +368,8 @@
           (is (= ["rel only" "recent user" "recent reply"]
                  (mapv :content ctx)))))))
 
-(deftest compose-context-without-memory-returns-history
-  (testing "compose-context without memory returns in-agent history as-is"
-    (let [state {:history [{:role "user" :content "hello"}]}]
-      (is (= [{:role "user" :content "hello"}]
-             (sut/compose-context state "query")))))))
+  (deftest compose-context-without-memory-returns-history
+    (testing "compose-context without memory returns in-agent history as-is"
+      (let [state {:history [{:role "user" :content "hello"}]}]
+        (is (= [{:role "user" :content "hello"}]
+               (sut/compose-context state "query")))))))

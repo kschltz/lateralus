@@ -1,12 +1,12 @@
 (ns kschltz.agent.memory.datalevin
   "Datalevin-based session memory backend.
    Uses a Datalog store for structured message data and a standalone
-   vector index for semantic similarity search. Embedding vectors
-   are computed via an OpenAI-compatible /embeddings endpoint (e.g. Ollama)."
+   vector index for semantic similarity search. Embeddings default to
+   LangChain4j in-process ONNX models; HTTP providers are optional."
   (:require [clojure.string :as str]
             [clojure.java.io :as io]
             [datalevin.core :as d]
-            [kschltz.agent.http :as http]
+            [kschltz.agent.memory.embedding :as embedding]
             [kschltz.agent.memory.schemas :as schemas]
             [malli.core :as m]))
 
@@ -29,8 +29,9 @@
 
 ;; ---- Defaults -------------------------------------------------------------
 
-(def ^:private default-embedding-dims 384)
-(def ^:private default-embedding-model "nomic-embed-text")
+(def ^:private default-embedding-dims embedding/default-dims)
+(def ^:private default-embedding-model embedding/default-langchain4j-model)
+(def ^:private default-embedding-method embedding/default-method)
 (def ^:private default-sessions-dir "sessions")
 
 ;; ---- Paths ----------------------------------------------------------------
@@ -80,59 +81,64 @@
 (defn create-session-store
   "Create a session store: a Datalog connection + a standalone vector index.
    opts may include:
-     :embedding-dims  - vector dimensionality (default 384)
-     :embedding-model - model name for /embeddings (default nomic-embed-text)
-     :base-url        - Ollama/API base URL (default http://localhost:11434)
-     :api-key         - API key for remote providers
-     :embedding-fn   - custom (fn [text] => vec) override
-     :model           - LLM model name (stored as metadata)
-     :sessions-dir    - root directory for session stores (default sessions/ or LATERALUS_SESSIONS_DIR)"
+     :embedding-method - :langchain4j (default) or :http
+     :embedding-dims   - vector dimensionality (default 384)
+     :embedding-model  - model name (default all-minilm-l6-v2-q for langchain4j)
+     :base-url         - Ollama/API base URL (required for :http)
+     :api-key          - API key for remote HTTP providers
+     :embedding-fn     - custom (fn [text] => vec) override for tests
+     :model            - LLM model name (stored as metadata)
+     :sessions-dir     - root directory for session stores (default sessions/ or LATERALUS_SESSIONS_DIR)"
   [session-id opts]
   (let [sessions-dir (or (:sessions-dir opts) (env-sessions-dir))
         db-path      (session-db-path sessions-dir session-id)
         vectors-path (str db-path "/vectors")
+        emb-method   (or (:embedding-method opts) default-embedding-method)
         emb-dims     (or (:embedding-dims opts) default-embedding-dims)
         emb-model    (or (:embedding-model opts) default-embedding-model)
-        base-url     (or (:base-url opts) "http://localhost:11434")
+        base-url     (:base-url opts)
         api-key      (:api-key opts)
         embedding-fn (:embedding-fn opts)
+        provider     (embedding/create-provider
+                      {:method emb-method
+                       :model  emb-model
+                       :dims   emb-dims
+                       :base-url base-url
+                       :api-key api-key})
         conn         (create-conn-with-recovery db-path session-id schema)
         kv-store     (open-kv-with-recovery vectors-path session-id)
         vec-index    (d/new-vector-index kv-store
                                          {:dimensions emb-dims :metric-type :cosine})
-        session-meta (cond-> {:session/id session-id
-                              :session/emb-model emb-model
-                              :session/emb-method "openai-compatible-http"}
-                       (:model opts) (assoc :session/model (:model opts)))]
+        session-meta (merge {:session/id session-id}
+                            (embedding/provider-metadata provider)
+                            (when (:model opts)
+                              {:session/model (:model opts)}))]
     (d/transact conn [session-meta])
-    {:connection     conn
-     :kv-store       kv-store
-     :vec-index      vec-index
-     :embedding-dims emb-dims
-     :embedding-model emb-model
-     :base-url       base-url
-     :api-key        api-key
-     :embedding-fn   embedding-fn
-     :session-id     session-id
-     :sessions-dir   sessions-dir
-     :db-path        db-path}))
+    {:connection          conn
+     :kv-store            kv-store
+     :vec-index           vec-index
+     :embedding-dims      emb-dims
+     :embedding-model     (embedding/provider-model provider)
+     :embedding-method    (embedding/provider-method provider)
+     :embedding-provider  provider
+     :base-url            base-url
+     :api-key             api-key
+     :embedding-fn        embedding-fn
+     :session-id          session-id
+     :sessions-dir        sessions-dir
+     :db-path             db-path}))
 
 ;; ---- Embedding computation ------------------------------------------------
 
 (defn- compute-embedding
   "Compute embedding vector for text. Uses custom :embedding-fn if provided,
-   otherwise calls the /embeddings endpoint via http/embed.
+   otherwise the configured EmbeddingProvider.
    Returns vector of floats or nil on failure."
   [store text]
   (let [emb-fn (:embedding-fn store)]
     (if emb-fn
       (try (emb-fn text) (catch Exception _ nil))
-      (try
-        (http/embed (:base-url store)
-                    (:api-key store)
-                    (:embedding-model store)
-                    text)
-        (catch Exception _ nil)))))
+      (embedding/embed-text (:embedding-provider store) text))))
 
 ;; ---- Store messages -------------------------------------------------------
 
@@ -154,26 +160,26 @@
                        (:session-id store))
         entity     (cond-> {:msg/id msg-id :msg/role role :msg/text text
                             :msg/timestamp timestamp}
-                      session-id                              (assoc :msg/session session-id)
-                      (not-empty (:tool-name message-map))    (assoc :msg/tool-name (:tool-name message-map))
-                      (not-empty (:tool-result message-map))  (assoc :msg/tool-result (:tool-result message-map))
-                      (not-empty (:tool-calls message-map))   (assoc :msg/tool-calls (:tool-calls message-map))
-                      (not-empty (:tool-call-id message-map)) (assoc :msg/tool-call-id (:tool-call-id message-map)))]
+                     session-id                              (assoc :msg/session session-id)
+                     (not-empty (:tool-name message-map))    (assoc :msg/tool-name (:tool-name message-map))
+                     (not-empty (:tool-result message-map))  (assoc :msg/tool-result (:tool-result message-map))
+                     (not-empty (:tool-calls message-map))   (assoc :msg/tool-calls (:tool-calls message-map))
+                     (not-empty (:tool-call-id message-map)) (assoc :msg/tool-call-id (:tool-call-id message-map)))]
     (d/transact conn [entity])
     (let [embedding (when-not (str/blank? text)
                       (compute-embedding store text))
           indexed?  (boolean
-                      (when embedding
-                        (try
-                          (d/add-vec vec-index msg-id embedding)
-                          true
-                          (catch Exception e
-                            (println "Warning: vector index failed for" msg-id ":"
-                                     (.getMessage e))
-                            false))))
+                     (when embedding
+                       (try
+                         (d/add-vec vec-index msg-id embedding)
+                         true
+                         (catch Exception e
+                           (println "Warning: vector index failed for" msg-id ":"
+                                    (.getMessage e))
+                           false))))
           result    (cond-> {:msg-id msg-id :stored true :indexed indexed?}
-                       (and (not (str/blank? text)) (not indexed?))
-                       (assoc :reason (if embedding "index-failed" "embedding-failed")))]
+                      (and (not (str/blank? text)) (not indexed?))
+                      (assoc :reason (if embedding "index-failed" "embedding-failed")))]
       (when (and (not (str/blank? text)) (not indexed?))
         (println "Warning: message stored without vector index:" msg-id
                  (:reason result)))
@@ -215,9 +221,9 @@
     (try
       (let [id-set (set msg-ids)
             pulls  (d/q '[:find (pull ?e msg-pull-pattern)
-                           :in $ ?ids msg-pull-pattern
-                           :where [?e :msg/id ?id] [(contains? ?ids ?id)]]
-                         (d/db conn) id-set msg-pull-pattern)
+                          :in $ ?ids msg-pull-pattern
+                          :where [?e :msg/id ?id] [(contains? ?ids ?id)]]
+                        (d/db conn) id-set msg-pull-pattern)
             by-id  (into {} (map (fn [[m]] [(:msg/id m) m]) pulls))]
         (vec (keep by-id msg-ids)))
       (catch Exception _ []))))

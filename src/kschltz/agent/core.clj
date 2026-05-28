@@ -144,13 +144,58 @@
     text))
 
 (defn- truncate-tool-calls
+  "Truncate tool call arguments, preserving valid JSON.
+   Tool call :arguments must be valid JSON or the API rejects the request.
+   If the arguments are too long, replace them with an empty JSON object
+   rather than truncating mid-string (which produces invalid JSON)."
   [tool-calls max-chars]
   (when (seq tool-calls)
     (mapv (fn [tc]
             (if-let [f (:function tc)]
-              (update tc :function #(update % :arguments truncate-text max-chars))
+              (update tc :function
+                      (fn [func]
+                        (if (and max-chars
+                                 (pos? max-chars)
+                                 (string? (:arguments func))
+                                 (> (count (:arguments func)) max-chars))
+                          ;; Arguments are too long — replace with empty JSON object
+                          ;; rather than producing invalid JSON via truncation.
+                          ;; The LLM will see the tool name and know it was truncated.
+                          (assoc func :arguments "{}")
+                          func)))
               tc))
           tool-calls)))
+
+(defn- sanitize-context-messages
+  "Strip tool_calls and tool_call_id from context messages before sending to the LLM API.
+   Historical tool calls are stale — their IDs don't match any tool results,
+   and sending assistant messages with tool_calls but no matching tool results
+   causes 'invalid tool call arguments' errors from the API.
+   Convert tool-related messages to plain text summaries instead."
+  [messages]
+  (mapv (fn [msg]
+          (cond
+            ;; Assistant message with tool_calls -> plain text summary
+            (and (= (:role msg) "assistant") (seq (:tool_calls msg)))
+            (let [tool-names (mapv (fn [tc]
+                                    (get-in tc [:function :name] "unknown"))
+                                  (:tool_calls msg))
+                  base      (str "[Used tools: " (str/join ", " tool-names) "]")
+                  content   (if-let [c (:content msg)]
+                               (str base "\n" c)
+                               base)]
+              {:role "assistant" :content content})
+
+            ;; Tool result message -> plain text summary
+            (= (:role msg) "tool")
+            {:role "user"
+             :content (str "[Tool result: "
+                          (subs (:content msg "") 0 (min 500 (count (:content msg ""))))
+                          "]")}
+
+            ;; Normal message - pass through unchanged
+            :else msg))
+        messages))
 
 (defn- truncate-chat-message
   "Truncate :content and tool :arguments in an OpenAI-format chat message."
@@ -407,10 +452,12 @@
           [facts chat-msgs] (split-facts-and-chat composed)
           memory-block (when (seq facts)
                          [{:role "system" :content (format-memory-block facts)}])
-          chat-context (mapv #(truncate-chat-message % memory-max-chars)
-                             (memory-msgs->chat-msgs chat-msgs))]
+          chat-context (sanitize-context-messages
+                        (mapv #(truncate-chat-message % memory-max-chars)
+                              (memory-msgs->chat-msgs chat-msgs)))]
       (into (vec memory-block) chat-context))
-    (mapv #(truncate-chat-message % memory-max-chars) history)))
+    (sanitize-context-messages
+     (mapv #(truncate-chat-message % memory-max-chars) history))))
 
 (defn- cap-history
   "Cap history to :history-limit messages. Older messages are persisted in

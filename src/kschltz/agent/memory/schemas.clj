@@ -44,9 +44,8 @@
 (def RememberInput
   "Args for the remember tool."
   [:map
-   [:content [:string {:min 1}]]
-   [:topic {:optional true} :string]
-   [:tags {:optional true} [:vector :string]]])
+   [:query [:string {:min 1}]]
+   [:limit {:optional true} :int]])
 
 (def RememberResult
   "Remember tool response map."

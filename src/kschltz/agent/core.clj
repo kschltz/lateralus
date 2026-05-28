@@ -272,16 +272,13 @@
                 (web/web-search-tool)
                 (when (and memory-store session-id)
                   (remember/remember-tool
-                    {:store-fact! (fn [{:keys [content topic tags]}]
-                                    (memory/store-message
-                                      {:backend memory-backend
-                                       :connection memory-store
-                                       :session-id session-id
-                                       :message (cond-> {:role "assistant"
-                                                         :text content
-                                                         :kind "fact"}
-                                                  topic (assoc :topic topic)
-                                                  (seq tags) (assoc :tags tags))}))}))])))
+                    {:search-fn (fn [{:keys [query limit]}]
+                                 (memory/retrieve-relevant
+                                   {:backend memory-backend
+                                    :connection memory-store
+                                    :session-id session-id
+                                    :query query
+                                    :limit (or limit 5)}))}))])))
 
 (defn- merge-tools
   "Append default tools without duplicating names from user tools."
@@ -1092,21 +1089,17 @@
   ([ag]
    (add-remember-tool! ag {}))
   ([ag opts]
-   (let [state @ag
-         tool  (remember/remember-tool
-                 (merge opts
-                        {:store-fact! (or (:store-fact! opts)
-                                          (when (:memory-store state)
-                                            (fn [fact]
-                                              (memory/store-message
-                                                {:backend (:memory-backend state)
-                                                 :connection (:memory-store state)
-                                                 :session-id (:session-id state)
-                                                 :message (cond-> {:role "assistant"
-                                                                   :text (:content fact)
-                                                                   :kind "fact"}
-                                                          (:topic fact) (assoc :topic (:topic fact))
-                                                          (seq (:tags fact)) (assoc :tags (:tags fact)))}))))}))]
+   (let [state    @ag
+         search-fn (or (:search-fn opts)
+                      (when (:memory-store state)
+                        (fn [{:keys [query limit]}]
+                          (memory/retrieve-relevant
+                            {:backend     (:memory-backend state)
+                             :connection  (:memory-store state)
+                             :session-id  (:session-id state)
+                             :query       query
+                             :limit       (or limit 5)}))))
+         tool     (remember/remember-tool (merge opts {:search-fn search-fn}))]
      (register-tool! ag tool)
      tool)))
 

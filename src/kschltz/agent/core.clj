@@ -599,7 +599,7 @@
            depth        0
            retry-count  0
            transcript   []]
-      (let [{:keys [response api-error?]}
+      (let [{:keys [response api-error? api-error-msg]}
             (try
               {:response (llm-call state {:user-text user-text
                                           :turn-messages turn-msgs})}
@@ -610,15 +610,14 @@
                   (try (on-error ag e) (catch Exception _)))
                 (fire-on-thought state {:type :error :content (.getMessage e)})
                 {:response {:choices [{:message
-                              {:content (str "LLM API error: " (.getMessage e)
-                                           ". Try again with a simpler response or no tool calls.")}}]}
-                 :api-error? true :api-error-msg (.getMessage e)}))
+                              {:content (str "LLM API error: " (.getMessage e))}}]}
+                 :api-error? true
+                 :api-error-msg (.getMessage e)}))
             content    (http/assistant-content response)
             reasoning  (http/reasoning-content response)
             _          (when reasoning
                          (fire-on-thought state {:type :thinking :content reasoning}))
-            calls      (when-not api-error? (parse-tool-calls-native response))
-            err-msg    (:api-error-msg response)]
+            calls      (when-not api-error? (parse-tool-calls-native response))]
         (cond
           ;; No tool calls — handle API errors, empty responses, or normal text
           (nil? calls)
@@ -627,16 +626,18 @@
               ;; LLM API error — retry with trimmed context, not by adding the error
               api-error?
               (if (< retry-count max-retries)
-                (recur (-> (subvec turn-msgs 0 (max 2 (count turn-msgs))) ;; keep first user msg + recent
-                            (conj {:role "user"
-                                   :content (str "The previous LLM call failed ("
-                                                (or err-msg "unknown error")
-                                                "). This is often caused by a large tool result in context. "
-                                                "Provide a shorter response. Avoid repeating large outputs.")}))
-                       depth (inc retry-count) transcript)
-                (llm-turn-result (str "LLM API error: " (or err-msg "unknown error"))
+                (let [trimmed (if (> (count turn-msgs) 2)
+                                (conj (subvec turn-msgs 0 1) ;; keep only first user msg
+                                      {:role "user"
+                                       :content (str "The previous LLM call failed ("
+                                                    (or api-error-msg "unknown error")
+                                                    "). This is often caused by large context. "
+                                                    "Provide a shorter response. Avoid repeating large outputs.")})
+                                turn-msgs)] ;; already minimal, retry as-is
+                  (recur trimmed depth (inc retry-count) transcript))
+                (llm-turn-result (str "LLM API error: " (or api-error-msg "unknown error"))
                                  (conj transcript {:role "assistant"
-                                                   :content (str "LLM API error: " (or err-msg "unknown error"))})))
+                                                   :content (str "LLM API error: " (or api-error-msg "unknown error"))})))
 
               ;; Empty response — retry
               (str/blank? text)

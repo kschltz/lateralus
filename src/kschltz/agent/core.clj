@@ -604,15 +604,32 @@
                          (fire-on-thought state {:type :thinking :content reasoning}))
             calls      (when-not api-error? (parse-tool-calls-native response))]
         (cond
-          ;; No tool calls — retry if empty, otherwise return
+          ;; No tool calls — handle API errors, empty responses, or normal text
           (nil? calls)
           (let [text (or content "")]
-            (if (and (str/blank? text) (< retry-count max-retries))
-              (recur (conj turn-msgs
-                           (http/assistant-message response)
-                           {:role "user"
-                            :content "Your previous response was empty. Provide a plain-text answer."})
-                     depth (inc retry-count) transcript)
+            (cond
+              ;; LLM API error — retry with simpler prompt
+              api-error?
+              (if (< retry-count max-retries)
+                (recur (conj turn-msgs
+                             {:role "assistant" :content text}
+                             {:role "user"
+                              :content "The previous LLM call failed with an API error. Simplify your response — use plain text, no tool calls, shorter output."})
+                       depth (inc retry-count) transcript)
+                (llm-turn-result text (conj transcript {:role "assistant" :content text})))
+
+              ;; Empty response — retry
+              (str/blank? text)
+              (if (< retry-count max-retries)
+                (recur (conj turn-msgs
+                             (http/assistant-message response)
+                             {:role "user"
+                              :content "Your previous response was empty. Provide a plain-text answer."})
+                       depth (inc retry-count) transcript)
+                (llm-turn-result text (conj transcript {:role "assistant" :content text})))
+
+              ;; Normal text response — return it
+              :else
               (llm-turn-result text (conj transcript {:role "assistant" :content text}))))
 
           (>= depth max-depth)

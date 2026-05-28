@@ -65,15 +65,18 @@
 
 (defn- eval-forms
   "Evaluate one or more Clojure forms from a code string.
-   Runs in a daemon thread with a timeout to prevent blocking the agent."
+   Runs in a daemon thread with a timeout to prevent blocking the agent.
+   Pushes the current thread's Var bindings so eval sees the right namespace,"
   [code]
   (let [forms (edamame/parse-string-all code {:all true
                                                 :read-cond :allow
                                                 :auto-resolve name})
+        bindings (get-thread-bindings)
         task  (fn []
-                (if (= 1 (count forms))
-                  (clojure.core/eval (first forms))
-                  (clojure.core/eval `(do ~@forms))))
+                (with-bindings bindings
+                  (if (= 1 (count forms))
+                    (clojure.core/eval (first forms))
+                    (clojure.core/eval `(do ~@forms)))))
         fut   (.submit eval-executor ^Callable task)
         result (try (.get fut eval-timeout-ms TimeUnit/MILLISECONDS)
                     (catch java.util.concurrent.TimeoutException _

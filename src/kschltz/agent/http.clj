@@ -3,7 +3,7 @@
             [kschltz.agent.memory.schemas :as mem-schemas]
             [malli.core :as m]))
 
-(def ^:private default-connect-timeout-ms 2000)
+(def ^:private default-connect-timeout-ms 10000)
 (def ^:private default-timeout-ms 60000)
 
 (defn- timeout-ms
@@ -12,10 +12,16 @@
   (or (some-> (System/getenv "LATERALUS_HTTP_TIMEOUT_MS") parse-long)
       default-timeout-ms))
 
+(defn- connect-timeout-ms
+  "Connect timeout (ms). Override with LATERALUS_CONNECT_TIMEOUT_MS for slow networks."
+  []
+  (or (some-> (System/getenv "LATERALUS_CONNECT_TIMEOUT_MS") parse-long)
+      default-connect-timeout-ms))
+
 (defn- http-opts
   "Base hato opts with timeouts so unreachable LLM/embed hosts fail fast."
   [extra]
-  (merge {:connect-timeout   default-connect-timeout-ms
+  (merge {:connect-timeout   (connect-timeout-ms)
           :timeout           (timeout-ms)
           :throw-exceptions  false}
          extra))
@@ -26,18 +32,18 @@
 
 (defn get-models [base-url api-key]
   (let [url (format "%s/v1/models" base-url)
-        resp (hato/get url (cond-> {:as :json :throw-exceptions false}
-                        api-key
-                        (assoc :headers (auth-headers api-key))))]
+        resp (hato/get url (http-opts (cond-> {:as :json}
+                                api-key
+                                (assoc :headers (auth-headers api-key)))))]
     (if (and (:status resp) (>= (:status resp) 400))
       (throw (ex-info (str "API error: status: " (:status resp)) {:status (:status resp) :body (:body resp)}))
       (get-in resp [:body :data]))))
 
 (defn get-model-info [base-url api-key model-id]
   (let [url (format "%s/v1/models/%s" base-url model-id)
-        resp (hato/get url (cond-> {:as :json :throw-exceptions false}
-                        api-key
-                        (assoc :headers (auth-headers api-key))))]
+        resp (hato/get url (http-opts (cond-> {:as :json}
+                                api-key
+                                (assoc :headers (auth-headers api-key)))))]
     (if (and (:status resp) (>= (:status resp) 400))
       (throw (ex-info (str "API error: status: " (:status resp)) {:status (:status resp) :body (:body resp)}))
       (:body resp))))

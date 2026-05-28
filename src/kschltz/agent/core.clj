@@ -15,6 +15,7 @@
             [kschltz.agent.tools.repl :as repl]
             [kschltz.agent.tools.web :as web]
             [kschltz.agent.tools.remember :as remember]
+            [kschltz.agent.tools.portal :as portal]
             [clojure.string :as str]))
 
 ;; ---- REPL Usage ----
@@ -166,11 +167,20 @@
               tc))
           tool-calls)))
 
+(def ^:private openai-msg-keys
+  "Only these keys are valid in OpenAI Chat Completion message objects.
+   Any other keys (e.g. :msg-id, :timestamp, :msg/id, :msg/timestamp)
+   will cause a 400 from strict providers like the HuggingFace router."
+  #{:role :content :name :tool_calls :tool_call_id :reasoning_content})
+
 (defn- sanitize-context-messages
-  "Strip tool_calls and tool_call_id from context messages before sending to the LLM API.
+  "Strip tool_calls, tool_call_id, and non-OpenAI metadata from context messages
+   before sending to the LLM API.
    Historical tool calls are stale — their IDs don't match any tool results,
    and sending assistant messages with tool_calls but no matching tool results
    causes 'invalid tool call arguments' errors from the API.
+   Internal metadata like :msg-id and :timestamp cause 400 errors from strict
+   providers (e.g. HuggingFace router) that reject unknown properties.
    Convert tool-related messages to plain text summaries instead."
   [messages]
   (mapv (fn [msg]
@@ -193,8 +203,8 @@
                           (subs (:content msg "") 0 (min 500 (count (:content msg ""))))
                           "]")}
 
-            ;; Normal message - pass through unchanged
-            :else msg))
+            ;; Normal message - strip non-OpenAI keys
+            :else (into {} (filter (fn [[k _]] (contains? openai-msg-keys k))) msg)))
         messages))
 
 (defn- truncate-chat-message
@@ -270,6 +280,7 @@
   (vec (remove nil?
                [(repl/repl-eval-tool)
                 (web/web-search-tool)
+                (portal/visualize-tool)
                 (when (and memory-store session-id)
                   (remember/remember-tool
                     {:search-fn (fn [{:keys [query limit]}]
@@ -870,9 +881,10 @@
 ;; ---- Public API ----
 
 (defn start!
-  "Start the agent loop (blocking). Messages are sent via send-message!.
-   Returns final state map when loop exits."
+  "Start the agent loop (blocking). Also opens Portal and adds it as a tap> target
+   so (tap> value) and the visualize tool both display in Portal."
   [ag]
+  (portal/tap-portal!)
   (send ag assoc :running true)
   (await ag)
   (try
@@ -1072,6 +1084,17 @@
    (add-repl-nrepl-tool! ag {}))
   ([ag opts]
    (let [tool (repl/repl-nrepl-tool opts)]
+     (register-tool! ag tool)
+     tool)))
+
+(defn add-visualize-tool!
+  "Add a :visualize tool that lets the LLM display data in a Portal inspector.
+   Requires djblue/portal on the classpath. If Portal is not available,
+   the tool returns an error with installation instructions."
+  ([ag]
+   (add-visualize-tool! ag {}))
+  ([ag opts]
+   (let [tool (portal/visualize-tool opts)]
      (register-tool! ag tool)
      tool)))
 

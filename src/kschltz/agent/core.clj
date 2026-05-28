@@ -584,13 +584,25 @@
            depth        0
            retry-count  0
            transcript   []]
-      (let [response   (llm-call state {:user-text user-text
-                                        :turn-messages turn-msgs})
+      (let [{:keys [response api-error?]}
+            (try
+              {:response (llm-call state {:user-text user-text
+                                          :turn-messages turn-msgs})}
+              (catch Exception e
+                ;; LLM API error (400, timeout, connection refused, etc.)
+                ;; Fire on-error for logging, then tell the LLM so it can self-correct
+                (when-let [on-error (:on-error state)]
+                  (try (on-error ag e) (catch Exception _)))
+                (fire-on-thought state {:type :error :content (.getMessage e)})
+                {:response {:choices [{:message
+                              {:content (str "LLM API error: " (.getMessage e)
+                                           ". Try again with a simpler response or no tool calls.")}}]}
+                 :api-error? true}))
             content    (http/assistant-content response)
             reasoning  (http/reasoning-content response)
             _          (when reasoning
                          (fire-on-thought state {:type :thinking :content reasoning}))
-            calls      (parse-tool-calls-native response)]
+            calls      (when-not api-error? (parse-tool-calls-native response))]
         (cond
           ;; No tool calls — retry if empty, otherwise return
           (nil? calls)
@@ -640,8 +652,14 @@
                          (into [asst-msg])
                          (into tool-msgs)
                          (into [{:role "user"
-                                 :content (str "The following tool calls failed. Do NOT explain or apologize. "
-                                               "Call the tool again with corrected arguments.\nErrors:\n"
+                                 :content (str "The following tool calls failed. "
+                                               "Review the errors carefully and fix the issue.\n"
+                                               "Common fixes:\n"
+                                               "  - Fix the specific error mentioned (e.g. ClassNotFoundException → fix the import)\n"
+                                               "  - Simplify the code if it was too complex\n"
+                                               "  - If a tool keeps failing, try a different approach or answer from what you know\n"
+                                               "Do NOT repeat the exact same call.\n"
+                                               "Errors:\n"
                                                (str/join "\n" (map #(str "  " (:tool %) ": " (:error %)) errors)))}]))
                      (inc depth) (inc retry-count) transcript')
               (recur (into turn-msgs (into [asst-msg] tool-msgs))

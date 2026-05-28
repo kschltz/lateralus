@@ -208,9 +208,10 @@
           (Thread/sleep 500)
           (is (>= (count @errors) 1) "on-error handler should be called")
           (is (.contains (first @errors) "LLM connection refused"))
-          ;; Error is delivered to the promise
-          (is (realized? p) "promise should be delivered with error")
-          (is (.startsWith @p "Error:"))
+          ;; Agent recovers gracefully from LLM errors instead of crashing
+          (is (or (.contains @p "LLM API error")
+                  (.startsWith @p "Error:"))
+              "response should mention the API error or start with Error:")
           (when (core/running? ag) (core/stop! ag))
           (try @loop-future (catch Exception _ nil)))))))
 

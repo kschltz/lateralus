@@ -148,7 +148,7 @@ When embedding or vector indexing fails:
 | Embed failure + fallback | `http-test`, `memory.datalevin-test`, `core-test` |
 | End-to-end prompt shape | `memory-e2e-test`, `e2e-test` |
 | Stub embeddings (CI) | `memory-e2e-test`, `memory.datalevin-test` |
-| Live embed HTTP (optional) | `real-e2e-test` when Ollama is up |
+| Live LangChain4j integration (slow) | `memory.embedding-integration-test` |
 | LangChain4j in-process | `memory.embedding-test` |
 
 ## Dependencies

@@ -17,6 +17,13 @@
         (throw (ex-info "Invalid embedding method (use langchain4j or http)" {:method s})))
       kw)))
 
+(defn- resolve-embedding-method
+  "Resolve embedding backend: CLI opts beat env var."
+  [opts env-getter]
+  (or (:embedding-method opts)
+      (some-> (env-getter "LATERALUS_EMBEDDING_METHOD")
+              parse-embedding-method)))
+
 (defn- parse-args
   "Parse CLI arguments into an opts map."
   [args]
@@ -152,9 +159,7 @@
             turns          (if (:turns opts) (Integer/parseInt (:turns opts)) 5)
             retries        (if (:max-retries opts) (Integer/parseInt (:max-retries opts)) 3)
             session-id     (or (:session opts) (System/getenv "LATERALUS_SESSION"))
-            embedding-method (or (:embedding-method opts)
-                                 (some-> (System/getenv "LATERALUS_EMBEDDING_METHOD")
-                                         parse-embedding-method))
+            embedding-method (resolve-embedding-method opts #(System/getenv %))
             embedding-model (or (:embedding-model opts)
                                 (System/getenv "LATERALUS_EMBEDDING_MODEL"))
             embedding-dims  (or (:embedding-dims opts)

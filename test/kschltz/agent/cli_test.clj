@@ -77,6 +77,21 @@
                  (cli/-main "-E" "ollama"))
         "Invalid CLI method should fail before agent start")))
 
+(deftest cli-precedence-embedding-method
+  (testing "CLI -E flag wins over LATERALUS_EMBEDDING_METHOD env var"
+    (is (= :langchain4j
+           (#'cli/resolve-embedding-method
+             {:embedding-method :langchain4j}
+             (fn [_] "http")))
+        "CLI embedding-method should beat env var")
+    (is (= :http
+           (#'cli/resolve-embedding-method
+             {}
+             (fn [_] "http")))
+        "env var should be used when CLI omits -E")
+    (is (nil? (#'cli/resolve-embedding-method {} (fn [_] nil)))
+        "nil when neither CLI nor env is set")))
+
 (deftest cli-memory-opt-in
   (testing "memory is disabled without -s or LATERALUS_SESSION (CLI default)"
     (let [session-id (or nil (System/getenv "LATERALUS_SESSION"))]

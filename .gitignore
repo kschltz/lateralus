@@ -27,3 +27,7 @@
 /checkouts
 /classes
 /target
+
+# Test artifacts
+test-sessions-*/
+sessions/

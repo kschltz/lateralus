@@ -14,6 +14,7 @@
             [kschltz.agent.http :as http]
             [kschltz.agent.tools.repl :as repl]
             [kschltz.agent.tools.web :as web]
+            [kschltz.agent.tools.remember :as remember]
             [clojure.string :as str]))
 
 ;; ---- REPL Usage ----
@@ -190,9 +191,59 @@
       chat)))
 
 (defn- memory-msgs->chat-msgs
-  "Convert memory-format messages to chat-history format (chronological)."
+  "Convert memory-format messages to chat-history format (chronological).
+   Explicit facts are excluded; they appear in the [memory] context block."
   [memory-msgs]
-  (mapv memory-msg->chat-msg memory-msgs))
+  (mapv memory-msg->chat-msg
+        (remove #(= "fact" (:msg/kind %)) memory-msgs)))
+
+(defn- fact-msg? [msg]
+  (= "fact" (:msg/kind msg)))
+
+(defn- format-fact-line
+  [{:msg/keys [text topic tags]}]
+  (let [tags-str (when (and (string? tags) (not (str/blank? tags)))
+                   (str " (" tags ")"))]
+    (cond
+      (str/blank? topic) (str "- " text)
+      tags-str (str "- " topic tags-str ": " text)
+      :else (str "- " topic ": " text))))
+
+(defn- format-memory-block
+  [fact-msgs]
+  (str "[memory]\n"
+       (str/join "\n" (map format-fact-line (sort-by :msg/timestamp fact-msgs)))
+       "\n[/memory]"))
+
+(defn- split-facts-and-chat
+  [memory-msgs]
+  [(filterv fact-msg? memory-msgs)
+   (vec (remove fact-msg? memory-msgs))])
+
+(defn- default-agent-tools
+  [memory-store session-id memory-backend]
+  (vec (remove nil?
+               [(repl/repl-eval-tool)
+                (web/web-search-tool)
+                (when (and memory-store session-id)
+                  (remember/remember-tool
+                    {:store-fact! (fn [{:keys [content topic tags]}]
+                                    (memory/store-message
+                                      {:backend memory-backend
+                                       :connection memory-store
+                                       :session-id session-id
+                                       :message (cond-> {:role "assistant"
+                                                         :text content
+                                                         :kind "fact"}
+                                                  topic (assoc :topic topic)
+                                                  (seq tags) (assoc :tags tags))}))}))])))
+
+(defn- merge-tools
+  "Append default tools without duplicating names from user tools."
+  [user-tools default-tools]
+  (let [names (set (map :name user-tools))]
+    (into (vec user-tools)
+          (remove #(contains? names (:name %)) default-tools))))
 
 ;; ---- Agent Construction ----
 
@@ -206,7 +257,8 @@
     :turns                     — Max turns (default 100)
     :tools                     — Tool vector (optional)
     :initial                   — Initial messages (optional)
-    :session-id                — Session ID for memory (optional, enables memory when non-nil)
+    :session-id                — Session ID for memory; defaults to \"default\" when omitted.
+                                Pass nil or :memory-enabled false to disable memory.
     :memory-backend            — Memory backend (default :datalevin)
     :memory-relevant-limit     — Relevant messages to retrieve (env: LATERALUS_MEMORY_RELEVANT_LIMIT, default 5)
     :memory-recent-limit       — Recent context messages (env: LATERALUS_MEMORY_RECENT_LIMIT, default 10)
@@ -227,20 +279,23 @@
    (make-agent {}))
   ([opts]
    (let [{:keys [base-url api-key model turns tools initial
-                 session-id memory-backend on-response on-error on-thought
+                 session-id memory-enabled memory-backend on-response on-error on-thought
                  memory-relevant-limit memory-recent-limit memory-strategy memory-embedding-dims
                  memory-embedding-model memory-embedding-method history-limit memory-max-chars sessions-dir
                  on-memory-event]
           :or   {turns 100 tools [] initial [] memory-backend :datalevin}} opts
          cfg           (resolve-config opts)
-         memory-enabled? (some? session-id)
-         session-id'     (when memory-enabled? session-id)
+         session-id'   (when (not (false? memory-enabled))
+                         (cond
+                           (and (contains? opts :session-id) (nil? session-id)) nil
+                           (contains? opts :session-id) session-id
+                           :else "default"))
          embedding-dims (:memory-embedding-dims cfg)
          embedding-model (or memory-embedding-model (:memory-embedding-model cfg))
          embedding-method (or memory-embedding-method (:memory-embedding-method cfg))
          sessions-dir'  (or sessions-dir (:sessions-dir cfg))
          history-limit' (or history-limit (:history-limit cfg))
-         memory-store    (when memory-enabled?
+         memory-store    (when session-id'
                            (try
                              (:connection (memory/create-session
                                            {:backend memory-backend
@@ -256,6 +311,8 @@
                                (println "Warning: failed to create memory session:"
                                         (.getMessage e))
                                nil)))
+         default-tools   (default-agent-tools memory-store session-id' memory-backend)
+         tools'          (merge-tools (vec tools) default-tools)
          loaded-history  (when (and memory-store session-id' (empty? initial))
                            (try
                              (memory/load-recent-messages
@@ -272,7 +329,7 @@
                                  :api-key        api-key
                                  :model          model
                                  :max-turns      turns
-                                 :tools          (vec tools)
+                                 :tools          tools'
                                  :history        start-history
                                  :session-id     session-id'
                                  :memory-store   memory-store
@@ -346,9 +403,13 @@
                                     :relevant relevant
                                     :recent recent
                                     :relevant-limit memory-relevant-limit
-                                    :recent-limit memory-recent-limit})]
-      (mapv #(truncate-chat-message % memory-max-chars)
-            (memory-msgs->chat-msgs composed)))
+                                    :recent-limit memory-recent-limit})
+          [facts chat-msgs] (split-facts-and-chat composed)
+          memory-block (when (seq facts)
+                         [{:role "system" :content (format-memory-block facts)}])
+          chat-context (mapv #(truncate-chat-message % memory-max-chars)
+                             (memory-msgs->chat-msgs chat-msgs))]
+      (into (vec memory-block) chat-context))
     (mapv #(truncate-chat-message % memory-max-chars) history)))
 
 (defn- cap-history
@@ -899,6 +960,29 @@
    (add-web-search-tool! ag {}))
   ([ag opts]
    (let [tool (web/web-search-tool opts)]
+     (register-tool! ag tool)
+     tool)))
+
+(defn add-remember-tool!
+  "Add a remember tool wired to the agent's memory store."
+  ([ag]
+   (add-remember-tool! ag {}))
+  ([ag opts]
+   (let [state @ag
+         tool  (remember/remember-tool
+                 (merge opts
+                        {:store-fact! (or (:store-fact! opts)
+                                          (when (:memory-store state)
+                                            (fn [fact]
+                                              (memory/store-message
+                                                {:backend (:memory-backend state)
+                                                 :connection (:memory-store state)
+                                                 :session-id (:session-id state)
+                                                 :message (cond-> {:role "assistant"
+                                                                   :text (:content fact)
+                                                                   :kind "fact"}
+                                                          (:topic fact) (assoc :topic (:topic fact))
+                                                          (seq (:tags fact)) (assoc :tags (:tags fact)))}))))}))]
      (register-tool! ag tool)
      tool)))
 

@@ -96,9 +96,9 @@
   (testing "memory is disabled without -s or LATERALUS_SESSION (CLI default)"
     (let [session-id (or nil (System/getenv "LATERALUS_SESSION"))]
       (when (nil? session-id)
-        (let [ag (core/make-agent {:base-url "http://mock" :model "mock"})]
+        (let [ag (core/make-agent {:base-url "http://mock" :model "mock" :session-id nil})]
           (is (nil? (core/get-memory-store ag))
-              "make-agent without session-id should not open memory")))))
+              "make-agent with explicit nil session-id should not open memory")))))
   (testing "memory is enabled when session-id is provided like CLI -s"
     (let [sid (str "cli-opt-in-" (System/nanoTime))
           ag  (core/make-agent {:base-url    "http://mock"

@@ -3,7 +3,8 @@
    Uses a Datalog store for structured message data and a standalone
    vector index for semantic similarity search. Embeddings default to
    LangChain4j in-process ONNX models; HTTP providers are optional."
-  (:require [clojure.string :as str]
+  (:require [cheshire.core :as json]
+            [clojure.string :as str]
             [clojure.java.io :as io]
             [datalevin.core :as d]
             [kschltz.agent.memory.embedding :as embedding]
@@ -25,7 +26,10 @@
    :msg/tool-name      {:db/valueType :db.type/string}
    :msg/tool-result    {:db/valueType :db.type/string}
    :msg/tool-calls     {:db/valueType :db.type/string}
-   :msg/tool-call-id   {:db/valueType :db.type/string}})
+   :msg/tool-call-id   {:db/valueType :db.type/string}
+   :msg/kind           {:db/valueType :db.type/string}
+   :msg/topic          {:db/valueType :db.type/string}
+   :msg/tags           {:db/valueType :db.type/string}})
 
 ;; ---- Defaults -------------------------------------------------------------
 
@@ -164,7 +168,10 @@
                      (not-empty (:tool-name message-map))    (assoc :msg/tool-name (:tool-name message-map))
                      (not-empty (:tool-result message-map))  (assoc :msg/tool-result (:tool-result message-map))
                      (not-empty (:tool-calls message-map))   (assoc :msg/tool-calls (:tool-calls message-map))
-                     (not-empty (:tool-call-id message-map)) (assoc :msg/tool-call-id (:tool-call-id message-map)))]
+                     (not-empty (:tool-call-id message-map)) (assoc :msg/tool-call-id (:tool-call-id message-map))
+                     (not-empty (:kind message-map))       (assoc :msg/kind (:kind message-map))
+                     (not-empty (:topic message-map))      (assoc :msg/topic (:topic message-map))
+                     (seq (:tags message-map))             (assoc :msg/tags (json/generate-string (:tags message-map))))]
     (d/transact conn [entity])
     (let [embedding (when-not (str/blank? text)
                       (compute-embedding store text))
@@ -191,7 +198,7 @@
 
 (def ^:private msg-pull-pattern
   [:msg/id :msg/role :msg/text :msg/timestamp :msg/tool-calls :msg/tool-call-id
-   :msg/tool-name :msg/tool-result])
+   :msg/tool-name :msg/tool-result :msg/kind :msg/topic :msg/tags])
 
 (defn- sort-memory-msgs [msgs]
   (vec (sort-by :msg/timestamp msgs)))

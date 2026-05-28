@@ -33,10 +33,29 @@
    [:id {:optional true} :string]
    [:timestamp {:optional true} int?]
    [:session-id {:optional true} :string]
+   [:kind {:optional true} [:enum "fact"]]
+   [:topic {:optional true} :string]
+   [:tags {:optional true} [:vector :string]]
    [:tool-name {:optional true} :string]
    [:tool-result {:optional true} :string]
    [:tool-calls {:optional true} :string]
    [:tool-call-id {:optional true} :string]])
+
+(def RememberInput
+  "Args for the remember tool."
+  [:map
+   [:content [:string {:min 1}]]
+   [:topic {:optional true} :string]
+   [:tags {:optional true} [:vector :string]]])
+
+(def RememberResult
+  "Remember tool response map."
+  [:map
+   [:type [:= "memory"]]
+   [:stored boolean?]
+   [:content {:optional true} [:string {:min 1}]]
+   [:msg-id {:optional true} :string]
+   [:error {:optional true} :string]])
 
 (def StoreResult
   "Result of storing and optionally indexing a message."

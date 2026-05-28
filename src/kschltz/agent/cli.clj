@@ -171,6 +171,7 @@
                                      :model       model
                                      :turns       turns
                                      :max-retries retries
+                                     :session-id  session-id
                                      :on-response (fn [r] (println (str "\nagent> " r)))
                                      :on-error    (fn [_a e] (println (str "\nERROR: " (.getMessage e))))
                                      :on-thought  (fn [evt]
@@ -180,12 +181,9 @@
                                                       (doseq [r (:results evt)]
                                                         (println (str "  [tool-result] " (:tool r)
                                                                       " => " (or (:error r) (:result r)))))))}
-                              session-id (assoc :session-id session-id)
                               embedding-method (assoc :memory-embedding-method embedding-method)
                               embedding-model (assoc :memory-embedding-model embedding-model)
                               embedding-dims (assoc :memory-embedding-dims embedding-dims)))]
-        (core/add-repl-eval-tool! ag)
-        (core/add-web-search-tool! ag)
         (if (:interactive opts)
           (do
             (future (core/start! ag))

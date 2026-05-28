@@ -8,8 +8,13 @@
 
 ;; ---- Helper ----
 
-(defn- fresh-agent []
-  (sut/make-agent {:base-url "http://llm" :model "test"}))
+(defn- fresh-agent
+  ([] (fresh-agent {}))
+  ([opts]
+   (sut/make-agent (merge {:base-url "http://llm"
+                           :model "test"
+                           :session-id nil}
+                          opts))))
 
 ;; ---- Agent Construction ----
 
@@ -20,14 +25,17 @@
 
 (deftest make-agent-default-state
   (testing "make-agent initializes default state"
-    (let [ag (fresh-agent)]
+    (let [ag (sut/make-agent {:base-url "http://llm"
+                              :model "test"
+                              :sessions-dir "test-sessions-core"})]
       (is (false? (sut/running? ag)))
       (is (= [] (sut/get-history ag)))
       (is (= 0 (:turns @ag)))
       (is (= 100 (:max-turns @ag)))
-      (is (nil? (:session-id @ag)))
-      (is (nil? (:memory-store @ag)))
-      (is (nil? (:on-response @ag))))))
+      (is (= "default" (:session-id @ag)))
+      (is (some? (:memory-store @ag)))
+      (is (nil? (:on-response @ag)))
+      (sut/close-session! ag))))
 
 ;; ---- Reset ----
 
@@ -269,8 +277,8 @@
 ;; ---- Memory Integration ----
 
 (deftest make-agent-without-memory
-  (testing "make-agent without :session-id has no memory state"
-    (let [ag (sut/make-agent {:base-url "http://llm" :model "test"})]
+  (testing "make-agent with explicit nil :session-id has no memory state"
+    (let [ag (fresh-agent)]
       (is (nil? (:session-id @ag)))
       (is (nil? (:memory-store @ag))))))
 
@@ -292,6 +300,15 @@
                               :session-id nil})]
       (is (nil? (:session-id @ag)))
       (is (nil? (:memory-store @ag))))))
+
+(deftest make-agent-default-session-id
+  (testing "make-agent without :session-id defaults to default session"
+    (let [ag (sut/make-agent {:base-url "http://llm"
+                              :model "test"
+                              :sessions-dir "test-sessions-core"})]
+      (is (= "default" (:session-id @ag)))
+      (is (some? (:memory-store @ag)))
+      (sut/close-session! ag))))
 ;; ---- History Limit ----
 
 (deftest make-agent-default-history-limit

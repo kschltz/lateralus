@@ -39,6 +39,30 @@ Vectors are **not** stored on entities. They live in a separate LMDB KV store in
 - User-provided via CLI `-s` / `LATERALUS_SESSION` or `make-agent {:session-id "..."}`
 - Memory is **opt-in** — omitted `:session-id` disables memory entirely
 
+## Embedding Configuration via CLI
+
+The following CLI flags control embedding behavior:
+
+| Flag | Description | Valid Values | Env Var |
+|------|-------------|--------------|---------|
+| `-E`, `--embedding-method` | Embedding backend | `langchain4j` or `http` | `LATERALUS_EMBEDDING_METHOD` |
+| `--embedding-model` | Model name | string | `LATERALUS_EMBEDDING_MODEL` |
+| `--embedding-dims` | Vector dimensions | integer | `LATERALUS_MEMORY_EMBEDDING_DIMS` |
+
+**Precedence**: CLI flags > environment variables > core defaults.
+
+**Examples**:
+```bash
+# Use HTTP embeddings
+clojure -M:cli -s my-session -E http --embedding-model nomic-embed-text "hello"
+
+# Use LangChain4j in-process (default)
+clojure -M:cli -s my-session -E langchain4j --embedding-model all-minilm-l6-v2-q "hello"
+
+# Override embedding dimensions
+clojure -M:cli -s my-session --embedding-dims 768 --embedding-model custom-model "hello"
+```
+
 ## Session Lifecycle
 
 | Event | Behavior |
@@ -66,9 +90,9 @@ Agent state holds the memory store at `:memory-store` (access via `get-memory-st
 | Option / Env | Default |
 |--------------|---------|
 | `LATERALUS_SESSIONS_DIR` / `:sessions-dir` | `sessions` |
-| `LATERALUS_EMBEDDING_METHOD` / `:memory-embedding-method` | `:langchain4j` (or `:http`) |
-| `LATERALUS_EMBEDDING_MODEL` / `:memory-embedding-model` | `all-minilm-l6-v2-q` |
-| `LATERALUS_MEMORY_EMBEDDING_DIMS` / `:memory-embedding-dims` | `384` |
+| `LATERALUS_EMBEDDING_METHOD` / `:memory-embedding-method` / CLI `-E`, `--embedding-method` | `:langchain4j` (or `:http`) |
+| `LATERALUS_EMBEDDING_MODEL` / `:memory-embedding-model` / CLI `--embedding-model` | `all-minilm-l6-v2-q` |
+| `LATERALUS_MEMORY_EMBEDDING_DIMS` / `:memory-embedding-dims` / CLI `--embedding-dims` | `384` |
 | `LATERALUS_MEMORY_RELEVANT_LIMIT` | `5` |
 | `LATERALUS_MEMORY_RECENT_LIMIT` | `10` |
 | `LATERALUS_MEMORY_STRATEGY` | `:hybrid` |

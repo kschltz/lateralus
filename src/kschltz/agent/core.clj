@@ -509,13 +509,28 @@
             :tool (:name f)
             :args (:arguments f)}))))
 
+(def ^:private max-tool-result-chars
+  "Maximum characters for a single tool result. Longer results are truncated."
+  (or (some-> (System/getenv "LATERALUS_MAX_TOOL_RESULT_CHARS") parse-long)
+      8000))
+
+(defn- truncate-tool-result
+  "Truncate a tool result string to max-tool-result-chars."
+  [s]
+  (let [s (str s)]
+    (if (> (count s) max-tool-result-chars)
+      (str (subs s 0 max-tool-result-chars) "\n... [truncated]")
+      s)))
+
 (defn- format-tool-results-native
-  "Build role:\"tool\" messages from tool execution results."
+  "Build role:\"tool\" messages from tool execution results.
+   Results are truncated to max-tool-result-chars to prevent context bloat."
   [results]
   (vec (for [{:keys [id result error]} results]
          {:role "tool"
           :tool_call_id id
-          :content (if error (str "Error: " error) (str result))})))
+          :content (truncate-tool-result
+                     (if error (str "Error: " error) (str result)))})))
 
 (defn- execute-tool-call
   "Execute a single tool call with Malli validation.
@@ -597,26 +612,31 @@
                 {:response {:choices [{:message
                               {:content (str "LLM API error: " (.getMessage e)
                                            ". Try again with a simpler response or no tool calls.")}}]}
-                 :api-error? true}))
+                 :api-error? true :api-error-msg (.getMessage e)}))
             content    (http/assistant-content response)
             reasoning  (http/reasoning-content response)
             _          (when reasoning
                          (fire-on-thought state {:type :thinking :content reasoning}))
-            calls      (when-not api-error? (parse-tool-calls-native response))]
+            calls      (when-not api-error? (parse-tool-calls-native response))
+            err-msg    (:api-error-msg response)]
         (cond
           ;; No tool calls — handle API errors, empty responses, or normal text
           (nil? calls)
           (let [text (or content "")]
             (cond
-              ;; LLM API error — retry with simpler prompt
+              ;; LLM API error — retry with trimmed context, not by adding the error
               api-error?
               (if (< retry-count max-retries)
-                (recur (conj turn-msgs
-                             {:role "assistant" :content text}
-                             {:role "user"
-                              :content "The previous LLM call failed with an API error. Simplify your response — use plain text, no tool calls, shorter output."})
+                (recur (-> (subvec turn-msgs 0 (max 2 (count turn-msgs))) ;; keep first user msg + recent
+                            (conj {:role "user"
+                                   :content (str "The previous LLM call failed ("
+                                                (or err-msg "unknown error")
+                                                "). This is often caused by a large tool result in context. "
+                                                "Provide a shorter response. Avoid repeating large outputs.")}))
                        depth (inc retry-count) transcript)
-                (llm-turn-result text (conj transcript {:role "assistant" :content text})))
+                (llm-turn-result (str "LLM API error: " (or err-msg "unknown error"))
+                                 (conj transcript {:role "assistant"
+                                                   :content (str "LLM API error: " (or err-msg "unknown error"))})))
 
               ;; Empty response — retry
               (str/blank? text)

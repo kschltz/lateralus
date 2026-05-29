@@ -28,6 +28,12 @@
 /classes
 /target
 
+# Secrets and runtime locks
+.env
+.env.*
+!.env.example
+.pi-loop.json.lock
+
 # Test artifacts
 test-sessions-*/
 sessions/

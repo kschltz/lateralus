@@ -23,6 +23,7 @@
             [kschltz.agent.tools :as tools]
             [clojure.string :as str]
             [cheshire.core :as json]
+            [edamame.core :as edamame]
             [malli.core :as m]))
 
 ;; ---- Portal Lifecycle ----
@@ -88,8 +89,8 @@
      (h :ul (h :li \"One\") (h :li \"Two\"))     ;=> [:ul [:li \"One\"] [:li \"Two\"]]"
   [tag & args]
   (let [[attrs children] (if (map? (first args))
-                            [(first args) (rest args)]
-                            [nil args])
+                           [(first args) (rest args)]
+                           [nil args])
         children' (remove nil? children)]
     (if attrs
       (into [tag attrs] children')
@@ -125,16 +126,19 @@
                {:name \"Bob\"   :age 25}])"
   [cols rows]
   (let [header (into [:tr]
-                     (map (fn [c] [:th {:style {:padding "8px 12px"
-                                               :border-bottom "1px solid #ddd"
-                                               :text-align "left"}}
-                                  (or (:label c) (name (:key c)))]) cols))
+                     (map (fn [c]
+                            [:th {:style {:padding "8px 12px"
+                                          :border-bottom "1px solid #ddd"
+                                          :text-align "left"}}
+                             (or (:label c) (name (:key c)))])
+                          cols))
         body   (map (fn [row]
                       (into [:tr]
                             (map (fn [c]
                                    [:td {:style {:padding "8px 12px"
                                                  :border-bottom "1px solid #eee"}}
-                                    (str (get row (:key c) ""))]) cols)))
+                                    (str (get row (:key c) ""))])
+                                 cols)))
                     rows)]
     [:table {:style {:border-collapse "collapse"
                      :width "100%"
@@ -261,10 +265,10 @@
      (h-columns [(h-metric \"42\" \"Errors\")
                  (h-metric \"99%\" \"Uptime\")])"
   [children]
-  [:div {:style {:display "flex"
-                :flex-direction "row"
-                :gap "16px"
-                :flex-wrap "wrap"}}
+  [:div {:style {:display "flex"}
+         :flex-direction "row"
+         :gap "16px"
+         :flex-wrap "wrap"}
    (for [c (remove nil? children)]
      [:div {:style {:flex "1 1 0"}} c])])
 
@@ -293,34 +297,98 @@
                    v
                    (keyword "portal.viewer" (name v)))
     (string? v) (let [s (str/trim (str/replace v #"^:" ""))]
-                 (when (seq s)
-                   (keyword "portal.viewer" s)))
+                  (when (seq s)
+                    (keyword "portal.viewer" s)))
     :else        nil))
 
+(def ^:private edamame-opts
+  {:read-cond :allow :auto-resolve 'data})
+
+(def ^:private structured-viewers
+  "Viewers that need parsed Clojure data — not a raw string."
+  #{:portal.viewer/table :portal.viewer/tree :portal.viewer/hiccup
+    :portal.viewer/html :portal.viewer/json :portal.viewer/edn
+    :portal.viewer/vega :portal.viewer/vega-lite})
+
+(defn- keywordize-keys
+  "Recursively keywordize map keys (JSON tool args use string keys)."
+  [x]
+  (cond
+    (map? x)     (into {} (map (fn [[k v]] [(keyword k) (keywordize-keys v)]) x))
+    (vector? x)  (mapv keywordize-keys x)
+    (sequential? x) (mapv keywordize-keys x)
+    :else x))
+
 (defn- try-parse-data
-  "Attempt to parse a string value as EDN or JSON.
-   Returns parsed data if successful, original value otherwise.
-   The LLM always sends :data as a string in JSON args — this converts it
-   to actual Clojure data that Portal can render."
+  "Parse string :data from LLM JSON args into Clojure data.
+   Tries edamame (EDN/hiccup), then JSON. Returns {:data :parsed? :error}."
   [data]
   (cond
-    (not (string? data)) data
-    (str/blank? data)     data
-    :else (or (try (clojure.edn/read-string data) (catch Exception _ nil))
-              (try (json/parse-string data true) (catch Exception _ nil))
-              data)))
+    (not (string? data))
+    {:data (keywordize-keys data) :parsed? true}
+
+    (str/blank? data)
+    {:data data :parsed? false :error "data is empty"}
+
+    :else
+    (let [trimmed (str/trim data)]
+      (try
+        (let [parsed (edamame/parse-string trimmed edamame-opts)]
+          (if (symbol? parsed)
+            {:data parsed :parsed? false
+             :error (str "data looks like a variable name, not data: " trimmed
+                          " — pass the actual EDN/JSON value")}
+            {:data parsed :parsed? true}))
+        (catch Exception e1
+          (try
+            {:data (keywordize-keys (json/parse-string trimmed true)) :parsed? true}
+            (catch Exception _e2
+              (if (or (str/starts-with? trimmed "[")
+                      (str/starts-with? trimmed "{"))
+                {:data data :parsed? false
+                 :error (str "Failed to parse data as EDN/JSON: " (.getMessage e1))}
+                {:data data :parsed? false
+                 :error (str "data looks like plain text, not structured data: "
+                             (subs trimmed 0 (min 80 (count trimmed))))}))))))))
+
+(defn- data-ready?
+  "True when data is suitable for the requested viewer."
+  [data viewer]
+  (if (or (nil? viewer) (not (structured-viewers viewer)))
+    true
+    (case viewer
+      :portal.viewer/hiccup
+      (and (vector? data) (keyword? (first data)))
+
+      :portal.viewer/html
+      (and (vector? data) (keyword? (first data)))
+
+      :portal.viewer/table
+      (or (vector? data) (map? data))
+
+      :portal.viewer/tree
+      (some? data)
+
+      (not (or (string? data) (symbol? data) (keyword? data))))))
 
 (defn- normalize-visualize-args
   "Accept {:data ..., :viewer ..., :title ...} or bare data value.
    Parses data strings and coerces viewer strings from LLM JSON args."
   [args]
-  (cond
-    (map? args)    (let [raw-data   (:data args)
-                        parsed-data (try-parse-data raw-data)]
-                    (cond-> {:data parsed-data}
-                      (:viewer args) (assoc :viewer (coerce-viewer (:viewer args)))
-                      (:title args)  (assoc :title (:title args))))
-    :else          {:data (try-parse-data args)}))
+  (let [parse (fn [raw]
+                (let [{:keys [data parsed? error]} (try-parse-data raw)]
+                  {:data data :parsed? parsed? :parse-error error}))]
+    (cond
+      (map? args)
+      (let [{:keys [data parsed? parse-error]} (parse (:data args))
+            viewer (some-> (:viewer args) coerce-viewer)]
+        (cond-> {:data data :parsed? parsed? :parse-error parse-error}
+          viewer (assoc :viewer viewer)
+          (:title args) (assoc :title (:title args))))
+
+      :else
+      (let [{:keys [data parsed? parse-error]} (parse args)]
+        {:data data :parsed? parsed? :parse-error parse-error}))))
 
 (defn visualize-tool
   "Create a :visualize tool that sends data to Portal via tap>.
@@ -334,23 +402,39 @@
    {:type        :visualize
     :name        (or (:name opts) "visualize")
     :description (or (:description opts)
-                     (str "Display data in a rich visual inspector (Portal). "
-                          "Great for tables, charts, JSON, diffs, and nested data. "
-                          "Args: {:data string-or-data, :viewer string, :title string?}. "
-                          "Data can be a string of EDN/JSON or actual data. "
-                          "Viewers: :table, :tree, :json, :edn, :hiccup, :html, "
-                          ":text, :code, :diff, :vega, :vega-lite, :chart."))
+                     (str "Display data in Portal (opens automatically via tap>). "
+                          "Args: {:data <edn-or-json-string-or-value>, :viewer string, :title string?}. "
+                          "IMPORTANT: :data must be the actual data — NOT a variable name. "
+                          "For tables pass EDN/JSON like [{:model \"RTX 4090\" :price 1599}]. "
+                          "For hiccup/html pass an EDN vector like [:html [:body ...]]. "
+                          "Build complex hiccup with repl-eval first, then pass the vector in :data. "
+                          "Viewers: table, tree, json, edn, hiccup, html, text, code, diff, vega, vega-lite."))
     :parameters  [:map
                   [:data :any]
                   [:viewer {:optional true} :string]
                   [:title {:optional true} :string]]}))
 
 (defmethod tools/run :visualize
-  [tool args]
-  (let [{:keys [data viewer]} (normalize-visualize-args args)
-        valued (if viewer (pv/default data viewer) data)]
-    (clojure.core/tap> valued)
-    (pr-str {:status :ok :viewer (or viewer :default)})))
+  [_tool args]
+  (let [{:keys [data viewer parsed? parse-error]} (normalize-visualize-args args)]
+    (cond
+      (false? parsed?)
+      (pr-str {:status :error
+               :message (or parse-error
+                            "Could not parse :data — pass actual EDN/JSON, not a variable name")})
+
+      (not (data-ready? data viewer))
+      (pr-str {:status :error
+               :message (str "Viewer " viewer " needs parsed data (vector/map), got string. "
+                             "Pass EDN like [{:k v}] or [:html [:body ...]]")})
+
+      :else
+      (let [valued (if viewer (pv/default data viewer) data)]
+        (clojure.core/tap> valued)
+        (pr-str {:status   :ok
+                 :viewer   (or viewer :default)
+                 :data-type (.getSimpleName (class data))
+                 :preview  (subs (pr-str data) 0 (min 120 (count (pr-str data))))})))))
 
 (defmethod tools/parse :visualize
   [_ response]

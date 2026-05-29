@@ -284,3 +284,82 @@
     (let [state {:history [1 2 3] :history-limit 2 :other "value"}
           result (sut/cap-history state)]
       (is (= "value" (:other result))))))
+
+;; ---- Memory msgs -> chat msgs ----
+
+(deftest memory-msgs->chat-msgs-test
+  (testing "converts memory messages to chat format"
+    (let [msgs [{:msg/role "user" :msg/text "hello"}
+                {:msg/role "assistant" :msg/text "hi there"}]
+          result (sut/memory-msgs->chat-msgs msgs)]
+      (is (= 2 (count result)))
+      (is (= "user" (:role (first result))))
+      (is (= "hello" (:content (first result))))
+      (is (= "assistant" (:role (second result))))))
+
+  (testing "filters out fact messages"
+    (let [msgs [{:msg/role "user" :msg/text "hello"}
+                {:msg/role "assistant" :msg/text "fact" :msg/kind "fact"}]
+          result (sut/memory-msgs->chat-msgs msgs)]
+      (is (= 1 (count result)))
+      (is (= "user" (:role (first result)))))))
+
+;; ---- Fact helpers ----
+
+(deftest fact-msg-test
+  (testing "identifies fact messages"
+    (is (sut/fact-msg? {:msg/kind "fact" :msg/text "Paris is the capital"}))
+    (is (not (sut/fact-msg? {:msg/role "user" :msg/text "hello"}))))
+
+  (testing "nil kind is not a fact"
+    (is (not (sut/fact-msg? {:msg/text "hello"})))))
+
+(deftest format-fact-line-test
+  (testing "formats fact with topic and tags"
+    (is (= "- cooking (recipes): Boil water"
+           (sut/format-fact-line {:msg/text "Boil water" :msg/topic "cooking" :msg/tags "recipes"}))))
+
+  (testing "formats fact with topic only"
+    (is (= "- cooking: Boil water"
+           (sut/format-fact-line {:msg/text "Boil water" :msg/topic "cooking" :msg/tags nil}))))
+
+  (testing "formats fact with no topic"
+    (is (= "- Boil water"
+           (sut/format-fact-line {:msg/text "Boil water" :msg/topic nil :msg/tags nil}))))
+
+  (testing "formats fact with empty topic"
+    (is (= "- Boil water"
+           (sut/format-fact-line {:msg/text "Boil water" :msg/topic ""})))))
+
+(deftest format-memory-block-test
+  (testing "formats memory block correctly"
+    (let [facts [{:msg/kind "fact" :msg/text "Paris is the capital" :msg/topic "geography" :msg/timestamp 1000}]
+          result (sut/format-memory-block facts)]
+      (is (str/starts-with? result "[memory]"))
+      (is (str/ends-with? result "[/memory]"))
+      (is (str/includes? result "geography: Paris is the capital"))))
+
+  (testing "empty facts produces block with no entries"
+    (let [result (sut/format-memory-block [])]
+      (is (str/starts-with? result "[memory]"))
+      (is (str/ends-with? result "[/memory]")))))
+
+;; ---- Compose context (history-only) ----
+
+(deftest compose-context-history-only-test
+  (testing "sanitizes and truncates history when no memory store"
+    (let [state {:history [{:role "user" :content "hello"}
+                           {:role "assistant" :content 42}
+                           {:role "user" :content "what?"}]
+                 :memory-max-chars 1000}
+          result (sut/compose-context state "hi")]
+      (is (= "user" (:role (first result))))
+      ;; numeric content should be coerced to string
+      (is (= "42" (:content (second result))))))
+
+  (testing "strips non-OpenAI keys from history"
+    (let [state {:history [{:role "user" :content "hello" :msg-id "m1" :timestamp 999}]
+                 :memory-max-chars 1000}
+          result (sut/compose-context state "hi")]
+      (is (nil? (:msg-id (first result))))
+      (is (nil? (:timestamp (first result)))))))

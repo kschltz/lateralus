@@ -40,7 +40,7 @@
         stored-msg (assoc memory-msg :id msg-id :timestamp ts)
         store-result (memory/store-message {:backend memory-backend
                                             :session-id session-id
-                                            :connection memory-store
+                                            :store memory-store
                                             :message stored-msg})]
     (notify-store-result state (:role memory-msg) store-result)
     {:msg-id    msg-id
@@ -65,7 +65,7 @@
             user-memory  (context/chat-msg->memory-msg {:role "user" :content user-input})
             user-result  (memory/store-message {:backend memory-backend
                                                 :session-id session-id
-                                                :connection memory-store
+                                                :store memory-store
                                                 :message (assoc user-memory
                                                                 :id user-id
                                                                 :timestamp ts)})
@@ -122,7 +122,7 @@
          {:role "tool"
           :tool_call_id id
           :content (truncate-tool-result
-                     (if error (str "Error: " error) (str result)))})))
+                    (if error (str "Error: " error) (str result)))})))
 
 (defn- execute-tool-call
   "Execute a single tool call with Malli validation.
@@ -214,7 +214,7 @@
             content    (http/assistant-content response)
             reasoning  (http/reasoning-content response)
             _          (when reasoning
-                        (fire-on-thought state {:type :thinking :content reasoning}))
+                         (fire-on-thought state {:type :thinking :content reasoning}))
             calls      (when-not api-error? (parse-tool-calls-native response))]
         (cond
           ;; No tool calls — handle API errors, empty responses, or normal text
@@ -228,9 +228,9 @@
                                 (conj (subvec turn-msgs 0 1) ;; keep only first user msg
                                       {:role "user"
                                        :content (str "The previous LLM call failed ("
-                                                    (or api-error-msg "unknown error")
-                                                    "). This is often caused by large context. "
-                                                    "Provide a shorter response. Avoid repeating large outputs.")})
+                                                     (or api-error-msg "unknown error")
+                                                     "). This is often caused by large context. "
+                                                     "Provide a shorter response. Avoid repeating large outputs.")})
                                 turn-msgs)] ;; already minimal, retry as-is
                   (recur trimmed depth (inc retry-count) transcript))
                 (llm-turn-result (str "LLM API error: " (or api-error-msg "unknown error"))
@@ -257,18 +257,18 @@
           ;; We inject a system-like user message telling the model to wrap up,
           ;; then call the LLM one more time and return THAT response.
           (let [wrap-up-prompt (str "You have reached the maximum number of tool calls ("
-                                   max-depth "). "
-                                   "You cannot make any more tool calls. "
-                                   "Using only the information you already have from previous tool results, "
-                                   "provide the best possible answer to the user now. "
-                                   "Do not attempt any more tool calls.")
+                                    max-depth "). "
+                                    "You cannot make any more tool calls. "
+                                    "Using only the information you already have from previous tool results, "
+                                    "provide the best possible answer to the user now. "
+                                    "Do not attempt any more tool calls.")
                 final-turn  (conj (into turn-msgs
                                         (into [(http/assistant-message response)]
                                               (format-tool-results-native
-                                            (execute-tool-calls calls (:tools state)))))
-                                   {:role "user" :content wrap-up-prompt})
+                                               (execute-tool-calls calls (:tools state)))))
+                                  {:role "user" :content wrap-up-prompt})
                 final-resp  (llm-call state {:user-text user-text
-                                            :turn-messages final-turn})
+                                             :turn-messages final-turn})
                 final-text  (or (http/assistant-content final-resp) "")]
             (fire-on-thought state {:type :thinking :content (or (http/reasoning-content final-resp) "")})
             (llm-turn-result final-text

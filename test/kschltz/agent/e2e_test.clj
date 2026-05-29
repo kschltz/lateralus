@@ -79,13 +79,13 @@
       (is (= on-resp (:on-response @ag)))
       (is (= on-err (:on-error @ag)))
       (is (= 4 (count (core/get-tools ag))))
-      (is (some? (core/get-memory-conn ag))))))
+      (is (some? (core/get-memory-store ag))))))
 
 (deftest e2e-make-agent-without-memory
   (testing "make-agent without session-id has no memory"
     (let [ag (fresh-agent {})]
       (is (nil? (core/get-session-id ag)))
-      (is (nil? (core/get-memory-conn ag))))))
+      (is (nil? (core/get-memory-store ag))))))
 
 ;; ============================================================
 ;; 2. MESSAGE QUEUE + PROMISE DELIVERY
@@ -281,10 +281,10 @@
 ;; ============================================================
 
 (deftest e2e-memory-session-creation
-  (testing "agent with session-id creates memory connection"
+  (testing "agent with session-id creates memory store"
     (let [ag (fresh-agent {:session-id "e2e-mem-test"})]
       (is (= "e2e-mem-test" (core/get-session-id ag)))
-      (is (some? (core/get-memory-conn ag))))))
+      (is (some? (core/get-memory-store ag))))))
 
 (deftest e2e-memory-stores-and-retrieves
   (testing "agent loop stores exchanges in memory"
@@ -294,14 +294,14 @@
           loop-future (future (core/start! ag))]
       @p
       (Thread/sleep 200)
-      (let [conn    (core/get-memory-conn ag)
+      (let [conn    (core/get-memory-store ag)
             results (memory/retrieve-relevant
                      {:backend    :datalevin
                       :session-id "e2e-store-test"
-                      :connection conn
+                      :store conn
                       :query      "remember"
                       :limit      5})]
-        (is (some? conn) "memory connection should exist")
+        (is (some? conn) "memory store should exist")
         (is (some? results) "should retrieve results from memory"))
       (when (core/running? ag) (core/stop! ag))
       @loop-future)))
@@ -352,7 +352,7 @@
       ;; Phase 1: Initial state
       (is (false? (core/running? ag)))
       (is (= "lifecycle-test" (core/get-session-id ag)))
-      (is (some? (core/get-memory-conn ag)))
+      (is (some? (core/get-memory-store ag)))
       (is (= 4 (count (core/get-tools ag))))
 
       ;; Phase 2: Send message with handler, start loop
@@ -374,11 +374,11 @@
           (is (>= (count (core/get-history ag)) 4)))
 
         ;; Phase 4: Verify memory was stored
-        (let [conn    (core/get-memory-conn ag)
+        (let [conn    (core/get-memory-store ag)
               results (memory/retrieve-relevant
                        {:backend    :datalevin
                         :session-id "lifecycle-test"
-                        :connection conn
+                        :store conn
                         :query      "hello"
                         :limit      5})]
           (is (some? conn))

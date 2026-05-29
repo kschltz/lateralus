@@ -52,7 +52,7 @@
       (is (= [] (:message-queue @ag))))))
 
 (deftest reset!-keeps-memory-session
-  (testing "reset! keeps memory connection and session-id"
+  (testing "reset! keeps memory store and session-id"
     (let [sid (str "reset-keep-" (System/nanoTime))
           ag  (sut/make-agent {:base-url "http://llm" :model "test"
                                :session-id sid
@@ -81,11 +81,11 @@
                                :sessions-dir dir
                                :history-limit 10})]
       (memory/store-message {:backend :datalevin :session-id sid
-                             :connection (sut/get-memory-store ag1)
+                             :store (sut/get-memory-store ag1)
                              :message {:role "user" :text "hello"
                                        :id "m1" :timestamp 100}})
       (memory/store-message {:backend :datalevin :session-id sid
-                             :connection (sut/get-memory-store ag1)
+                             :store (sut/get-memory-store ag1)
                              :message {:role "assistant" :text "hi there"
                                        :id "m2" :timestamp 101}})
       (sut/close-session! ag1)
@@ -152,7 +152,7 @@
       (let [store (sut/get-memory-store ag)
             msgs  (memory/load-recent-messages {:backend :datalevin
                                                 :session-id sid
-                                                :connection store
+                                                :store store
                                                 :limit 10})]
         (is (= 4 (count msgs)) "user, assistant+tool_calls, tool, assistant")
         (is (= "user" (:msg/role (nth msgs 0))))
@@ -357,7 +357,7 @@
       (let [store (sut/get-memory-store ag)
             msgs  (memory/load-recent-messages {:backend :datalevin
                                                 :session-id sid
-                                                :connection store
+                                                :store store
                                                 :limit 5})
             user  (first msgs)
             ctx   (ctx/compose-context @ag "follow-up")]

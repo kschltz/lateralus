@@ -151,13 +151,13 @@
                 (portal/visualize-tool)
                 (when (and memory-store session-id)
                   (remember/remember-tool
-                    {:search-fn (fn [{:keys [query limit]}]
+                   {:search-fn (fn [{:keys [query limit]}]
                                  (memory/retrieve-relevant
-                                   {:backend memory-backend
-                                    :connection memory-store
-                                    :session-id session-id
-                                    :query query
-                                    :limit (or limit 5)}))}))])))
+                                  {:backend memory-backend
+                                   :store memory-store
+                                   :session-id session-id
+                                   :query query
+                                   :limit (or limit 5)}))}))])))
 
 (defn- merge-tools
   "Append default tools without duplicating names from user tools."
@@ -218,16 +218,16 @@
          history-limit' (or history-limit (:history-limit cfg))
          memory-store    (when session-id'
                            (try
-                             (:connection (memory/create-session
-                                           {:backend memory-backend
-                                            :session-id session-id'
-                                            :model model
-                                            :embedding-dims embedding-dims
-                                            :embedding-model embedding-model
-                                            :embedding-method embedding-method
-                                            :base-url base-url
-                                            :api-key api-key
-                                            :sessions-dir sessions-dir'}))
+                             (:store (memory/create-session
+                                      {:backend memory-backend
+                                       :session-id session-id'
+                                       :model model
+                                       :embedding-dims embedding-dims
+                                       :embedding-model embedding-model
+                                       :embedding-method embedding-method
+                                       :base-url base-url
+                                       :api-key api-key
+                                       :sessions-dir sessions-dir'}))
                              (catch Exception e
                                (println "Warning: failed to create memory session:"
                                         (.getMessage e))
@@ -239,7 +239,7 @@
                              (memory/load-recent-messages
                               {:backend memory-backend
                                :session-id session-id'
-                               :connection memory-store
+                               :store memory-store
                                :limit history-limit'})
                              (catch Exception _ [])))
          start-history   (if (seq initial)
@@ -278,14 +278,13 @@
   [state]
   (when-let [store (:memory-store state)]
     (try
-      (memory/close-session {:backend (:memory-backend state) :connection store})
+      (memory/close-session {:backend (:memory-backend state) :store store})
       (catch Exception e
         (println "Warning: failed to close memory session:" (.getMessage e)))))
   (-> state
       (dissoc :memory-store)
       (dissoc :memory-backend)
       (dissoc :session-id)))
-
 
 ;; ---- Public API ----
 
@@ -351,7 +350,7 @@
   ([ag message opts]
    (let [state    @ag
          {:keys [response transcript]} (loop/llm-turn ag (merge state (select-keys opts [:base-url :api-key :model]))
-                                                 message)
+                                                      message)
          stored   (loop/store-exchange state message :transcript transcript)
          entries  (loop/history-entries-for-exchange [{:text message}] stored :transcript transcript)]
      (send ag update :history into entries)
@@ -362,7 +361,7 @@
 
 (defn reset!
   "Reset agent runtime state: clear history, turns, queue, and current response.
-   Keeps the memory session connection open so persisted messages remain available."
+   Keeps the memory session store open so persisted messages remain available."
   [ag]
   (send ag (fn [s]
              (assoc s :history [] :turns 0 :current-response nil :message-queue [])))
@@ -521,11 +520,11 @@
   ([ag opts]
    (let [state    @ag
          search-fn (or (:search-fn opts)
-                      (when (:memory-store state)
-                        (fn [{:keys [query limit]}]
-                          (memory/retrieve-relevant
+                       (when (:memory-store state)
+                         (fn [{:keys [query limit]}]
+                           (memory/retrieve-relevant
                             {:backend     (:memory-backend state)
-                             :connection  (:memory-store state)
+                             :store  (:memory-store state)
                              :session-id  (:session-id state)
                              :query       query
                              :limit       (or limit 5)}))))
@@ -610,16 +609,16 @@
 
   ;; === Direct memory API ===
   (require '[kschltz.agent.memory :as memory])
-  (def conn (memory/create-session {:backend    :datalevin
-                                    :session-id "demo"
-                                    :model      "deepseek-v4-flash:cloud"}))
+  (def session (memory/create-session {:backend    :datalevin
+                                       :session-id "demo"
+                                       :model      "deepseek-v4-flash:cloud"}))
   (memory/store-message {:backend    :datalevin
                          :session-id "demo"
-                         :connection (:connection conn)
+                         :store      (:store session)
                          :message    {:role "user" :text "Hello"}})
   (memory/retrieve-relevant {:backend    :datalevin
                              :session-id "demo"
-                             :connection (:connection conn)
+                             :store      (:store session)
                              :query      "hello" :limit 5})
   (memory/close-session {:backend    :datalevin
-                         :connection (:connection conn)}))
+                         :store      (:store session)}))

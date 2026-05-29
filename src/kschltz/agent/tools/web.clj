@@ -12,7 +12,8 @@
    [clojure.string :as str]
    [hato.client :as hato]
    [kschltz.agent.tools :as tools]
-   [malli.core :as m]))
+   [malli.core :as m]
+   [malli.instrument :as mi]))
 
 ;; ---- Schemas ----
 
@@ -30,6 +31,28 @@
 (def SearchResponse
   "Vector of search hits."
   [:vector SearchHit])
+
+(def HttpHeaders
+  "Optional HTTP headers for search backends."
+  [:maybe [:map-of :string :string]])
+
+(def HttpUrl
+  "HTTP URL used by search backends."
+  [:string {:min 1}])
+
+(def HttpBody
+  "String response body returned by search backends."
+  :string)
+
+(def HttpGetBodyFn
+  "Instrumented schema for HTTP GET calls at the network boundary."
+  [:=> [:cat :any HttpUrl HttpHeaders]
+   HttpBody])
+
+(def SearchFn
+  "Instrumented schema for web search protocol implementations."
+  [:=> [:cat :any SearchQuery]
+   SearchResponse])
 
 (def ^:private max-hits 8)
 
@@ -59,19 +82,32 @@
 
 ;; ---- Protocol ----
 
+(defprotocol HttpClient
+  (get-body [this url extra-headers]))
+
+(m/=> get-body HttpGetBodyFn)
+
 (defprotocol WebSearch
   (search [this query]))
 
+(m/=> search SearchFn)
+
 ;; ---- Helpers ----
+
+(defn- validate!
+  [schema value message data]
+  (when-not (m/validate schema value)
+    (throw (ex-info message (assoc data :schema schema))))
+  value)
 
 (defn- normalize-query
   "Accept native tool args map {:query ...} or a bare query string."
   [args]
   (str/trim
-    (str (cond
-           (string? args) args
-           (map? args) (:query args)
-           :else args))))
+   (str (cond
+          (string? args) args
+          (map? args) (:query args)
+          :else args))))
 
 (defn- encode-query
   [query]
@@ -82,14 +118,16 @@
   (or (some-> (System/getenv "LATERALUS_HTTP_TIMEOUT_MS") parse-long)
       60000))
 
-(defn- http-get
-  ([url]
-   (http-get url nil))
-  ([url extra-headers]
-   (:body (hato/get url {:as      :string
-                         :timeout (http-timeout-ms)
-                         :headers (merge {"User-Agent" http-user-agent}
-                                        extra-headers)}))))
+(defrecord HatoHttpClient []
+  HttpClient
+  (get-body [_ url extra-headers]
+    (let [url           (validate! HttpUrl url "Invalid HTTP URL" {:url url})
+          extra-headers (validate! HttpHeaders extra-headers "Invalid HTTP headers" {:headers extra-headers})
+          body          (:body (hato/get url {:as      :string
+                                              :timeout (http-timeout-ms)
+                                              :headers (merge {"User-Agent" http-user-agent}
+                                                              extra-headers)}))]
+      (validate! HttpBody body "Invalid HTTP response body" {:url url :body body}))))
 
 (defn- html-unescape
   "Decode common HTML entities including numeric like &#039; and &#x27;."
@@ -100,9 +138,9 @@
       (str/replace "&gt;" ">")
       (str/replace "&quot;" "\"")
       (str/replace #"&#(\d+);"
-        (fn [[_ code]] (str (char (Integer/parseInt code)))))
+                   (fn [[_ code]] (str (char (Integer/parseInt code)))))
       (str/replace #"&#x([0-9a-fA-F]+);"
-        (fn [[_ hex]] (str (char (Integer/parseInt hex 16)))))
+                   (fn [[_ hex]] (str (char (Integer/parseInt hex 16)))))
       (str/replace "&nbsp;" " ")))
 
 (defn- strip-style-blocks
@@ -128,9 +166,9 @@
 
 (defn- fetch-mojeek-hits
   "Search via Mojeek. Clean HTML, independent index, no API key."
-  [query]
+  [http-client query]
   (let [url  (str mojeek-url "?q=" (encode-query query))
-        body (http-get url)
+        body (get-body http-client url nil)
         links   (for [[_ href title] (re-seq mojeek-title-re body)]
                   {:url   (html-unescape href)
                    :title (strip-html-tags title)})
@@ -146,9 +184,9 @@
 
 (defn- fetch-startpage-hits
   "Search via Startpage (Google results via privacy proxy). No API key."
-  [query]
+  [http-client query]
   (let [url  (str startpage-url "?q=" (encode-query query))
-        body (http-get url {"Accept" "text/html,application/xhtml+xml"})
+        body (get-body http-client url {"Accept" "text/html,application/xhtml+xml"})
         ;; Strip <style> blocks first to prevent CSS leaking into titles
         clean   (strip-style-blocks body)
         links   (for [[_ href title-html] (re-seq startpage-link-re clean)]
@@ -173,11 +211,11 @@
                                    "UTF-8")))
 
 (defn- wikipedia-search
-  [query]
+  [http-client query]
   (let [url  (str wiki-api-url
                   "?action=query&list=search&format=json&utf8=1&srlimit="
                   max-hits "&srsearch=" (encode-query query))
-        body (http-get url {"Accept" "application/json"})
+        body (get-body http-client url {"Accept" "application/json"})
         items (get-in (json/parse-string body true) [:query :search])]
     (vec (for [{:keys [title snippet]} items]
            {:title   title
@@ -185,36 +223,52 @@
             :snippet (strip-html-tags snippet)}))))
 
 (defn- fetch-wikipedia-hits
-  [query]
-  (wikipedia-search query))
+  [http-client query]
+  (wikipedia-search http-client query))
 
 ;; ---- Public API ----
+
+(defn default-http-client
+  "Create the default HTTP client for web search backends."
+  []
+  (->HatoHttpClient))
+
+(defrecord WebSearchClient [http-client]
+  WebSearch
+  (search [_ query]
+    (let [query       (validate! SearchQuery query "Invalid search query" {:query query})
+          http-client (or http-client (default-http-client))
+          mojeek      (try (fetch-mojeek-hits http-client query) (catch Exception _ nil))
+          startpage   (try (fetch-startpage-hits http-client query) (catch Exception _ nil))
+          hits        (cond
+                        (seq mojeek)    mojeek
+                        (seq startpage) startpage
+                        :else          (try (fetch-wikipedia-hits http-client query)
+                                            (catch Exception _ [])))
+          result      (vec hits)]
+      (validate! SearchResponse result "Invalid search response" {:result result}))))
+
+(defn web-search-client
+  "Create a WebSearch client, optionally with an injected HttpClient."
+  ([]
+   (web-search-client (default-http-client)))
+  ([http-client]
+   (->WebSearchClient http-client)))
+
+(defrecord DuckDuckGoClient [http-client]
+  WebSearch
+  (search [_ query]
+    (search (web-search-client http-client) query)))
 
 (defn web-search
   "Search the web. Priority: Mojeek → Startpage → Wikipedia."
   [query]
-  (when-not (m/validate SearchQuery query)
-    (throw (ex-info "Invalid search query" {:query query :schema SearchQuery})))
-  (let [mojeek    (try (fetch-mojeek-hits query) (catch Exception _ nil))
-        startpage (try (fetch-startpage-hits query) (catch Exception _ nil))
-        hits      (cond
-                   (seq mojeek)    mojeek
-                   (seq startpage) startpage
-                   :else          (try (fetch-wikipedia-hits query) (catch Exception _ [])))
-        result    (vec hits)]
-    (when-not (m/validate SearchResponse result)
-      (throw (ex-info "Invalid search response" {:result result :schema SearchResponse})))
-    result))
+  (search (web-search-client) query))
 
 (defn duckduckgo-search
   "Deprecated. Use web-search instead."
   [query]
   (web-search query))
-
-(defrecord DuckDuckGoClient []
-  WebSearch
-  (search [_ query]
-    (web-search query)))
 
 (defn web-search-tool
   "Create a :web tool that searches the web.
@@ -226,8 +280,9 @@
    {:type        :web
     :name        (or (:name opts) "web-search")
     :description (or (:description opts)
-                      "Search the web. Args: {:query string}. Returns up to 8 maps with :title, :url, :snippet.")
-    :parameters  [:map [:query :string]]}))
+                     "Search the web. Args: {:query string}. Returns up to 8 maps with :title, :url, :snippet.")
+    :parameters  [:map [:query :string]]
+    :client      (:client opts)}))
 
 (defmethod tools/run :web
   [_tool args]
@@ -235,7 +290,7 @@
     (if (str/blank? query)
       (pr-str [])
       (try
-        (pr-str (web-search query))
+        (pr-str (search (or (:client _tool) (web-search-client)) query))
         (catch Exception e
           (pr-str {:error (.getMessage e)}))))))
 
@@ -244,3 +299,6 @@
   (try
     (clojure.edn/read-string response)
     (catch Exception _ response)))
+
+;; Instrument network-boundary protocol fns (input + output) per project rule.
+(mi/instrument! {:ns ['kschltz.agent.tools.web]})

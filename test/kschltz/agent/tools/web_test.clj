@@ -20,6 +20,12 @@
      Clojure
    </a>")
 
+(defn- mock-http-client
+  [handler]
+  (reify sut/HttpClient
+    (get-body [_ url extra-headers]
+      (handler url extra-headers))))
+
 (deftest web-search-tool-defaults
   (testing "web-search-tool has expected metadata"
     (let [tool (sut/web-search-tool)]
@@ -27,12 +33,33 @@
       (is (= "web-search" (:name tool)))
       (is (string? (:description tool))))))
 
-(deftest parse-mojeek-html-extracts-hits
-  (testing "parses titles and snippets from Mojeek HTML"
-    (let [hits (#'sut/fetch-mojeek-hits "dummy")]  ;; will make real HTTP call
-      ;; Just check structure if it works
-      (is (every? #(contains? % :title) hits))
-      (is (every? #(contains? % :url) hits)))))
+(deftest web-search-client-uses-injected-http-client
+  (testing "parses titles and snippets from injected Mojeek HTML"
+    (let [requests (atom [])
+          client   (mock-http-client
+                    (fn [url extra-headers]
+                      (swap! requests conj {:url url :headers extra-headers})
+                      sample-mojeek))
+          hits     (sut/search (sut/web-search-client client) "clojure")]
+      (is (= ["Clojure" "Clojure - Wikipedia"] (mapv :title hits)))
+      (is (= ["https://clojure.org/" "https://en.wikipedia.org/wiki/Clojure"]
+             (mapv :url hits)))
+      (is (str/includes? (:snippet (first hits)) "dynamic"))
+      (is (str/includes? (:url (first @requests)) "mojeek.com/search")))))
+
+(deftest web-search-client-falls-back-to-startpage
+  (testing "uses Startpage when Mojeek has no hits"
+    (let [client (mock-http-client
+                  (fn [url _extra-headers]
+                    (cond
+                      (str/includes? url "mojeek.com") ""
+                      (str/includes? url "startpage.com") sample-startpage
+                      :else (throw (ex-info "unexpected URL" {:url url})))))
+          hits   (sut/search (sut/web-search-client client) "clojure")]
+      (is (= [{:title "Clojure"
+               :url "https://clojure.org/"
+               :snippet ""}]
+             hits)))))
 
 (deftest html-unescape-numeric-entities
   (testing "decodes numeric HTML entities like &#039; and &#x27;"
@@ -51,14 +78,29 @@
     (let [tool (sut/web-search-tool)]
       (is (= "[]" (tools/run tool "   "))))))
 
+(deftest web-search-rejects-invalid-query
+  (testing "protocol search input is Malli-instrumented"
+    (let [client (mock-http-client (fn [_ _] sample-mojeek))]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (sut/search (sut/web-search-client client) ""))))))
+
+(deftest web-search-tool-uses-injected-client
+  (testing "tool execution can inject a deterministic WebSearch client"
+    (let [client (mock-http-client (fn [_ _] sample-mojeek))
+          tool   (sut/web-search-tool {:client (sut/web-search-client client)})
+          result (tools/parse tool (tools/run tool {:query "clojure"}))]
+      (is (= "Clojure" (:title (first result)))))))
+
 (deftest add-web-search-tool-registers
   (testing "core can register web-search tool"
     (let [ag (core/make-agent {:base-url "http://mock" :model "m"})]
       (core/add-web-search-tool! ag)
       (is (some #(= "web-search" (:name %)) (core/get-tools ag))))))
 
-(deftest web-search-live
-  (testing "live web search returns results"
-    (let [result (sut/web-search "clojure programming")]
-      (is (pos? (count result)))
-      (is (every? #(and (:title %) (:url %) (:snippet %)) result)))))
+(deftest web-search-protocol-validates-output
+  (testing "record search output is Malli-validated"
+    (let [client (mock-http-client (fn [_ _] sample-mojeek))]
+      (with-redefs [sut/fetch-mojeek-hits (fn [_ _]
+                                            [{:title "Missing URL and snippet"}])]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (sut/search (sut/web-search-client client) "clojure")))))))

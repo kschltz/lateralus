@@ -1,7 +1,6 @@
 {:paths ["src" "resources"]
  :deps {org.clojure/clojure {:mvn/version "1.12.5"}
         hato/hato {:mvn/version "1.0.0"}
-        org.replikativ/proximum {:mvn/version "0.1.25"}
         cheshire/cheshire {:mvn/version "6.2.0"}
         datalevin/datalevin {:mvn/version "0.10.7"}
         borkdude/edamame {:mvn/version "1.5.37"}

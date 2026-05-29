@@ -606,9 +606,9 @@
               {:id id :tool tool :args args :error (.getMessage e)})))))))
 
 (defn- execute-tool-calls
-  "Execute multiple tool calls in parallel. Returns vector of results."
+  "Execute multiple tool calls serially. Returns vector of results."
   [calls tools]
-  (vec (pmap #(execute-tool-call tools %) calls)))
+  (mapv #(execute-tool-call tools %) calls))
 
 ;; ---- LLM ----
 

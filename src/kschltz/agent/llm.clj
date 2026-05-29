@@ -28,14 +28,17 @@
                   {:opts opts})))
 
 (defmethod call :openai-compatible
-  [{:keys [base-url api-key model message chat-history]
+  [{:keys [base-url api-key model message chat-history messages tools]
     :or   {chat-history []}
     :as   opts}]
   (let [url     (or base-url
                     (throw (ex-info "Missing :base-url" {:opts opts})))
         model'  (or model
                     (throw (ex-info "Missing :model" {:opts opts})))
-        message (or message
-                    (throw (ex-info "Missing :message" {:opts opts})))
-        http-res (http/completion url api-key model' message :chat-history chat-history)]
+        _       (when (and (nil? message) (nil? messages))
+                  (throw (ex-info "Missing :message or :messages" {:opts opts})))
+        http-res (http/completion url api-key model' message
+                                   :chat-history chat-history
+                                   :messages messages
+                                   :tools tools)]
     (or (:body http-res) http-res)))

@@ -12,6 +12,7 @@
             [kschltz.agent.memory :as memory]
             [kschltz.agent.tools :as tools]
             [kschltz.agent.http :as http]
+            [kschltz.agent.llm :as llm]
             [kschltz.agent.tools.repl :as repl]
             [kschltz.agent.tools.web :as web]
             [kschltz.agent.tools.remember :as remember]
@@ -628,10 +629,12 @@
                                           {:role "user" :content user-text}
                                           max-chars)))
           api-tools    (openai-tools (:tools state))]
-      (http/completion (:base-url state) (:api-key state)
-                       (:model state) nil
-                       :messages api-messages
-                       :tools api-tools))
+      (llm/call {:provider :openai-compatible
+                 :base-url (:base-url state)
+                 :api-key  (:api-key state)
+                 :model    (:model state)
+                 :messages api-messages
+                 :tools    api-tools}))
     {:choices [{:message {:content "LLM not configured"}}]}))
 
 ;; ---- Loop ----

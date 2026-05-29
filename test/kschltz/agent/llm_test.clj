@@ -39,9 +39,29 @@
                  (sut/call {:provider :openai-compatible :base-url "http://localhost" :message "hi"})))))
 
 (deftest call-openai-compatible-missing-message
-  (testing "call :openai-compatible throws when :message is missing"
+  (testing "call :openai-compatible throws when :message and :messages are missing"
     (is (thrown? clojure.lang.ExceptionInfo
                  (sut/call {:provider :openai-compatible :base-url "http://localhost" :model "test"})))))
+
+(deftest call-openai-compatible-with-messages-and-tools
+  (testing "call :openai-compatible passes :messages and :tools to http/completion"
+    (with-redefs [http/completion
+                  (fn [url api-key model message & {:keys [messages tools]}]
+                    (is (= "http://localhost:8080" url))
+                    (is (= "my-key" api-key))
+                    (is (= "my-model" model))
+                    (is (nil? message))
+                    (is (= [{:role "user" :content "hi"}] messages))
+                    (is (= [{:type "function" :function {:name "foo"}}] tools))
+                    (mock-response))]
+      (let [opts {:provider :openai-compatible
+                  :base-url "http://localhost:8080"
+                  :api-key  "my-key"
+                  :model    "my-model"
+                  :messages [{:role "user" :content "hi"}]
+                  :tools    [{:type "function" :function {:name "foo"}}]}]
+        (is (= {:choices [{:message {:content "Hi there!"}}]}
+               (sut/call opts)))))))
 
 (deftest call-openai-compatible-with-chat-history
   (testing "call :openai-compatible passes chat-history to http/completion"

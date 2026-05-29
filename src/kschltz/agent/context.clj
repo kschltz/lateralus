@@ -89,11 +89,11 @@
 
             ;; Tool result message -> plain text summary
             (= (:role msg) "tool")
-(let [c (str (or (:content msg) ""))]
+            (let [c (str (or (:content msg) ""))]
               {:role "user"
                :content (str "[Tool result: "
                             (subs c 0 (min 500 (count c)))
-                            "]")}
+                            "]")})
 
             ;; Normal message - strip non-OpenAI keys, coerce content to string
             :else (let [m (into {} (filter (fn [[k _]] (contains? openai-msg-keys k)) msg))]

@@ -20,8 +20,10 @@
 
 (require '[kschltz.agent.tools :as tools]
          '[kschltz.agent.delimiter-repair :as delimiter-repair]
+         '[kschltz.agent.nrepl-server :as nrepl-srv]
          '[clojure.string :as str]
-         '[edamame.core :as edamame])
+         '[edamame.core :as edamame]
+         '[nrepl.core :as nrepl])
 
 (defn- strip-markdown-fence
   "Remove optional ```clojure fences from LLM-generated code."
@@ -114,6 +116,55 @@
                 (throw e)))
             (throw first-e)))))))
 
+(defn- nrepl-connect-opts
+  [{:keys [host port]}]
+  (cond-> {:port (or port 59500)}
+    host (assoc :host host)
+    (not host) (assoc :host "127.0.0.1")))
+
+(defn- nrepl-eval-response
+  "Run code on an nREPL client and return a string result (value or error)."
+  [client code]
+  (let [{:keys [value err out status]}
+        (-> (nrepl/message client {:op "eval" :code code})
+            nrepl/combine-responses)]
+    (cond
+      (and status (contains? status "eval-error"))
+      (str "Exception: " (or err "eval failed"))
+
+      (some-> err not-empty)
+      (str "Exception: " err)
+
+      (and (seq out) (not (seq value)))
+      (str/trim out)
+
+      (seq value)
+      (str (last value))
+
+      :else "nil")))
+
+(defn- ensure-nrepl-server!
+  "Start the embedded nREPL server when :auto-start? is true and it is not running."
+  [{:keys [port auto-start?] :or {port 59500 auto-start? true}}]
+  (when auto-start?
+    (when-not (nrepl-srv/running?)
+      (nrepl-srv/start! port))))
+
+(defn- eval-via-nrepl
+  [tool raw-code]
+  (let [{:keys [code repaired?]} (-> raw-code sanitize-code delimiter-repair/prepare-for-eval)
+        connect-opts (nrepl-connect-opts tool)]
+    (ensure-nrepl-server! {:port (:port tool) :auto-start? (:auto-start? tool)})
+    (try
+      (with-open [conn (nrepl/connect connect-opts)]
+        (let [client (nrepl/client conn eval-timeout-ms)
+              result (nrepl-eval-response client code)]
+          (if repaired?
+            (str result "\n; delimiter repair applied before eval")
+            result)))
+      (catch Exception e
+        (str "Exception: " (.getMessage e))))))
+
 ;; ---- Execution Mode Dispatch ----
 ;; These dispatch functions are defined BEFORE defmulti so the
 ;; compiler can resolve them.  The :repl multimethods dispatch on
@@ -143,12 +194,7 @@
 
 (defmethod run-repl :nrepl
   [tool args]
-  (let [code (sanitize-code args)
-        port (:port tool)]
-    ;; TODO: Add nrepl library dependency to deps.edn for nREPL support.
-    ;; Until then, this mode is a stub.
-    (throw (ex-info "nREPL mode requires [nrepl/nrepl] dependency"
-                    {:port port}))))
+  (eval-via-nrepl tool args))
 
 (defmethod run-repl :default
   [tool args]
@@ -195,17 +241,21 @@
 (defn- make-repl-tool
   "Build a REPL tool map. Args are passed as a decoded map from the LLM's JSON args."
   ([mode name desc]
-   (make-repl-tool mode name desc nil nil))
+   (make-repl-tool mode name desc nil nil nil))
   ([mode name desc port]
-   (make-repl-tool mode name desc port :string))
+   (make-repl-tool mode name desc port :string nil))
   ([mode name desc port result-type]
-   {:type       :repl
-    :mode       mode
-    :name       name
-    :result-type (or result-type :string)
-    :description desc
-    :port       port
-    :parameters [:map [:code :string]]}))
+   (make-repl-tool mode name desc port result-type nil))
+  ([mode name desc port result-type opts]
+   (merge
+    (cond-> {:type        :repl
+             :mode        mode
+             :name        name
+             :result-type (or result-type :string)
+             :description desc
+             :parameters  [:map [:code :string]]}
+      port (assoc :port port))
+    (select-keys (or opts {}) [:host :auto-start?]))))
 
 (defn repl-eval-tool
   "Create a :repl tool that evaluates Clojure code locally via
@@ -233,20 +283,24 @@
    Args: a code string.
    Returns: parsed result (falls back to raw string on parse failure).
 
-   Requires: [nrepl/nrepl] in deps.edn for full nREPL protocol support.
-   Until then, this mode throws an error.
+   Starts the embedded nREPL server on demand unless :auto-start? is false.
 
    Options:
      :port         — nREPL port (default: 59500)
+     :host         — nREPL host (default: 127.0.0.1)
+     :auto-start?  — start kschltz.agent.nrepl-server if not running (default: true)
      :result-type  — parse mode (:string or :edn, default :string)
      :name         — tool name (default: \\\"repl-nrepl\\\")
      :description  — tool description"
   ([]
    (repl-nrepl-tool {:port 59500}))
   ([opts]
-   (let [{:keys [port result-type name description]
+   (let [{:keys [port host auto-start? result-type name description]
           :or   {port 59500
+                 host "127.0.0.1"
+                 auto-start? true
                  result-type :string
                  name "repl-nrepl"
-                 description "Evaluate Clojure code via nREPL. Args: code string. Returns: parsed result."}} opts]
-     (make-repl-tool :nrepl name description port result-type))))
+                 description "Evaluate Clojure code via nREPL. Args: {:code string}. Returns: parsed result."}} opts]
+     (make-repl-tool :nrepl name description port result-type
+                     {:host host :auto-start? auto-start?}))))

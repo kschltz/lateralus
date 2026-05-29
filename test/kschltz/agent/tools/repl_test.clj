@@ -1,5 +1,6 @@
 (ns kschltz.agent.tools.repl-test
   (:require [clojure.test :refer [deftest is testing]]
+            [kschltz.agent.nrepl-server :as nrepl-srv]
             [kschltz.agent.tools :as tools]
             [kschltz.agent.tools.repl :as sut]))
 
@@ -107,22 +108,35 @@
 
 ;; ---- Run REPL :nrepl Mode ----
 
-(deftest run-repl-nrepl-throws-unavailable
-  (testing "nrepl mode throws when library not available"
-    (let [tool (sut/repl-nrepl-tool)
-          tool' (assoc tool :port 12345)]
-      (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo
-           #"nREPL mode requires"
-           (tools/run tool' "(+ 1 2)"))))))
+(defn- random-nrepl-port []
+  (+ 59100 (mod (System/nanoTime) 500)))
 
-(deftest run-repl-nrepl-includes-port-in-exception
-  (testing "nrepl mode exception includes port in data"
-    (let [tool (assoc (sut/repl-nrepl-tool) :port 59500)
-          e (try (tools/run tool "(+ 1 2)")
-                 (catch Exception ex ex))]
-      (is (instance? clojure.lang.ExceptionInfo e))
-      (is (= 59500 (-> e ex-data :port))))))
+(deftest run-repl-nrepl-eval-smoke
+  (testing "nrepl mode evaluates via embedded server"
+    (let [port (random-nrepl-port)
+          tool (sut/repl-nrepl-tool {:port port})]
+      (try
+        (is (= "6" (tools/run tool "(+ 1 2 3)")))
+        (finally
+          (when (nrepl-srv/running?)
+            (nrepl-srv/stop!)))))))
+
+(deftest run-repl-nrepl-eval-with-code-map
+  (testing "nrepl mode accepts {:code ...} args map"
+    (let [port (random-nrepl-port)
+          tool (sut/repl-nrepl-tool {:port port})]
+      (try
+        (is (= "(0 1 2 3 4)" (tools/run tool {:code "(range 5)"})))
+        (finally
+          (when (nrepl-srv/running?)
+            (nrepl-srv/stop!)))))))
+
+(deftest run-repl-nrepl-connection-refused
+  (testing "nrepl mode reports connection failure when server is down"
+    (let [tool (sut/repl-nrepl-tool {:port 59999 :auto-start? false})
+          result (tools/run tool "(+ 1 2)")]
+      (is (string? result))
+      (is (re-find #"Exception:" result)))))
 
 ;; ---- Run REPL :default Fallback ----
 

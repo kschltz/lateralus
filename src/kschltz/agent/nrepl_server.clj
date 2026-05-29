@@ -14,11 +14,9 @@
 
 (require '[nrepl.server :as server])
 
-(defonce agent-server (agent nil)
-  "The running nREPL server instance. nil = not running.")
+(defonce ^:private agent-server (agent nil))
 
-(defonce server-running (agent false)
-  "Flag indicating whether the nREPL server is running.")
+(defonce ^:private server-running (agent false))
 
 (defn start!
   "Start the nREPL server on the given port (default 59500).

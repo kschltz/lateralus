@@ -95,11 +95,14 @@
                             (subs c 0 (min 500 (count c)))
                             "]")})
 
-            ;; Normal message - strip non-OpenAI keys, coerce content to string
+            ;; Normal message - strip non-OpenAI keys, coerce content fields to string
             :else (let [m (into {} (filter (fn [[k _]] (contains? openai-msg-keys k)) msg))]
-                    (cond-> m
+                    (cond->
+                     m
                       (contains? m :content)
-                      (update :content #(str (or % "")))))))
+                      (update :content #(str (or % "")))
+                      (contains? m :reasoning_content)
+                      (update :reasoning_content #(when (some? %) (str %)))))))
         messages))
 
 ;; ---- Serialization ----

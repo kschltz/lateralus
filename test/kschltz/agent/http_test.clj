@@ -1,11 +1,22 @@
 (ns kschltz.agent.http-test
   (:require [clojure.test :refer [deftest is testing]]
             [kschltz.agent.http :as sut]
+            [malli.instrument :as mi]
             [clojure.core :refer [with-redefs]]))
 
 ;; ---- HTTP Client Mocking ----
 ;; We use clojure.core/with-redefs to stub hato's HTTP functions so tests run
 ;; without a live server.  Each test supplies its own response fixture.
+
+(defn- malli-ex?
+  "True when ex-data carries malli instrument validation failure."
+  [e]
+  (let [d (ex-data e)]
+    (or (:malli/error d)
+        (get-in d [:data :malli/error])
+        (#{:malli.core/invalid-input
+           :malli.core/invalid-output
+           :malli.core/invalid-arity} (:type d)))))
 
 (defn- mock-response
   "Build a minimal hato response map."
@@ -139,6 +150,38 @@
                     (mock-response :body {:choices [{:message {:content "public"}}]}))]
       (is (= {:choices [{:message {:content "public"}}]}
              (sut/completion "http://127.0.0.1:8080" nil "model" "msg"))))))
+
+(deftest http-network-fns-are-instrumented
+  (testing "network-boundary fns wrapped by malli.instrument/instrument!"
+    (is (some? (mi/-original #'sut/completion-request)))
+    (is (some? (mi/-original #'sut/embed-request)))))
+
+(deftest completion-rejects-invalid-base-url
+  (testing "instrumented completion throws ex-info with :malli/error for invalid base-url"
+    (try
+      (sut/completion "" nil "model" "msg")
+      (is false "expected ex-info")
+      (catch clojure.lang.ExceptionInfo e
+        (is (malli-ex? e))))))
+
+(deftest completion-rejects-invalid-model
+  (testing "instrumented completion throws ex-info with :malli/error for empty model"
+    (try
+      (sut/completion "http://127.0.0.1:8080" nil "" "msg")
+      (is false "expected ex-info")
+      (catch clojure.lang.ExceptionInfo e
+        (is (malli-ex? e))))))
+
+(deftest completion-rejects-invalid-response
+  (testing "instrumented completion throws ex-info with :malli/error for malformed response body"
+    (with-redefs [hato.client/post
+                  (fn [_ _]
+                    (mock-response :body {:unexpected "shape"}))]
+      (try
+        (sut/completion "http://127.0.0.1:8080" nil "model" "msg")
+        (is false "expected ex-info")
+        (catch clojure.lang.ExceptionInfo e
+          (is (malli-ex? e)))))))
 
 ;; ---- Assistant Content Extraction ----
 

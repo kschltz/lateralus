@@ -63,3 +63,79 @@
    [:stored boolean?]
    [:indexed boolean?]
    [:reason {:optional true} [:enum "embedding-failed" "index-failed"]]])
+
+;; ---- Chat completion HTTP boundaries ----
+
+(def ChatModel
+  "Chat completion model identifier."
+  [:string {:min 1}])
+
+(def ChatRole
+  "OpenAI-compatible chat message role."
+  [:enum "user" "assistant" "system" "tool"])
+
+(def ToolCall
+  "Native function-call descriptor in an assistant message."
+  [:map
+   [:id string?]
+   [:type {:optional true} string?]
+   [:function {:optional true} :map]])
+
+(def ChatMessage
+  "One message in a /v1/chat/completions request."
+  [:map
+   [:role ChatRole]
+   [:content {:optional true} [:maybe :string]]
+   [:tool_call_id {:optional true} :string]
+   [:tool_calls {:optional true} [:vector ToolCall]]
+   [:reasoning_content {:optional true} :string]])
+
+(def CompletionMessages
+  "Non-empty chat message list for completion requests."
+  [:vector {:min 1} ChatMessage])
+
+(def CompletionTools
+  "Optional OpenAI-style tool definitions."
+  [:vector :map])
+
+(def AssistantMessage
+  "Assistant message in a completion response."
+  [:map
+   [:role {:optional true} string?]
+   [:content {:optional true} [:maybe :string]]
+   [:tool_calls {:optional true} [:vector ToolCall]]
+   [:reasoning_content {:optional true} :string]])
+
+(def CompletionChoice
+  "One choice in a completion response."
+  [:map
+   [:message AssistantMessage]
+   [:index {:optional true} int?]
+   [:finish_reason {:optional true} string?]])
+
+(def CompletionResponse
+  "Validated body from /v1/chat/completions."
+  [:map
+   [:choices [:vector {:min 1} CompletionChoice]]])
+
+(def CompletionRequestOpts
+  "Optional keyword args for completion-request."
+  [:map
+   [:chat-history {:optional true} [:vector ChatMessage]]
+   [:messages {:optional true} CompletionMessages]
+   [:tools {:optional true} CompletionTools]])
+
+(def CompletionRequestFn
+  "Instrumented schema for http/completion-request (network I/O)."
+  [:=> [:cat BaseUrl ApiKey ChatModel [:maybe :string] [:? CompletionRequestOpts]]
+        CompletionResponse])
+
+(def EmbedRequestFn
+  "Instrumented schema for http/embed-request (network I/O)."
+  [:=> [:cat BaseUrl ApiKey EmbedModel EmbedText]
+        EmbeddingVector])
+
+(def EmbedFn
+  "Instrumented schema for http/embed (may return nil on failure)."
+  [:=> [:cat BaseUrl ApiKey EmbedModel EmbedText]
+        [:maybe EmbeddingVector]])

@@ -61,6 +61,24 @@
   (p/inspect value)
   nil)
 
+(def ^:private portal-tapped?
+  "True once Portal is open and registered as a tap> target."
+  (atom false))
+
+(defn ensure-tap-portal!
+  "Open Portal and register tap> on first call. No-op on subsequent calls.
+   Used by the visualize tool so Portal starts only when the LLM requests it."
+  ([] (ensure-tap-portal! {}))
+  ([opts]
+   (when-not @portal-tapped?
+     (locking portal-tapped?
+       (when-not @portal-tapped?
+         (let [portal (open! (when-let [t (:title opts)]
+                               {:window-title t}))]
+           (add-tap #'p/submit)
+           (reset! portal-tapped? true)
+           portal))))))
+
 (defn tap-portal!
   "Open a Portal and add it as a tap> target. Returns the portal session.
    Usage:
@@ -69,7 +87,9 @@
   ([] (tap-portal! {}))
   ([opts]
    (let [portal (open! opts)]
-     (add-tap #'p/submit)
+     (when-not @portal-tapped?
+       (add-tap #'p/submit)
+       (reset! portal-tapped? true))
      portal)))
 
 ;; ---- Hiccup Helpers ----
@@ -105,11 +125,70 @@
 
 (defn h-style
   "Create a CSS style map from keyword-value pairs.
+   Portal/React require map styles, not CSS strings.
    Example:
      (h-style :color \"red\" :font-size \"16px\" :margin-top 8)
      ;=> {:color \"red\" :font-size \"16px\" :margin-top 8}"
   [& kvs]
   (apply hash-map kvs))
+
+(defn- css-string->style-map
+  "Convert \"color: red; font-size: 14px\" to {:color \"red\" :font-size \"14px\"}.
+   Portal renders hiccup via React — string :style causes React error #62."
+  [s]
+  (when (and (string? s) (seq (str/trim s)))
+    (into {}
+          (keep (fn [part]
+                  (let [t (str/trim part)]
+                    (when (seq t)
+                      (when-let [idx (.indexOf t ":")]
+                        (when (pos? idx)
+                          [(keyword (str/replace (str/trim (subs t 0 idx)) #"\s+" "-"))
+                           (str/trim (subs t (inc idx)))])))))
+                (str/split s #";")))))
+
+(defn- sanitize-attrs
+  "Ensure :style is a map for Portal's React hiccup renderer."
+  [attrs]
+  (if (map? attrs)
+    (if-let [style (:style attrs)]
+      (assoc attrs :style (if (string? style)
+                            (or (css-string->style-map style) {})
+                            style))
+      attrs)
+    attrs))
+
+(defn- hiccup-node?
+  "True for a hiccup vector [tag attrs? ...children]."
+  [x]
+  (and (vector? x) (pos? (count x)) (keyword? (first x))))
+
+(defn sanitize-hiccup
+  "Walk hiccup and convert string :style attrs to maps (fixes React error #62)."
+  [data]
+  (cond
+    (hiccup-node? data)
+    (let [[tag & rest] data
+          [attrs & children] (if (map? (first rest))
+                               [(first rest) (rest rest)]
+                               [nil rest])]
+      (into [tag (when attrs (sanitize-attrs attrs))]
+            (map sanitize-hiccup children)))
+
+    (vector? data) (mapv sanitize-hiccup data)
+    (list? data)   (map sanitize-hiccup data)
+    (seq? data)    (map sanitize-hiccup data)
+    :else data))
+
+(defn- prepare-for-portal
+  "Normalize data before tap> — hiccup gets style sanitization."
+  [data viewer]
+  (let [data (if (or (= viewer :portal.viewer/hiccup)
+                     (= viewer :portal.viewer/html)
+                     (and (vector? data) (keyword? (first data))))
+               (sanitize-hiccup data)
+               data)]
+    (if viewer (pv/default data viewer) data)))
 
 ;; ---- Pre-built hiccup components ----
 
@@ -402,11 +481,12 @@
    {:type        :visualize
     :name        (or (:name opts) "visualize")
     :description (or (:description opts)
-                     (str "Display data in Portal (opens automatically via tap>). "
+                     (str "Display data in Portal (opens Portal on first use). "
                           "Args: {:data <edn-or-json-string-or-value>, :viewer string, :title string?}. "
                           "IMPORTANT: :data must be the actual data — NOT a variable name. "
                           "For tables pass EDN/JSON like [{:model \"RTX 4090\" :price 1599}]. "
                           "For hiccup/html pass an EDN vector like [:html [:body ...]]. "
+                          "Use map styles {:style {:color \"red\"}} not CSS strings (auto-fixed if needed). "
                           "Build complex hiccup with repl-eval first, then pass the vector in :data. "
                           "Viewers: table, tree, json, edn, hiccup, html, text, code, diff, vega, vega-lite."))
     :parameters  [:map
@@ -416,7 +496,7 @@
 
 (defmethod tools/run :visualize
   [_tool args]
-  (let [{:keys [data viewer parsed? parse-error]} (normalize-visualize-args args)]
+  (let [{:keys [data viewer title parsed? parse-error]} (normalize-visualize-args args)]
     (cond
       (false? parsed?)
       (pr-str {:status :error
@@ -429,7 +509,8 @@
                              "Pass EDN like [{:k v}] or [:html [:body ...]]")})
 
       :else
-      (let [valued (if viewer (pv/default data viewer) data)]
+      (let [_portal (ensure-tap-portal! (when title {:title title}))
+            valued (prepare-for-portal data viewer)]
         (clojure.core/tap> valued)
         (pr-str {:status   :ok
                  :viewer   (or viewer :default)

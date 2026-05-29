@@ -881,10 +881,8 @@
 ;; ---- Public API ----
 
 (defn start!
-  "Start the agent loop (blocking). Also opens Portal and adds it as a tap> target
-   so (tap> value) and the visualize tool both display in Portal."
+  "Start the agent loop (blocking). Messages are sent via send-message!."
   [ag]
-  (portal/tap-portal!)
   (send ag assoc :running true)
   (await ag)
   (try

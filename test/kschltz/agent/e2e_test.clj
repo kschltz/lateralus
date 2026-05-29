@@ -6,6 +6,7 @@
    http/assistant-content, and http/embed."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [kschltz.agent.core :as core]
+            [kschltz.agent.loop :as loop]
             [kschltz.agent.memory :as memory]
             [kschltz.agent.http :as http]
             [kschltz.agent.tools.repl :as repl-tools]))
@@ -396,13 +397,13 @@
 
 (deftest e2e-openai-tools-empty
   (testing "openai-tools returns nil when no tools registered"
-    (is (nil? (core/openai-tools [])))
-    (is (nil? (core/openai-tools nil)))))
+    (is (nil? (loop/openai-tools [])))
+    (is (nil? (loop/openai-tools nil)))))
 
 (deftest e2e-openai-tools-builds-array
   (testing "openai-tools builds OpenAI-format tools array"
     (let [tools [(repl-tools/repl-eval-tool)]
-          result (core/openai-tools tools)]
+          result (loop/openai-tools tools)]
       (is (= 1 (count result)))
       (is (= "function" (:type (first result))))
       (is (= "repl-eval" (get-in (first result) [:function :name])))

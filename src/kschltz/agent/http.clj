@@ -89,6 +89,7 @@
         msg'   (when (some? message) (str message))]
     (completion-request url api-key model msg' opts'')))
 
+(m/=> get-models mem-schemas/GetModelsFn)
 (defn get-models [base-url api-key]
   (let [url (format "%s/v1/models" base-url)
         resp (hato/get url (http-opts (cond-> {:as :json}
@@ -98,6 +99,7 @@
       (throw (ex-info (str "API error: status: " (:status resp)) {:status (:status resp) :body (:body resp)}))
       (get-in resp [:body :data]))))
 
+(m/=> get-model-info mem-schemas/GetModelInfoFn)
 (defn get-model-info [base-url api-key model-id]
   (let [url (format "%s/v1/models/%s" base-url model-id)
         resp (hato/get url (http-opts (cond-> {:as :json}

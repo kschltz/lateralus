@@ -139,3 +139,32 @@
   "Instrumented schema for http/embed (may return nil on failure)."
   [:=> [:cat BaseUrl ApiKey EmbedModel EmbedText]
         [:maybe EmbeddingVector]])
+
+;; ---- Model listing HTTP boundaries ----
+
+(def ModelInfo
+  "Single model object from /v1/models response."
+  [:map
+   [:id :string]
+   [:name {:optional true} :string]
+   [:object {:optional true} :string]
+   [:owned_by {:optional true} :string]
+   [:created {:optional true} :int]])
+
+(def ModelListResult
+  "Result from get-models — vector of model info maps."
+  [:maybe [:vector :map]])
+
+(def ModelInfoResult
+  "Result from get-model-info — single model info map or nil."
+  [:maybe :map])
+
+(def GetModelsFn
+  "Instrumented schema for http/get-models (network I/O)."
+  [:=> [:cat BaseUrl ApiKey]
+        ModelListResult])
+
+(def GetModelInfoFn
+  "Instrumented schema for http/get-model-info (network I/O)."
+  [:=> [:cat BaseUrl ApiKey :string]
+        ModelInfoResult])

@@ -49,7 +49,7 @@
                                              base-url         (assoc :base-url base-url)
                                              api-key          (assoc :api-key api-key)
                                              sessions-dir     (assoc :sessions-dir sessions-dir)))]
-    {:connection store}))
+    {:store store}))
 
 (defmulti store-message
   "Store a message in the session."
@@ -62,11 +62,11 @@
 
 (defmethod store-message :datalevin
   [{:keys [session-id message] :as opts}]
-  (let [conn (get-in opts [:connection])
+  (let [conn (get-in opts [:store])
         msg  (assoc message :session-id session-id)]
     (if conn
       (dlevin/store-message! conn msg)
-      (throw (ex-info "No connection in opts" {:opts opts})))))
+      (throw (ex-info "No store in opts" {:opts opts})))))
 
 (defmulti retrieve-relevant
   "Retrieve relevant messages via embedding similarity."
@@ -78,9 +78,9 @@
                   {:opts opts})))
 
 (defmethod retrieve-relevant :datalevin
-  [{:keys [session-id query limit connection] :as opts}]
-  (let [conn (or connection
-                 (throw (ex-info "No connection in opts" {:opts opts})))
+  [{:keys [session-id query limit store] :as opts}]
+  (let [conn (or store
+                 (throw (ex-info "No store in opts" {:opts opts})))
         q    (or query
                  (throw (ex-info "Missing :query" {:opts opts})))
         sid  (or session-id
@@ -98,9 +98,9 @@
                   {:opts opts})))
 
 (defmethod load-recent-messages :datalevin
-  [{:keys [session-id limit connection] :as opts}]
-  (let [conn (or connection
-                 (throw (ex-info "No connection in opts" {:opts opts})))
+  [{:keys [session-id limit store] :as opts}]
+  (let [conn (or store
+                 (throw (ex-info "No store in opts" {:opts opts})))
         sid  (or session-id
                  (throw (ex-info "Missing :session-id" {:opts opts})))
         n    (or limit 10)]
@@ -116,9 +116,9 @@
                   {:opts opts})))
 
 (defmethod close-session :datalevin
-  [{:keys [connection] :as opts}]
-  (if connection
-    (dlevin/close-session-store connection)
+  [{:keys [store] :as opts}]
+  (if store
+    (dlevin/close-session-store store)
     true))
 
 ;; ---- Composition Strategies ----

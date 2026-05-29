@@ -39,11 +39,11 @@
 (defn- search-fn [store session-id]
   (fn [{:keys [query limit]}]
     (memory/retrieve-relevant
-      {:backend     :datalevin
-       :connection  store
-       :session-id  session-id
-       :query       query
-       :limit       (or limit 5)})))
+     {:backend     :datalevin
+      :store  store
+      :session-id  session-id
+      :query       query
+      :limit       (or limit 5)})))
 
 ;; ---- Retrieval tests ----
 
@@ -53,10 +53,10 @@
           store      (test-store session-id)
           ;; Store a fact first
           _         (memory/store-message
-                      {:backend    :datalevin
-                       :connection store
-                       :session-id session-id
-                       :message    {:role "assistant"
+                     {:backend    :datalevin
+                      :store store
+                      :session-id session-id
+                      :message    {:role "assistant"
                                    :text "User prefers dark mode"
                                    :kind "fact"
                                    :topic "preferences"}})
@@ -71,7 +71,7 @@
     (let [session-id (make-session-id)
           store      (test-store session-id)
           tool       (remember/remember-tool {:search-fn (search-fn store session-id)})
-          result     (tools/parse tool (tools/run tool {:query "nonexistent thing"}) )]
+          result     (tools/parse tool (tools/run tool {:query "nonexistent thing"}))]
       (is (false? (:stored result)))
       (is (str/includes? (:content result) "No matching memories"))
       (dlevin/close-session-store store))))
@@ -97,11 +97,11 @@
     (let [session-id (make-session-id)
           store      (test-store session-id)
           _          (dlevin/store-message! store {:session-id session-id
-                                                  :role "assistant"
-                                                  :text "Favorite color is teal"
-                                                  :kind "fact"
-                                                  :topic "preferences"
-                                                  :timestamp 1000})
+                                                   :role "assistant"
+                                                   :text "Favorite color is teal"
+                                                   :kind "fact"
+                                                   :topic "preferences"
+                                                   :timestamp 1000})
           state     {:session-id           session-id
                      :memory-store          store
                      :memory-backend        :datalevin
@@ -117,7 +117,7 @@
       (is (str/includes? (:content (first ctx)) "preferences:"))
       (is (not (some #(and (= "assistant" (:role %))
                            (str/includes? (:content %) "Favorite color is teal"))
-                    (rest ctx))))
+                     (rest ctx))))
       (dlevin/close-session-store store))))
 
 (deftest make-agent-registers-remember-tool

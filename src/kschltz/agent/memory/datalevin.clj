@@ -83,7 +83,7 @@
 ;; ---- Session store creation -----------------------------------------------
 
 (defn create-session-store
-  "Create a session store: a Datalog connection + a standalone vector index.
+  "Create a session store: a Datalog store handle + a standalone vector index.
    opts may include:
      :embedding-method - :langchain4j (default) or :http
      :embedding-dims   - vector dimensionality (default 384)
@@ -118,7 +118,7 @@
                             (when (:model opts)
                               {:session/model (:model opts)}))]
     (d/transact conn [session-meta])
-    {:connection          conn
+    {:store          conn
      :kv-store            kv-store
      :vec-index           vec-index
      :embedding-dims      emb-dims
@@ -152,7 +152,7 @@
   [store message-map]
   (when-not (m/validate schemas/StoreMessage message-map)
     (throw (ex-info "Invalid store message" {:message message-map})))
-  (let [conn       (:connection store)
+  (let [conn       (:store store)
         vec-index  (:vec-index store)
         msg-id     (or (:id message-map) (:msg/id message-map)
                        (str "msg-" (System/currentTimeMillis) "-" (rand-int 100000)))
@@ -246,7 +246,7 @@
         ;; Semantic search via vector index
         (try
           (let [vec-index (:vec-index store)
-                conn      (:connection store)
+                conn      (:store store)
                 neighbors (d/search-vec vec-index query-emb {:top top-y})
                 msg-ids   (vec neighbors)]
             (if (seq msg-ids)
@@ -254,27 +254,27 @@
               []))
           (catch Exception e
             (println "Warning: vector search failed, falling back:" (.getMessage e))
-            (brute-force-search (:connection store) session-id top-y)))
+            (brute-force-search (:store store) session-id top-y)))
         ;; No embedding available: brute-force
-        (brute-force-search (:connection store) session-id top-y)))))
+        (brute-force-search (:store store) session-id top-y)))))
 
 (defn load-recent-messages!
   "Return the most recent messages for a session, sorted chronologically."
   [store session-id limit]
   (when (and store session-id limit (pos? limit))
-    (brute-force-search (:connection store) session-id limit)))
+    (brute-force-search (:store store) session-id limit)))
 
 ;; ---- Close ----------------------------------------------------------------
 
 (defn close-session-store
-  "Close both the Datalog connection and the vector index."
+  "Close both the Datalog store handle and the vector index."
   [store]
   (try
     (when-let [vec-index (:vec-index store)]
       (d/close-vector-index vec-index))
     (when-let [kv-store (:kv-store store)]
       (d/close-kv kv-store))
-    (when-let [conn (:connection store)]
+    (when-let [conn (:store store)]
       (d/close conn))
     true
     (catch Exception e

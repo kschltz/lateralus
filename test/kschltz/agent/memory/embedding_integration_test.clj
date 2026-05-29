@@ -61,11 +61,11 @@
                   :sessions-dir test-base-dir})]
       (testing "store-message with real LangChain4j embedding"
         (let [result (dlevin/store-message!
-                       (:connection store)
-                       {:session-id session-id
-                        :role "user"
-                        :text "What is the capital of France?"
-                        :timestamp (System/currentTimeMillis)})]
+                      (:store store)
+                      {:session-id session-id
+                       :role "user"
+                       :text "What is the capital of France?"
+                       :timestamp (System/currentTimeMillis)})]
           (is (:stored result)
               "message should be stored")
           (is (:indexed result)
@@ -74,8 +74,8 @@
               "embedding should succeed without errors")))
       (testing "retrieve-relevant finds stored messages"
         (let [results (dlevin/search-relevant!
-                        (:connection store)
-                        "capital city" session-id 5)]
+                       (:store store)
+                       "capital city" session-id 5)]
           (is (some? results)
               "should return results")
           (is (pos? (count results))
@@ -84,8 +84,8 @@
               "should find exactly one message (the one we stored)")))
       (testing "load-recent-messages returns stored messages"
         (let [recent (dlevin/load-recent-messages!
-                       (:connection store)
-                       session-id 5)]
+                      (:store store)
+                      session-id 5)]
           (is (= 1 (count recent))
               "should have one message")
           (is (= "user" (:msg/role (first recent)))
@@ -94,7 +94,7 @@
               "content should contain 'capital'")))
       (memory/close-session
        {:backend :datalevin
-        :connection (:connection store)}))))
+        :store (:store store)}))))
 
 (deftest live-langchain4j-multiple-messages-slow
   "Integration test for multiple LangChain4j-stored messages."
@@ -107,23 +107,23 @@
                   :embedding-method :langchain4j
                   :embedding-model test-model
                   :sessions-dir test-base-dir})
-          conn (:connection store)]
+          conn (:store store)]
       (testing "store three messages with live embeddings"
         (dlevin/store-message! conn
-          {:session-id session-id
-           :role "user"
-           :text "What is Clojure?"
-           :timestamp 1000})
+                               {:session-id session-id
+                                :role "user"
+                                :text "What is Clojure?"
+                                :timestamp 1000})
         (dlevin/store-message! conn
-          {:session-id session-id
-           :role "assistant"
-           :text "Clojure is a functional programming language"
-           :timestamp 2000})
+                               {:session-id session-id
+                                :role "assistant"
+                                :text "Clojure is a functional programming language"
+                                :timestamp 2000})
         (dlevin/store-message! conn
-          {:session-id session-id
-           :role "user"
-           :text "Tell me about Lateralus"
-           :timestamp 3000}))
+                               {:session-id session-id
+                                :role "user"
+                                :text "Tell me about Lateralus"
+                                :timestamp 3000}))
       (testing "all messages retrievable by semantic search"
         (let [results (dlevin/search-relevant! conn "Clojure" session-id 5)]
           (is (some? results)
@@ -142,7 +142,7 @@
               "last message should contain 'Lateralus'")))
       (memory/close-session
        {:backend :datalevin
-        :connection conn}))))
+        :store conn}))))
 
 (deftest langchain4j-embedding-handles-tool-messages-slow
   "Integration test for tool metadata with LangChain4j embeddings."
@@ -155,15 +155,15 @@
                   :embedding-method :langchain4j
                   :embedding-model test-model
                   :sessions-dir test-base-dir})
-          conn (:connection store)]
+          conn (:store store)]
       (testing "store message with tool metadata"
         (let [result (dlevin/store-message! conn
-                       {:session-id session-id
-                        :role "assistant"
-                        :text "I'll evaluate the expression"
-                        :tool-name "repl-eval"
-                        :tool-result "(+ 1 2) => 3"
-                        :timestamp 1000})]
+                                            {:session-id session-id
+                                             :role "assistant"
+                                             :text "I'll evaluate the expression"
+                                             :tool-name "repl-eval"
+                                             :tool-result "(+ 1 2) => 3"
+                                             :timestamp 1000})]
           (is (:stored result)
               "message should be stored")
           (is (:indexed result)
@@ -178,4 +178,4 @@
               "tool-result should be preserved")))
       (memory/close-session
        {:backend :datalevin
-        :connection conn}))))
+        :store conn}))))

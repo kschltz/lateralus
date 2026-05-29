@@ -10,8 +10,7 @@
 
 (deftest resolve-response-timeout-ms-defaults
   (testing "default response timeout is 1 minute"
-    (is (= 60000 (#'cli/resolve-response-timeout-ms {} :env-getter (constantly nil))))
-    (is (= 60000 cli/default-response-timeout-ms))))
+    (is (= 60000 (#'cli/resolve-response-timeout-ms {} :env-getter (constantly nil))))))
 
 (deftest resolve-response-timeout-ms-precedence
   (testing "CLI --timeout beats LATERALUS_TIMEOUT_MS env"

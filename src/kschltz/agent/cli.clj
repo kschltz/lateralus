@@ -14,22 +14,26 @@
 
 (def ^:private default-response-timeout-ms
   "Default timeout for deref-ing a response promise."
-  (or (some-> (System/getenv "LATERALUS_TIMEOUT_MS") parse-long)
-      60000))
+  60000)
 
 (defn- resolve-response-timeout-ms
-  [cli-opts]
-  (or (:timeout-ms cli-opts) default-response-timeout-ms))
+  "Response wait timeout (ms). CLI --timeout beats LATERALUS_TIMEOUT_MS env."
+  [cli-opts & {:keys [env-getter] :or {env-getter #(System/getenv %)}}]
+  (or (:timeout-ms cli-opts)
+      (some-> (env-getter "LATERALUS_TIMEOUT_MS") parse-long)
+      default-response-timeout-ms))
 
 ;; ---- Embedding method resolution ----
 
 (defn- parse-embedding-method
-  "Parse --embedding-method flag value."
+  "Parse --embedding-method flag value (keyword or string)."
   [s]
   (cond
     (nil? s) nil
-    (= (str/lower-case s) "langchain4j") :langchain4j
-    (= (str/lower-case s) "http")         :http
+    (= s :langchain4j) :langchain4j
+    (= s :http)         :http
+    (= (str/lower-case (str s)) "langchain4j") :langchain4j
+    (= (str/lower-case (str s)) "http")         :http
     :else (throw (ex-info (str "Unknown embedding method: " s
                                ". Use 'langchain4j' or 'http'.")
                           {:method s}))))

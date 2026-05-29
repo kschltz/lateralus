@@ -8,7 +8,7 @@
   Memory is optional: pass :session-id to make-agent to enable
   Datalevin-backed hybrid memory (semantic search + recent context)."
   (:refer-clojure :exclude [reset!])
-  (:require [cheshire.core :as json]
+  (:require [kschltz.agent.context :as context]
             [kschltz.agent.memory :as memory]
             [kschltz.agent.tools :as tools]
             [kschltz.agent.http :as http]
@@ -66,7 +66,6 @@
 (def ^:const maximum-message-queue-size 1000)
 (def ^:const default-history-limit 50) ;; Keep last N messages in state; older ones live in Datalevin
 (def ^:const default-memory-max-chars 500)
-(def ^:const truncation-suffix "…")
 
 (def ^:private default-state
   "Initial agent state map."
@@ -137,144 +136,13 @@
                (opts k)
                (default-fn))])))
 
-(defn- truncate-text
-  "Truncate text to max-chars (including suffix). nil max-chars disables truncation."
-  [text max-chars]
-  (if (and max-chars (pos? max-chars) (string? text) (> (count text) max-chars))
-    (let [keep (max 1 (- max-chars (count truncation-suffix)))]
-      (str (subs text 0 keep) truncation-suffix))
-    text))
+;; ---- Public API (delegated to context ns) ----
 
-(defn- truncate-tool-calls
-  "Truncate tool call arguments, preserving valid JSON.
-   Tool call :arguments must be valid JSON or the API rejects the request.
-   If the arguments are too long, replace them with an empty JSON object
-   rather than truncating mid-string (which produces invalid JSON)."
-  [tool-calls max-chars]
-  (when (seq tool-calls)
-    (mapv (fn [tc]
-            (if-let [f (:function tc)]
-              (update tc :function
-                      (fn [func]
-                        (if (and max-chars
-                                 (pos? max-chars)
-                                 (string? (:arguments func))
-                                 (> (count (:arguments func)) max-chars))
-                          ;; Arguments are too long — replace with empty JSON object
-                          ;; rather than producing invalid JSON via truncation.
-                          ;; The LLM will see the tool name and know it was truncated.
-                          (assoc func :arguments "{}")
-                          func)))
-              tc))
-          tool-calls)))
-
-(def ^:private openai-msg-keys
-  "Only these keys are valid in OpenAI Chat Completion message objects.
-   Any other keys (e.g. :msg-id, :timestamp, :msg/id, :msg/timestamp)
-   will cause a 400 from strict providers like the HuggingFace router."
-  #{:role :content :name :tool_calls :tool_call_id :reasoning_content})
-
-(defn- sanitize-context-messages
-  "Strip tool_calls, tool_call_id, and non-OpenAI metadata from context messages
-   before sending to the LLM API.
-   Historical tool calls are stale — their IDs don't match any tool results,
-   and sending assistant messages with tool_calls but no matching tool results
-   causes 'invalid tool call arguments' errors from the API.
-   Internal metadata like :msg-id and :timestamp cause 400 errors from strict
-   providers (e.g. HuggingFace router) that reject unknown properties.
-   Convert tool-related messages to plain text summaries instead."
-  [messages]
-  (mapv (fn [msg]
-          (cond
-            ;; Assistant message with tool_calls -> plain text summary
-            (and (= (:role msg) "assistant") (seq (:tool_calls msg)))
-            (let [tool-names (mapv (fn [tc]
-                                    (get-in tc [:function :name] "unknown"))
-                                  (:tool_calls msg))
-                  base      (str "[Used tools: " (str/join ", " tool-names) "]")
-                  content   (if-let [c (:content msg)]
-                               (str base "\n" c)
-                               base)]
-              {:role "assistant" :content content})
-
-            ;; Tool result message -> plain text summary
-            (= (:role msg) "tool")
-            {:role "user"
-             :content (str "[Tool result: "
-                          (subs (:content msg "") 0 (min 500 (count (:content msg ""))))
-                          "]")}
-
-            ;; Normal message - strip non-OpenAI keys
-            :else (into {} (filter (fn [[k _]] (contains? openai-msg-keys k))) msg)))
-        messages))
-
-(defn- truncate-chat-message
-  "Truncate :content and tool :arguments in an OpenAI-format chat message."
-  [msg max-chars]
-  (cond-> msg
-    (contains? msg :content)
-    (update :content truncate-text max-chars)
-    (:tool_calls msg)
-    (update :tool_calls truncate-tool-calls max-chars)))
-
-(defn- serialize-tool-calls
-  [tool-calls]
-  (when (seq tool-calls)
-    (json/generate-string tool-calls)))
-
-(defn- deserialize-tool-calls
-  [s]
-  (when (and (string? s) (not (str/blank? s)))
-    (try (json/parse-string s true)
-         (catch Exception _ nil))))
-
-(defn- chat-msg->memory-msg
-  "Convert an OpenAI chat message to Datalevin storage format (full text, no truncation)."
-  [{:keys [role content tool_calls tool_call_id]}]
-  (cond-> {:role (or role "user")
-           :text (or content "")}
-    (seq tool_calls) (assoc :tool-calls (serialize-tool-calls tool_calls))
-    tool_call_id (assoc :tool-call-id tool_call_id)))
-
-(defn- memory-msg->chat-msg
-  [{:msg/keys [id role text timestamp tool-calls tool-call-id]}]
-  (let [chat (cond-> {:role (or role "user") :content (or text "")}
-               id (assoc :msg-id id)
-               timestamp (assoc :timestamp timestamp)
-               tool-call-id (assoc :tool_call_id tool-call-id))]
-    (if-let [tcs (deserialize-tool-calls tool-calls)]
-      (assoc chat :tool_calls tcs)
-      chat)))
-
-(defn- memory-msgs->chat-msgs
-  "Convert memory-format messages to chat-history format (chronological).
-   Explicit facts are excluded; they appear in the [memory] context block."
-  [memory-msgs]
-  (mapv memory-msg->chat-msg
-        (remove #(= "fact" (:msg/kind %)) memory-msgs)))
-
-(defn- fact-msg? [msg]
-  (= "fact" (:msg/kind msg)))
-
-(defn- format-fact-line
-  [{:msg/keys [text topic tags]}]
-  (let [tags-str (when (and (string? tags) (not (str/blank? tags)))
-                   (str " (" tags ")"))]
-    (cond
-      (str/blank? topic) (str "- " text)
-      tags-str (str "- " topic tags-str ": " text)
-      :else (str "- " topic ": " text))))
-
-(defn- format-memory-block
-  [fact-msgs]
-  (str "[memory]\n"
-       (str/join "\n" (map format-fact-line (sort-by :msg/timestamp fact-msgs)))
-       "\n[/memory]"))
-
-(defn- split-facts-and-chat
-  [memory-msgs]
-  [(filterv fact-msg? memory-msgs)
-   (vec (remove fact-msg? memory-msgs))])
+(defn compose-context
+  "Build memory-augmented context for the LLM call.
+   Delegates to kschltz.agent.context/compose-context."
+  [state user-input]
+  (context/compose-context state user-input))
 
 (defn- default-agent-tools
   [memory-store session-id memory-backend]
@@ -377,7 +245,7 @@
                              (catch Exception _ [])))
          start-history   (if (seq initial)
                            (vec initial)
-                           (memory-msgs->chat-msgs (or loaded-history [])))]
+                           (context/memory-msgs->chat-msgs (or loaded-history [])))]
      (clojure.core/agent (merge default-state
                                 {:base-url       base-url
                                  :api-key        api-key
@@ -419,65 +287,6 @@
       (dissoc :memory-backend)
       (dissoc :session-id)))
 
-(defn- history->memory-msgs
-  "Convert in-agent chat history to memory-format messages for composition."
-  [history]
-  (vec
-   (map-indexed (fn [idx msg]
-                  (let [{:keys [role text tool-calls tool-call-id]}
-                        (chat-msg->memory-msg msg)
-                        {:keys [msg-id timestamp]} msg]
-                    (cond-> {:msg/role role :msg/text text}
-                      msg-id (assoc :msg/id msg-id)
-                      timestamp (assoc :msg/timestamp timestamp)
-                      tool-calls (assoc :msg/tool-calls tool-calls)
-                      tool-call-id (assoc :msg/tool-call-id tool-call-id)
-                      (and (not timestamp) (not msg-id)) (assoc :msg/timestamp idx))))
-                history)))
-
-(defn compose-context
-  "Build memory-augmented context for the LLM call.
-   Retrieves semantically relevant messages, merges with recent in-agent
-   history via :memory-strategy (default :hybrid), deduped and sorted."
-  [{:keys [session-id memory-store memory-backend history memory-max-chars
-           memory-relevant-limit memory-recent-limit memory-strategy]
-    :or   {memory-relevant-limit 5 memory-recent-limit 10 memory-strategy :hybrid}}
-   user-input]
-  (if (and memory-store session-id)
-    (let [relevant (try
-                     (memory/retrieve-relevant
-                      {:backend memory-backend
-                       :session-id session-id
-                       :connection memory-store
-                       :query user-input
-                       :limit memory-relevant-limit})
-                     (catch Exception _ []))
-          recent   (history->memory-msgs history)
-          composed (memory/compose {:strategy memory-strategy
-                                    :relevant relevant
-                                    :recent recent
-                                    :relevant-limit memory-relevant-limit
-                                    :recent-limit memory-recent-limit})
-          [facts chat-msgs] (split-facts-and-chat composed)
-          memory-block (when (seq facts)
-                         [{:role "system" :content (format-memory-block facts)}])
-          chat-context (sanitize-context-messages
-                        (mapv #(truncate-chat-message % memory-max-chars)
-                              (memory-msgs->chat-msgs chat-msgs)))]
-      (into (vec memory-block) chat-context))
-    (sanitize-context-messages
-     (mapv #(truncate-chat-message % memory-max-chars) history))))
-
-(defn- cap-history
-  "Cap history to :history-limit messages. Older messages are persisted in
-   Datalevin and available via semantic retrieval. Returns state with :history trimmed."
-  [state]
-  (if-let [limit (:history-limit state)]
-    (let [h (:history state)]
-      (if (> (count h) limit)
-        (assoc state :history (vec (take-last limit h)))
-        state))
-    state))
 
 (defn- fire-on-thought
   "Fire the on-thought callback if present. Catches errors so loop continues."
@@ -509,7 +318,7 @@
     (notify-store-result state (:role memory-msg) store-result)
     {:msg-id    msg-id
      :timestamp ts
-     :chat-msg  (memory-msg->chat-msg
+     :chat-msg  (context/memory-msg->chat-msg
                  {:msg/id msg-id
                   :msg/role (:role memory-msg)
                   :msg/text (:text memory-msg)
@@ -526,7 +335,7 @@
       (let [{:keys [session-id memory-store memory-backend]} state
             ts           (System/currentTimeMillis)
             user-id      (str "msg-" ts "-u-" (rand-int 100000))
-            user-memory  (chat-msg->memory-msg {:role "user" :content user-input})
+            user-memory  (context/chat-msg->memory-msg {:role "user" :content user-input})
             user-result  (memory/store-message {:backend memory-backend
                                                 :session-id session-id
                                                 :connection memory-store
@@ -535,7 +344,7 @@
                                                                 :timestamp ts)})
             _            (notify-store-result state "user" user-result)
             stored-msgs  (mapv (fn [[idx msg]]
-                                 (let [memory-msg (assoc (chat-msg->memory-msg msg)
+                                 (let [memory-msg (assoc (context/chat-msg->memory-msg msg)
                                                          :timestamp (+ ts 1 idx))]
                                    (store-memory-chat-msg state session-id memory-store memory-backend
                                                           (str "x" idx) memory-msg)))
@@ -620,12 +429,12 @@
   [state {:keys [user-text turn-messages]}]
   (if (and (:base-url state) (:model state))
     (let [max-chars    (:memory-max-chars state)
-          ctx          (compose-context state user-text)
+          ctx          (context/compose-context state user-text)
           turn-msgs'   (when turn-messages
-                         (mapv #(truncate-chat-message % max-chars) turn-messages))
+                         (mapv #(context/truncate-chat-message % max-chars) turn-messages))
           api-messages (if turn-msgs'
                          (into (vec ctx) turn-msgs')
-                         (conj (vec ctx) (truncate-chat-message
+                         (conj (vec ctx) (context/truncate-chat-message
                                           {:role "user" :content user-text}
                                           max-chars)))
           api-tools    (openai-tools (:tools state))]
@@ -828,7 +637,7 @@
             state'   (-> state
                          (assoc :current-response response)
                          (update :history into entries)
-                         cap-history)]
+                         context/cap-history)]
         (doseq [item items]
           (deliver-response (merge item (select-keys state [:on-response])) response))
         state')
@@ -950,7 +759,7 @@
          entries  (history-entries-for-exchange [{:text message}] stored :transcript transcript)]
      (send ag update :history into entries)
      (await ag)
-     (send ag cap-history)
+     (send ag context/cap-history)
      (await ag)
      response)))
 

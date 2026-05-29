@@ -1,6 +1,7 @@
 (ns kschltz.agent.core-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [kschltz.agent.context :as ctx]
             [kschltz.agent.core :as sut]
             [kschltz.agent.memory :as memory]
             [kschltz.agent.http :as http]
@@ -359,7 +360,7 @@
                                                 :connection store
                                                 :limit 5})
             user  (first msgs)
-            ctx   (sut/compose-context @ag "follow-up")]
+            ctx   (ctx/compose-context @ag "follow-up")]
         (is (= long-text (:msg/text user)) "persisted text is not truncated")
         (is (<= (count (:content (first ctx))) 32))
         (is (str/ends-with? (:content (first ctx)) "…")))
@@ -380,7 +381,7 @@
           relevant [{:msg/id "a" :msg/role "user" :msg/text "old user" :msg/timestamp 10}
                     {:msg/id "c" :msg/role "user" :msg/text "rel only" :msg/timestamp 30}]]
       (with-redefs [memory/retrieve-relevant (fn [_] relevant)]
-        (let [ctx (sut/compose-context state "query")]
+        (let [ctx (ctx/compose-context state "query")]
           (is (= 3 (count ctx)))
           (is (= ["rel only" "recent user" "recent reply"]
                  (mapv :content ctx)))))))
@@ -389,4 +390,4 @@
     (testing "compose-context without memory returns in-agent history as-is"
       (let [state {:history [{:role "user" :content "hello"}]}]
         (is (= [{:role "user" :content "hello"}]
-               (sut/compose-context state "query")))))))
+               (ctx/compose-context state "query")))))))

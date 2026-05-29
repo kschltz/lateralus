@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [kschltz.agent.context :as ctx]
             [kschltz.agent.core :as core]
             [kschltz.agent.memory :as memory]
             [kschltz.agent.memory.datalevin :as dlevin]
@@ -109,7 +110,7 @@
                      :memory-relevant-limit 5
                      :memory-recent-limit   10
                      :memory-strategy       :hybrid}
-          ctx       (core/compose-context state "color")]
+          ctx       (ctx/compose-context state "color")]
       (is (= "system" (:role (first ctx))))
       (is (str/includes? (:content (first ctx)) "[memory]"))
       (is (str/includes? (:content (first ctx)) "Favorite color is teal"))

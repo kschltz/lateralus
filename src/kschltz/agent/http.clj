@@ -37,13 +37,25 @@
       (conj (vec chat-history)
             {:role "user" :content message})))
 
+(defn- ensure-string-message-content
+  "OpenAI-compatible APIs require string :content; tool results may be numbers."
+  [msgs]
+  (mapv (fn [m]
+          (cond-> m
+            (contains? m :content)
+            (update :content #(str (or % "")))
+            (contains? m :reasoning_content)
+            (update :reasoning_content #(when (some? %) (str %)))))
+        msgs))
+
 (m/=> completion-request mem-schemas/CompletionRequestFn)
 (defn- completion-request
   [url api-key model message & [opts]]
   (let [{:keys [chat-history messages tools]
          :or   {chat-history []}}
         (or opts {})
-        msgs (build-completion-messages message chat-history messages)
+        msgs (ensure-string-message-content
+               (build-completion-messages message chat-history messages))
         url  (format "%s/v1/chat/completions" url)
         body (cond-> {:model model :messages msgs}
                tools (assoc :tools tools))
@@ -62,12 +74,20 @@
                         {:status status :body error-body :url url})))
       (:body resp))))
 
+(defn- normalize-completion-opts
+  "Coerce message content before Malli input validation on completion-request."
+  [opts]
+  (cond-> (or opts {})
+    (:messages opts) (update :messages ensure-string-message-content)
+    (seq (:chat-history opts [])) (update :chat-history ensure-string-message-content)))
+
 (defn completion
   "Public entry; coerces keyword opts to a map for instrumented completion-request."
   [url api-key model message & opts]
-  (if (seq opts)
-    (completion-request url api-key model message (apply hash-map opts))
-    (completion-request url api-key model message)))
+  (let [opts'  (if (seq opts) (apply hash-map opts) {})
+        opts'' (normalize-completion-opts opts')
+        msg'   (when (some? message) (str message))]
+    (completion-request url api-key model msg' opts'')))
 
 (defn get-models [base-url api-key]
   (let [url (format "%s/v1/models" base-url)

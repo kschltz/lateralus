@@ -58,7 +58,7 @@
   [msg max-chars]
   (cond-> msg
     (contains? msg :content)
-    (update :content truncate-text max-chars)
+    (update :content #(truncate-text (str %) max-chars))
     (:tool_calls msg)
     (update :tool_calls truncate-tool-calls max-chars)))
 
@@ -89,13 +89,17 @@
 
             ;; Tool result message -> plain text summary
             (= (:role msg) "tool")
-            {:role "user"
-             :content (str "[Tool result: "
-                          (subs (:content msg "") 0 (min 500 (count (:content msg ""))))
-                          "]")}
+            (let [c (str (or (:content msg) ""))]
+              {:role "user"
+               :content (str "[Tool result: "
+                            (subs c 0 (min 500 (count c)))
+                            "]")})
 
-            ;; Normal message - strip non-OpenAI keys
-            :else (into {} (filter (fn [[k _]] (contains? openai-msg-keys k))) msg)))
+            ;; Normal message - strip non-OpenAI keys, coerce content to string
+            :else (let [m (into {} (filter (fn [[k _]] (contains? openai-msg-keys k)) msg))]
+                    (cond-> m
+                      (contains? m :content)
+                      (update :content #(str (or % "")))))))
         messages))
 
 ;; ---- Serialization ----
@@ -117,13 +121,13 @@
   "Convert an OpenAI chat message to Datalevin storage format (full text, no truncation)."
   [{:keys [role content tool_calls tool_call_id]}]
   (cond-> {:role (or role "user")
-           :text (or content "")}
+           :text (str (or content ""))}
     (seq tool_calls) (assoc :tool-calls (serialize-tool-calls tool_calls))
     tool_call_id (assoc :tool-call-id tool_call_id)))
 
 (defn memory-msg->chat-msg
   [{:msg/keys [id role text timestamp tool-calls tool-call-id]}]
-  (let [chat (cond-> {:role (or role "user") :content (or text "")}
+  (let [chat (cond-> {:role (or role "user") :content (str (or text ""))}
                id (assoc :msg-id id)
                timestamp (assoc :timestamp timestamp)
                tool-call-id (assoc :tool_call_id tool-call-id))]
@@ -175,7 +179,7 @@
                       msg-id (assoc :msg/id msg-id)
                       timestamp (assoc :msg/timestamp timestamp)
                       tool-calls (assoc :msg/tool-calls tool-calls)
-                      tool-call-id (assoc :msg/timestamp tool-call-id)
+                      tool-call-id (assoc :msg/tool-call-id tool-call-id)
                       (and (not timestamp) (not msg-id)) (assoc :msg/timestamp idx))))
                 history)))
 

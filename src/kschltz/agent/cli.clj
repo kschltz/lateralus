@@ -2,9 +2,9 @@
   "CLI entry point for the Lateralus agent.
 
    Parses command-line flags, builds agent config, and runs in one of:
-     - interactive mode (-i) — REPL loop with :quit/:history commands
+     - interactive mode (default) — REPL loop with :quit/:history commands
      - daemon mode (-d) — backgrounds the agent loop, nohup-style
-     - one-shot mode — single prompt, exit"
+     - one-shot mode — single prompt or stdin, then exit"
   (:require [kschltz.agent.core :as core]
             [kschltz.agent.tools.portal :as portal]
             [kschltz.agent.memory.embedding :as embedding]
@@ -57,12 +57,15 @@
    Supports both -x value and --flag value formats."
   [args]
   (loop [[arg value & next-rem] args
-         opts {}]
+         opts {:interactive true}]
     (if-not arg
       opts
       (cond
         (#{"-i" "--interactive"} arg)
         (recur next-rem (assoc opts :interactive true))
+
+        (#{"--no-interactive" "--batch"} arg)
+        (recur next-rem (assoc opts :interactive false))
 
         (#{"-d" "--daemon"} arg)
         (recur next-rem (assoc opts :daemon true))
@@ -149,7 +152,7 @@
           (throw (ex-info "Unknown flag" {:flag arg}))
 
           :else
-          (assoc opts :prompt arg)))))
+          (assoc opts :prompt arg :interactive false)))))
 
 (defn- prompt-loop
   "Interactive REPL loop. Reads from stdin, sends to agent, prints response."
@@ -203,8 +206,11 @@
   []
   (println "Usage: lateralus [prompt] [options]")
   (println "")
+  (println "Defaults: interactive REPL with session memory (session id \"default\").")
+  (println "")
   (println "Options:")
-  (println "  -i, --interactive              Interactive loop")
+  (println "  -i, --interactive              Interactive loop (default when no prompt)")
+  (println "      --no-interactive, --batch  One-shot from stdin; exit if no input")
   (println "  -d, --daemon                    Run as background daemon (nohup-style)")
   (println "  -m, --model MODEL              LLM model (env: LATERALUS_MODEL)")
   (println "  -u, --base-url URL             LLM API base URL (env: LATERALUS_BASE_URL)")
@@ -243,7 +249,12 @@
                       (case emb-method
                         :langchain4j embedding/default-langchain4j-model
                         :http embedding/default-http-model
-                        embedding/default-langchain4j-model))]
+                        embedding/default-langchain4j-model))
+        memory-on? (not (false? (:memory-enabled cli-opts)))
+        session-id (when memory-on?
+                     (or (:session cli-opts)
+                         (env-getter "LATERALUS_SESSION")
+                         "default"))]
     (cond-> {:base-url (str-or :base-url "LATERALUS_BASE_URL" "http://localhost:11434")
              :api-key (or (:api-key cli-opts) (env-getter "LATERALUS_API_KEY"))
              :model (str-or :model "LATERALUS_MODEL" "deepseek-v4-flash:cloud")
@@ -260,13 +271,9 @@
                                              " => " (or (:error r) (:result r)))))))}
       (false? (:memory-enabled cli-opts))
       (assoc :memory-enabled false :session-id nil)
-      (contains? cli-opts :session)
-      (assoc :session-id (:session cli-opts))
-      (env-getter "LATERALUS_SESSION")
-      (assoc :session-id (env-getter "LATERALUS_SESSION"))
-      ;; else omit :session-id — make-agent defaults to "default"
-      (not (false? (:memory-enabled cli-opts)))
-      (assoc :memory-embedding-method emb-method
+      memory-on?
+      (assoc :session-id session-id
+             :memory-embedding-method emb-method
              :memory-embedding-model emb-model)
       (int-or :embedding-dims "LATERALUS_MEMORY_EMBEDDING_DIMS")
       (assoc :memory-embedding-dims (int-or :embedding-dims "LATERALUS_MEMORY_EMBEDDING_DIMS"))
@@ -359,14 +366,18 @@
               (one-shot ag (:prompt opts) timeout-ms)
               (core/stop! ag))
 
-          ;; One-shot from stdin
+          ;; Interactive default, or one-shot from stdin when --batch
           :else
-          (if-let [stdin-input (read-line)]
+          (if (:interactive opts)
             (do (future (core/start! ag))
-                (one-shot ag stdin-input timeout-ms)
+                (prompt-loop ag timeout-ms)
                 (core/stop! ag))
-            (do (println "No prompt provided. Use -i for interactive, -d for daemon mode, or provide a prompt.")
-                (System/exit 1))))))))
+            (if-let [stdin-input (read-line)]
+              (do (future (core/start! ag))
+                  (one-shot ag stdin-input timeout-ms)
+                  (core/stop! ag))
+              (do (println "No prompt provided. Pass a prompt, use --batch with stdin, or omit --batch for interactive.")
+                  (System/exit 1)))))))))
 
 (defn -main
   "CLI entrypoint."

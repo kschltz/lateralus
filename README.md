@@ -7,14 +7,14 @@ Clojure agent with session memory (Datalevin + LangChain4j embeddings), REPL eva
 ```bash
 cd lateralus
 
-# One-shot prompt (default session "default", memory on)
+# Interactive (default)
+clojure -M:run-m
+
+# One-shot prompt (memory on, session "default")
 clojure -M:run-m "What is 2+2?"
 
-# Interactive
-clojure -M:run-m -i
-
 # Named session
-clojure -M:run-m -s my-project -i
+clojure -M:run-m -s my-project
 
 # Same CLI via :cli alias
 clojure -M:cli -h
@@ -43,7 +43,8 @@ clojure -M:cli -h
 | `--max-tool-calls` | `LATERALUS_MAX_TOOL_CALLS` | Tool rounds per message |
 | `-t`, `--turns` | — | Max turns (default 5) |
 | `-r`, `--retries` | — | Tool error retries (default 3) |
-| `-i`, `--interactive` | — | Interactive loop |
+| `-i`, `--interactive` | — | Interactive loop (default when no prompt) |
+| `--no-interactive`, `--batch` | — | One-shot from stdin; exit if no input |
 | `-h`, `--help` | — | Help |
 | `-v`, `--version` | — | Version |
 
@@ -53,11 +54,42 @@ Without `-s`, `make-agent` uses session `"default"` and enables memory. Use `--n
 
 Default tools: `repl-eval`, `web-search`, `remember` (when memory is on).
 
+## Uberjar
+
+Build (tests + jar):
+
+```bash
+clojure -T:build ci
+```
+
+Jar only:
+
+```bash
+clojure -T:build uber
+```
+
+Output:
+
+- `target/net.clojars.kschltz/lateralus-0.1.0-SNAPSHOT.jar` — standalone jar with Datalevin native libs for all platforms
+- `target/lateralus` — launcher script with required JVM flags baked in
+
+Run (recommended — includes Datalevin `--add-opens` and `--enable-native-access`):
+
+```bash
+./target/lateralus
+./target/lateralus "What is 2+2?"
+./target/lateralus -s my-project
+```
+
+Plain `java -jar` also works; the jar manifest carries the Datalevin module opens. On Java 24+, prefer the launcher to suppress native-access warnings.
+
 ## Development
 
 ```bash
 clojure -T:build test
 ```
+
+Dev and test aliases include the same Datalevin JVM flags as the uberjar launcher (`:jvm-base`).
 
 Memory system details: [docs/memory-system-mvi.md](docs/memory-system-mvi.md).
 

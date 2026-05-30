@@ -22,6 +22,23 @@
       (is (= 120000
              (#'cli/resolve-response-timeout-ms {} :env-getter env-getter))))))
 
+(deftest parse-args-interactive-defaults
+  (testing "interactive and memory are on by default"
+    (let [empty (#'cli/parse-args [])
+          with-prompt (#'cli/parse-args ["hello"])]
+      (is (= true (:interactive empty)))
+      (is (nil? (:prompt empty)))
+      (is (not (false? (:memory-enabled empty))))
+      (is (= false (:interactive with-prompt)))
+      (is (= "hello" (:prompt with-prompt)))))
+  (testing "--no-interactive disables interactive default"
+    (is (= false (:interactive (#'cli/parse-args ["--batch"]))))))
+
+(deftest build-make-agent-opts-default-session
+  (testing "build-make-agent-opts sets default session id when memory is on"
+    (let [opts (cli/build-make-agent-opts {} :env-getter (constantly nil))]
+      (is (= "default" (:session-id opts))))))
+
 (deftest parse-args-session-flag
   (testing "-s / --session sets :session"
     (is (= "my-session" (:session (#'cli/parse-args ["-s" "my-session" "hello"]))))
@@ -163,8 +180,7 @@
 (deftest cli-memory-opt-in
   (testing "build-make-agent-opts enables default session when no -s"
     (let [opts (cli/build-make-agent-opts {} :env-getter (constantly nil))]
-      (is (not (contains? opts :session-id))
-          "omit session-id so make-agent uses default")
+      (is (= "default" (:session-id opts)))
       (let [ag (core/make-agent (assoc opts :base-url "http://mock" :model "mock"))]
         (is (= "default" (core/get-session-id ag)))
         (is (some? (core/get-memory-store ag)))

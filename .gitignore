@@ -33,7 +33,18 @@
 .env.*
 !.env.example
 .pi-loop.json.lock
+*.pid
 
-# Test artifacts
-test-sessions-*/
+# Session databases and local data
 sessions/
+test-sessions-*/
+.lateralus/
+*.db
+*.dat
+
+# OS and IDE artifacts
+.DS_Store
+.idea/
+*.iml
+node_modules/
+*.log

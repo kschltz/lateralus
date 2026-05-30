@@ -16,6 +16,7 @@
             [kschltz.agent.tools.web :as web]
             [kschltz.agent.tools.remember :as remember]
             [kschltz.agent.tools.portal :as portal]
+            [kschltz.agent.tools.rewrite :as rewrite]
             [clojure.string :as str]))
 
 ;; ---- REPL Usage ----
@@ -147,6 +148,7 @@
   [memory-store session-id memory-backend]
   (vec (remove nil?
                [(repl/repl-eval-tool)
+                (rewrite/clj-edit-tool)
                 (web/web-search-tool)
                 (portal/visualize-tool)
                 (when (and memory-store session-id)
@@ -481,6 +483,16 @@
    (add-repl-eval-tool! ag {}))
   ([ag opts]
    (let [tool (repl/repl-eval-tool opts)]
+     (register-tool! ag tool)
+     tool)))
+
+(defn add-clj-edit-tool!
+  "Add a :clj-edit tool for structured Clojure/EDN source editing.
+   Uses rewrite-clj for comment/formatting-preserving edits."
+  ([ag]
+   (add-clj-edit-tool! ag {}))
+  ([ag opts]
+   (let [tool (rewrite/clj-edit-tool opts)]
      (register-tool! ag tool)
      tool)))
 

@@ -78,7 +78,7 @@
       (is (= "e2e-session" (core/get-session-id ag)))
       (is (= on-resp (:on-response @ag)))
       (is (= on-err (:on-error @ag)))
-      (is (= 4 (count (core/get-tools ag))))
+      (is (= 5 (count (core/get-tools ag))))
       (is (some? (core/get-memory-store ag))))))
 
 (deftest e2e-make-agent-without-memory
@@ -263,17 +263,17 @@
                        :parameters [:map]
                        :fn (constantly "ok")}
           ag (fresh-agent {})]
-      (is (= 3 (count (core/get-tools ag))))
-      (core/register-tool! ag custom-tool)
       (is (= 4 (count (core/get-tools ag))))
+      (core/register-tool! ag custom-tool)
+      (is (= 5 (count (core/get-tools ag))))
       (is (some #(= "custom-e2e" (:name %)) (core/get-tools ag)))
       (core/unregister-tool! ag "custom-e2e")
-      (is (= 3 (count (core/get-tools ag)))))))
+      (is (= 4 (count (core/get-tools ag)))))))
 
 (deftest e2e-tool-registration-via-make-agent
   (testing "tools can be passed to make-agent"
     (let [ag (fresh-agent {:tools [(repl-tools/repl-eval-tool)]})]
-      (is (= 3 (count (core/get-tools ag))))
+      (is (= 4 (count (core/get-tools ag))))
       (is (some #(= "repl-eval" (:name %)) (core/get-tools ag))))))
 
 ;; ============================================================
@@ -353,7 +353,7 @@
       (is (false? (core/running? ag)))
       (is (= "lifecycle-test" (core/get-session-id ag)))
       (is (some? (core/get-memory-store ag)))
-      (is (= 4 (count (core/get-tools ag))))
+      (is (= 5 (count (core/get-tools ag))))
 
       ;; Phase 2: Send message with handler, start loop
       (let [p           (core/send-message! ag "hello"

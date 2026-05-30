@@ -44,6 +44,29 @@
            (#'sut/normalize-visualize-args
             "[:div {:style \"color: red\"} \"hello\"]")))))
 
+(deftest sanitize-hiccup-handles-svg-with-attrs
+  (testing "sanitize-hiccup does not ClassCastException on hiccup with attr maps"
+    ;; Regression: local binding `rest` shadowed clojure.core/rest,
+    ;; causing (rest rest) to call the ChunkedSeq as a function.
+    (let [svg [:svg {:width 300 :height 200 :xmlns "http://www.w3.org/2000/svg"}
+               [:rect {:x 0 :y 0 :width 300 :height 200 :fill "#1a1a2e" :rx 16}]
+               [:circle {:cx 150 :cy 100 :r 60 :fill "#e94560" :opacity 0.9}]
+               [:text {:x 150 :y 185 :text-anchor "middle" :fill "#eee"
+                       :font-size 14 :font-family "sans-serif"}
+                "Yes, I can do SVG!"]]]
+      (let [result (sut/sanitize-hiccup svg)]
+        (is (vector? result))
+        (is (= :svg (first result)))
+        (is (map? (second result)))
+        ;; 3 child elements after tag + attrs
+        (is (= 3 (count (nthrest result 2)))))))
+
+  (testing "sanitize-hiccup handles hiccup nodes without attr maps"
+    ;; Nodes without attr maps get nil in the attrs position
+    (let [simple [:div "hello"]]
+      (let [result (sut/sanitize-hiccup simple)]
+        (is (= [:div nil "hello"] result))))))
+
 (deftest visualize-tool-registers-openai-tool-definition
   (testing "visualize-tool returns tool metadata and Malli parameters"
     (let [tool (sut/visualize-tool)]

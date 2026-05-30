@@ -168,12 +168,13 @@
   [data]
   (cond
     (hiccup-node? data)
-    (let [[tag & rest] data
-          [attrs & children] (if (map? (first rest))
-                               [(first rest) (rest rest)]
-                               [nil rest])]
+    (let [tag      (first data)
+          tail     (rest data)
+          attrs?   (map? (first tail))
+          attrs    (when attrs? (first tail))
+          children (if attrs? (rest tail) tail)]
       (into [tag (when attrs (sanitize-attrs attrs))]
-            (map sanitize-hiccup children)))
+            (mapv sanitize-hiccup children)))
 
     (vector? data) (mapv sanitize-hiccup data)
     (list? data)   (map sanitize-hiccup data)

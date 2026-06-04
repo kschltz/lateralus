@@ -30,7 +30,7 @@
 ;; 1. CHAT! ONE-SHOT
 ;; ============================================================
 
-(deftest real-chat!-returns-response
+(deftest ^:integration real-chat!-returns-response
   (when-llm
    (testing "chat! returns a non-empty response from real LLM"
      (let [ag   (core/make-agent {:base-url base-url
@@ -46,7 +46,7 @@
 ;; 2. AGENT LOOP: SEND → RECEIVE
 ;; ============================================================
 
-(deftest real-loop-processes-messages
+(deftest ^:integration real-loop-processes-messages
   (when-llm
    (testing "start! processes queued messages via real LLM"
      (let [ag          (core/make-agent {:base-url base-url
@@ -66,7 +66,7 @@
 ;; 3. ON-RESPONSE HANDLER
 ;; ============================================================
 
-(deftest real-on-response-called
+(deftest ^:integration real-on-response-called
   (when-llm
    (testing "on-response handler receives real LLM response"
      (let [responses (atom [])
@@ -87,7 +87,7 @@
 ;; 4. PER-MESSAGE HANDLER
 ;; ============================================================
 
-(deftest real-per-message-handler-called
+(deftest ^:integration real-per-message-handler-called
   (when-llm
    (testing "per-message handler receives real LLM response"
      (let [handler-results (atom [])
@@ -108,7 +108,7 @@
 ;; 5. MEMORY ROUND-TRIP
 ;; ============================================================
 
-(deftest real-memory-stores-and-retrieves
+(deftest ^:integration real-memory-stores-and-retrieves
   (when-llm
    (testing "agent stores exchanges in Datalevin and retrieves them"
      (let [session-id (str "real-e2e-" (System/currentTimeMillis))
@@ -143,7 +143,7 @@
 ;; 6. CHAT! WITH HISTORY
 ;; ============================================================
 
-(deftest real-chat!-with-history
+(deftest ^:integration real-chat!-with-history
   (when-llm
    (testing "chat! builds history across multiple calls"
      (let [ag (core/make-agent {:base-url base-url
@@ -161,7 +161,7 @@
 ;; 7. ON-ERROR WITH REAL LLM (bad model)
 ;; ============================================================
 
-(deftest real-on-error-bad-model
+(deftest ^:integration real-on-error-bad-model
   (when-llm
    (testing "custom on-error handler catches real API error"
      (let [errors      (atom [])
@@ -181,7 +181,7 @@
 ;; 8. FULL LIFECYCLE
 ;; ============================================================
 
-(deftest real-full-lifecycle
+(deftest ^:integration real-full-lifecycle
   (when-llm
    (testing "complete lifecycle: create → loop → chat → memory → stop → reset"
      (let [on-resp-calls (atom 0)
@@ -230,7 +230,7 @@
 ;; 9. LIVE EMBEDDINGS (optional)
 ;; ============================================================
 
-(deftest real-embed-returns-vector
+(deftest ^:integration real-embed-returns-vector
   (when-llm
    (testing "http/embed returns a numeric vector from live endpoint"
      (let [model (or (System/getenv "LATERALUS_EMBEDDING_MODEL") "nomic-embed-text")

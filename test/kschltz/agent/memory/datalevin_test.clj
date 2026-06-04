@@ -224,3 +224,43 @@
         (is (= "m2" (:msg/id (first recent))))
         (is (= "m3" (:msg/id (second recent)))))
       (dlevin/close-session-store store))))
+
+(deftest test-reindex-pending-recovery
+  (testing "unindexed messages are recovered on session startup"
+    (let [session-id (make-session-id)
+          fail-embed (atom true)
+          controlled-embed-fn (fn [text]
+                                (if @fail-embed
+                                  nil  ;; First pass: embedding fails
+                                  ;; Second pass (reindex): return a vector
+                                  (vec (for [i (range 384)]
+                                         (double (+ 0.01 (* (mod (+ (hash text) i) 1000) 0.001)))))))
+          store (test-store session-id {:embedding-fn controlled-embed-fn})]
+      ;; Store a message — embedding fails, :msg/indexed stays false
+      (let [result (dlevin/store-message! store
+                                           {:session-id session-id :id "pending-1"
+                                            :role "user" :text "hello"
+                                            :timestamp 1000})]
+        (is (:stored result))
+        (is (not (:indexed result)))
+        (is (= "embedding-failed" (:reason result))))
+      ;; Now allow embeddings to succeed and reindex
+      (reset! fail-embed false)
+      (let [reindexed (dlevin/reindex-pending! store)]
+        (is (= 1 reindexed) "one pending message should be reindexed"))
+      ;; Verify the message is now findable via search
+      (let [results (dlevin/search-relevant! store "hello" session-id 5)]
+        (is (pos? (count results))
+            "reindexed message should be findable via vector search"))
+      (dlevin/close-session-store store))))
+
+(deftest test-corrupt-indicator-selective
+  (testing "corrupt-indicator? only matches corruption errors"
+    ;; Access the private function via var
+    (let [corrupt-indicator? #'kschltz.agent.memory.datalevin/corrupt-indicator?]
+      (is (true? (corrupt-indicator? (Exception. "MDB_CORRUPT: page mismatch"))))
+      (is (true? (corrupt-indicator? (Exception. "Invalid header: bad page #42"))))
+      (is (true? (corrupt-indicator? (Exception. "map validation failed"))))
+      (is (false? (corrupt-indicator? (Exception. "No space left on device"))))
+      (is (false? (corrupt-indicator? (Exception. "Permission denied"))))
+      (is (false? (corrupt-indicator? (Exception. "Connection refused")))))))

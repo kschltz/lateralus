@@ -303,9 +303,23 @@
 
 ;; ---- Queue Operations ----
 
-(defn drain-queue
-  "Drain all pending items from the queue, returning [state-sans-queue items].
+(defn drain-queue!
+  "Atomically swap out the message queue via a single agent action.
+   Returns [items state-after-drain]. No TOCTOU race — read and clear
+   happen in one agent action, so concurrent send-message! cannot be lost.
    Each item is {:text ... :promise <promise> :handler <fn|nil>}."
+  [ag]
+  (let [result-promise (promise)]
+    (send ag (fn [state]
+               (let [items (:message-queue state)]
+                 (deliver result-promise [items (assoc state :message-queue [])])
+                 (assoc state :message-queue []))))
+    (await ag)
+    @result-promise))
+
+(defn drain-queue
+  "Pure drain on a state map (no agent action). Used by tests only.
+   Returns [items state-sans-queue]."
   [state]
   [(:message-queue state) (assoc state :message-queue [])])
 
@@ -395,15 +409,19 @@
         :else
         (let [next-state
               (try
-                (let [[items state'] (drain-queue state)]
+                (let [[items _] (drain-queue! ag)]
                   (if (empty? items)
-                    (do (queue-wait state')
+                    (do (queue-wait @ag)
                         {:action :idle :turn turn})
-                    (let [_         (do (send ag #(assoc % :message-queue []))
-                                        (await ag))
+                    (let [state'    @ag
                           result    (process-messages ag state' items)
                           next-turn (inc turn)]
-                      (send ag (fn [_] (assoc result :turns next-turn)))
+                      ;; Merge only changed keys so concurrent send-message!
+                      ;; enqueues are not overwritten by a full-state replace.
+                      (send ag (fn [s]
+                                 (merge s
+                                        (select-keys result [:current-response :history])
+                                        {:turns next-turn})))
                       (await ag)
                       {:action :processed :turn next-turn :result result})))
                 (catch Exception e

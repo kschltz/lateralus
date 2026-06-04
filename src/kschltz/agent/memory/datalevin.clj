@@ -23,6 +23,7 @@
    :msg/role           {:db/valueType :db.type/string}
    :msg/text           {:db/valueType :db.type/string}
    :msg/timestamp      {:db/valueType :db.type/long}
+   :msg/indexed        {:db/valueType :db.type/boolean}
    :msg/tool-name      {:db/valueType :db.type/string}
    :msg/tool-result    {:db/valueType :db.type/string}
    :msg/tool-calls     {:db/valueType :db.type/string}
@@ -58,27 +59,106 @@
                                 ".corrupt-" (System/currentTimeMillis)))]
       (.renameTo dir corrupt))))
 
+(defn- corrupt-indicator?
+  "True when the exception strongly suggests Datalevin/LMDB corruption
+   (e.g. map/validation errors, missing required keys in stored data).
+   Disk-full, permissions, and other transient errors should NOT trigger recovery."
+  [^Throwable e]
+  (let [msg (.getMessage e)]
+    (boolean
+      (some #(re-find % (or msg ""))
+            [#"(?i)corrupt"
+             #"(?i)invalid header"
+             #"(?i)bad page"
+             #"(?i)map validation"
+             #"(?i)read-only|read only"
+             #"(?i) MDB_PAGE_NOTFOUND"
+             #"(?i) MDB_CORRUPT"]))))
+
 (defn- create-conn-with-recovery
-  "Open a Datalevin conn; on failure rename the corrupt dir and retry once."
+  "Open a Datalevin conn; only renames the dir on corruption indicators,
+   not on transient errors (disk full, permissions, etc.).
+   Rethrows non-corruption exceptions so the caller can handle them."
   [db-path session-id schema]
   (try
     (d/create-conn db-path schema)
     (catch Throwable e
-      (println "Warning: corrupt session store, renaming:" db-path
-               (.getMessage e))
-      (rename-corrupt-dir! (io/file db-path))
-      (d/create-conn db-path schema))))
+      (if (corrupt-indicator? e)
+        (do
+          (println "Warning: corrupt session store, renaming:" db-path
+                   (.getMessage e))
+          (rename-corrupt-dir! (io/file db-path))
+          (d/create-conn db-path schema))
+        (do
+          (println "Error: failed to open session store:" db-path
+                   (.getMessage e))
+          (throw e))))))
 
 (defn- open-kv-with-recovery
-  "Open vector KV store; on failure rename corrupt dir and retry once."
+  "Open vector KV store; only renames the dir on corruption indicators.
+   Rethrows non-corruption exceptions so the caller can handle them."
   [kv-path session-id]
   (try
     (d/open-kv kv-path)
     (catch Throwable e
-      (println "Warning: corrupt vector store, renaming:" kv-path
-               (.getMessage e))
-      (rename-corrupt-dir! (io/file kv-path))
-      (d/open-kv kv-path))))
+      (if (corrupt-indicator? e)
+        (do
+          (println "Warning: corrupt vector store, renaming:" kv-path
+                   (.getMessage e))
+          (rename-corrupt-dir! (io/file kv-path))
+          (d/open-kv kv-path))
+        (do
+          (println "Error: failed to open vector store:" kv-path
+                   (.getMessage e))
+          (throw e))))))
+
+;; ---- Embedding computation ------------------------------------------------
+
+(defn- compute-embedding
+  "Compute embedding vector for text. Uses custom :embedding-fn if provided,
+   otherwise the configured EmbeddingProvider.
+   Returns vector of floats or nil on failure."
+  [store text]
+  (let [emb-fn (:embedding-fn store)]
+    (if emb-fn
+      (try (emb-fn text) (catch Exception _ nil))
+      (embedding/embed-text (:embedding-provider store) text))))
+
+(defn reindex-pending!
+  "Scan for messages with :msg/indexed false and retry vector indexing.
+   Called on session startup to recover from crashes between Datalog write
+   and vector index write. Returns count of messages successfully reindexed."
+  [store]
+  (let [conn       (:store store)
+        vec-index  (:vec-index store)]
+    (when (and conn vec-index)
+      (try
+        (let [pending (d/q '[:find (pull ?e [:msg/id :msg/text])
+                             :in $
+                             :where
+                             [?e :msg/indexed false]]
+                           (d/db conn))
+              ids    (mapv (comp :msg/id first) pending)
+              texts  (mapv (comp :msg/text first) pending)]
+          (when (seq ids)
+            (println "Reindexing" (count ids) "pending messages...")
+            (reduce
+              (fn [reindexed [msg-id text]]
+                (if-let [emb (compute-embedding store text)]
+                  (try
+                    (d/add-vec vec-index msg-id emb)
+                    (d/transact conn [[:db/add [:msg/id msg-id] :msg/indexed true]])
+                    (inc reindexed)
+                    (catch Exception e
+                      (println "Warning: reindex failed for" msg-id ":"
+                               (.getMessage e))
+                      reindexed))
+                  reindexed))
+              0
+              (map vector ids texts))))
+        (catch Exception e
+          (println "Warning: reindex scan failed:" (.getMessage e))
+          0)))))
 
 ;; ---- Session store creation -----------------------------------------------
 
@@ -118,31 +198,22 @@
                             (when (:model opts)
                               {:session/model (:model opts)}))]
     (d/transact conn [session-meta])
-    {:store          conn
-     :kv-store            kv-store
-     :vec-index           vec-index
-     :embedding-dims      emb-dims
-     :embedding-model     (embedding/provider-model provider)
-     :embedding-method    (embedding/provider-method provider)
-     :embedding-provider  provider
-     :base-url            base-url
-     :api-key             api-key
-     :embedding-fn        embedding-fn
-     :session-id          session-id
-     :sessions-dir        sessions-dir
-     :db-path             db-path}))
-
-;; ---- Embedding computation ------------------------------------------------
-
-(defn- compute-embedding
-  "Compute embedding vector for text. Uses custom :embedding-fn if provided,
-   otherwise the configured EmbeddingProvider.
-   Returns vector of floats or nil on failure."
-  [store text]
-  (let [emb-fn (:embedding-fn store)]
-    (if emb-fn
-      (try (emb-fn text) (catch Exception _ nil))
-      (embedding/embed-text (:embedding-provider store) text))))
+    (let [store-map {:store          conn
+                     :kv-store            kv-store
+                     :vec-index           vec-index
+                     :embedding-dims      emb-dims
+                     :embedding-model     (embedding/provider-model provider)
+                     :embedding-method    (embedding/provider-method provider)
+                     :embedding-provider  provider
+                     :base-url            base-url
+                     :api-key             api-key
+                     :embedding-fn        embedding-fn
+                     :session-id          session-id
+                     :sessions-dir        sessions-dir
+                     :db-path             db-path}]
+      ;; Recover any messages left unindexed by a previous crash
+      (reindex-pending! store-map)
+      store-map)))
 
 ;; ---- Store messages -------------------------------------------------------
 
@@ -172,13 +243,14 @@
                      (not-empty (:kind message-map))       (assoc :msg/kind (:kind message-map))
                      (not-empty (:topic message-map))      (assoc :msg/topic (:topic message-map))
                      (seq (:tags message-map))             (assoc :msg/tags (json/generate-string (:tags message-map))))]
-    (d/transact conn [entity])
+    (d/transact conn [(assoc entity :msg/indexed false)])
     (let [embedding (when-not (str/blank? text)
                       (compute-embedding store text))
           indexed?  (boolean
                      (when embedding
                        (try
                          (d/add-vec vec-index msg-id embedding)
+                         (d/transact conn [[:db/add [:msg/id msg-id] :msg/indexed true]])
                          true
                          (catch Exception e
                            (println "Warning: vector index failed for" msg-id ":"
@@ -197,7 +269,7 @@
 ;; ---- Search ---------------------------------------------------------------
 
 (def ^:private msg-pull-pattern
-  [:msg/id :msg/role :msg/text :msg/timestamp :msg/tool-calls :msg/tool-call-id
+  [:msg/id :msg/role :msg/text :msg/timestamp :msg/indexed :msg/tool-calls :msg/tool-call-id
    :msg/tool-name :msg/tool-result :msg/kind :msg/topic :msg/tags])
 
 (defn- sort-memory-msgs [msgs]

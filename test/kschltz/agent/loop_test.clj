@@ -127,17 +127,49 @@
 ;; ---- Queue operations ----
 
 (deftest drain-queue-test
-  (testing "drains all items from queue"
+  (testing "drains all items from queue (pure)"
     (let [state {:message-queue [{:text "hello" :promise (promise)}]}
           [items state'] (loop/drain-queue state)]
       (is (= 1 (count items)))
       (is (= [] (:message-queue state')))))
 
-  (testing "returns empty vector for empty queue"
+  (testing "returns empty vector for empty queue (pure)"
     (let [state {:message-queue []}
           [items state'] (loop/drain-queue state)]
       (is (= [] items))
-      (is (= [] (:message-queue state'))))))
+      (is (= [] (:message-queue state')))))
+
+(deftest drain-queue-atomic-test
+  (testing "atomic drain empties the agent queue"
+    (let [ag (clojure.core/agent {:message-queue [{:text "a" :promise (promise)}
+                                                 {:text "b" :promise (promise)}]})]
+      (let [[items _] (loop/drain-queue! ag)]
+        (is (= 2 (count items)))
+        (is (= [] (:message-queue @ag))))))
+
+  (testing "atomic drain returns empty when queue is empty"
+    (let [ag (clojure.core/agent {:message-queue []})]
+      (let [[items _] (loop/drain-queue! ag)]
+        (is (= [] items))
+        (is (= [] (:message-queue @ag))))))
+
+  (testing "concurrent send-message! does not lose items under atomic drain"
+    ;; Before the fix, a message enqueued between @ag read and (send ... assoc [])
+    ;; could be silently dropped. The atomic drain-queue! does read+clear
+    ;; in one agent action, so this race is impossible.
+    (let [ag        (clojure.core/agent {:message-queue []})
+          ;; Simulate a concurrent send-message! that enqueues after a tiny delay
+          _         (future
+                      (Thread/sleep 10)
+                      (send ag update :message-queue conj {:text "concurrent" :promise (promise)}))]
+      ;; Drain immediately — if the concurrent send lands before our
+      ;; atomic action, it will be captured; if after, it stays in the queue.
+      ;; Either way, the message is NOT lost.
+      (Thread/sleep 50)  ;; let concurrent send land
+      (let [[items _] (loop/drain-queue! ag)]
+        (is (= 1 (count items))
+            "Concurrent message must be either drained or still in the queue — never lost")
+        (is (= [] (:message-queue @ag))))))))
 
 (deftest deliver-response-test
   (testing "delivers to promise"

@@ -26,6 +26,7 @@ Hybrid memory = **top-Y relevant entries** + **last-N recent messages**, deduped
  :msg/role           {:db/valueType :db.type/string}   ;; "user" | "assistant" | "tool"
  :msg/text           {:db/valueType :db.type/string}
  :msg/timestamp      {:db/valueType :db.type/long}
+ :msg/indexed        {:db/valueType :db.type/boolean}   ;; true after vector index write; false = pending reindex
  :msg/tool-name      {:db/valueType :db.type/string}
  :msg/tool-result    {:db/valueType :db.type/string}
  :msg/tool-calls     {:db/valueType :db.type/string}  ;; JSON OpenAI tool_calls
@@ -36,6 +37,8 @@ Hybrid memory = **top-Y relevant entries** + **last-N recent messages**, deduped
 ```
 
 Vectors are **not** stored on entities. They live in a separate LMDB KV store indexed by `:msg/id`.
+
+`:msg/indexed` tracks vector-index consistency: written `false` at Datalog commit, flipped `true` after successful `add-vec`. On session startup, `reindex-pending!` scans for `:msg/indexed false` and retries vector indexing — recovering messages orphaned by crashes between the two writes.
 
 ## Session ID
 

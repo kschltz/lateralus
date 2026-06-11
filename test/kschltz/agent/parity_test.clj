@@ -47,6 +47,7 @@
 ;; ---- Minimal agent state ----
 
 (defn base-state
+  "..."
   [{:keys [client events memory-store session-id tool-specs max-retries max-tool-calls]}]
   (let [tool-specs (or tool-specs [])
         tools (mapv (fn [t] (assoc t :kschltz/registered? true)) tool-specs)
@@ -93,8 +94,26 @@
    ix/store-exchange
    ix/notify])
 
-(defn- map->ctx
-  "Build an initial ctx from a state + items + user-text + client."
+(defn stuck-loop-chain
+  "Chain assembly that includes the stuck-loop-detector after dispatch
+   so the detector runs after tool calls complete on every turn.
+   Used by fact-11 parity tests."
+  []
+  [ix/error-boundary
+   ix/compose-context
+   ix/llm-call
+   ix/parse-response
+   ix/dispatch
+   ix/stuck-loop-detector
+   ix/deliver-responses
+   ix/update-history
+   ix/store-exchange
+   ix/notify])
+
+(defn map->ctx
+  "Build an initial ctx from a state + items + user-text + client.
+   Public so other test namespaces (e.g. stuck-loop-parity) can build
+   a base ctx without duplicating boilerplate."
   [state items user-text client]
   {:agent/ref nil
    :agent/state state

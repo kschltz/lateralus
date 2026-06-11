@@ -17,13 +17,14 @@
             [kschltz.agent.context :as context]
             [kschltz.agent.http :as http]
             [kschltz.agent.llm.client :as llm-client]
-            [kschltz.agent.loop :as loop]))
+            [kschltz.agent.loop :as loop]
+            [kschltz.agent.stuck-loop :as stuck-loop]))
 
 ;; Forward declarations so the chain/enqueue lists can reference any
 ;; stage by symbol even though some are defined later in this file.
 (declare compose-context llm-call parse-response api-error-retry dispatch
-         execute-tools tool-error-retry wrap-up store-exchange
-         update-history deliver-responses notify error-boundary)
+         execute-tools tool-error-retry stuck-loop-detector wrap-up
+         store-exchange update-history deliver-responses notify error-boundary)
 
 ;; ---------------------------------------------------------------------------
 ;; compose-context (enter)
@@ -129,7 +130,7 @@
                         (assoc :turn/messages trimmed)
                         (update :turn/retries inc)
                         (chain/enqueue [llm-call parse-response
-                                    (deref #'api-error-retry) (deref #'dispatch)])))
+                                        (deref #'api-error-retry) (deref #'dispatch)])))
                   (assoc ctx :exchange/error
                          (str "LLM API error: " (:message api-err)))))
               ctx))})
@@ -153,6 +154,7 @@
                 (-> ctx
                     (update :turn/depth inc)
                     (chain/enqueue [(deref #'execute-tools) (deref #'tool-error-retry)
+                                    (deref #'stuck-loop-detector)
                                     llm-call parse-response (deref #'dispatch)]))
 
                 (and (seq calls) (>= depth max-depth))
@@ -177,6 +179,51 @@
                 :else
                 (update ctx :turn/transcript conj
                         {:role "assistant" :content text}))))})
+
+;; ---------------------------------------------------------------------------
+;; stuck-loop-detector (enter) - guards against tool-call loops
+;; ---------------------------------------------------------------------------
+
+(def stuck-loop-detector
+  "Detect when the agent is making no forward progress with its tool
+   calls. Runs after every `execute-tools` and inspects the recent
+   tool-call history plus the recent tool results.
+
+   When `kschltz.agent.stuck-loop/stuck?` returns a stuck-result, the
+   detector:
+     1. Sets `:exchange/error` to a structured stuck-loop message
+     2. Sets `:stuck-loop` ctx key with the full signal data
+     3. Fires `:on-thought` with the stuck event (for live observers)
+     4. Calls `chain/terminate` so no more stages run
+
+   The structured error format lets `deliver-responses` surface a
+   `{:type :stuck-loop :recent-calls [...] :reason \"...\"}` event to
+   the user. The user is then expected to respond (per the goal's
+   intervention policy: stop the turn and ask the user)."
+  {:name ::stuck-loop-detector
+   :enter (fn [ctx]
+            (let [turn-msgs (:turn/messages ctx)
+                  state (:agent/state ctx)
+                  cfg (stuck-loop/config)
+                  calls (stuck-loop/extract-recent-calls turn-msgs)
+                  ;; Only consider results from tool messages that match
+                  ;; the recent calls we extracted.
+                  results (stuck-loop/extract-recent-results
+                           (vec (take-last (* 2 (long (:window cfg))) turn-msgs)))]
+              (if-let [stuck (stuck-loop/stuck? calls results)]
+                (let [event (assoc stuck :type :stuck-loop :depth (:turn/depth ctx))
+                      msg (str "Agent appears stuck: " (:reason stuck)
+                               ". Recent calls: "
+                               (vec (take 3 (mapv :tool (:recent-calls stuck)))))]
+                  (loop/fire-on-thought state
+                                        {:type :stuck-loop
+                                         :content msg
+                                         :event event})
+                  (-> ctx
+                      (assoc :stuck-loop event)
+                      (assoc :exchange/error msg)
+                      (chain/terminate)))
+                ctx)))})
 
 ;; ---------------------------------------------------------------------------
 ;; execute-tools (enter)
@@ -293,14 +340,14 @@
                   items (:exchange/items ctx)
                   stored (:memory/stored ctx)
                   entries (loop/history-entries-for-exchange items stored
-                                                              :transcript (:turn/transcript ctx))
+                                                             :transcript (:turn/transcript ctx))
                   capped (context/cap-history
                           (into (:history state) entries))
                   delta (cond-> {}
-                         (some? (:exchange/response ctx))
-                         (assoc :current-response (:exchange/response ctx))
-                         (seq entries)
-                         (assoc :history capped))]
+                          (some? (:exchange/response ctx))
+                          (assoc :current-response (:exchange/response ctx))
+                          (seq entries)
+                          (assoc :history capped))]
               (assoc ctx :agent/state-delta delta)))})
 
 ;; ---------------------------------------------------------------------------

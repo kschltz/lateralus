@@ -93,8 +93,10 @@
    ix/store-exchange
    ix/notify])
 
-(defn- map->ctx
-  "Build an initial ctx from a state + items + user-text + client."
+(defn map->ctx
+  "Build an initial ctx from a state + items + user-text + client.
+   Public so other test namespaces (e.g. file-editing-parity) can build
+   a base ctx without duplicating boilerplate."
   [state items user-text client]
   {:agent/ref nil
    :agent/state state

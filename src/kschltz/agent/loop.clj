@@ -5,11 +5,20 @@
    Extracted from core.clj to reduce coupling and clarify boundaries.
    No behavior changes — pure refactor."
   (:require [clojure.string :as str]
+            [kschltz.agent.chain :as chain]
             [kschltz.agent.context :as context]
             [kschltz.agent.http :as http]
             [kschltz.agent.llm :as llm]
+            [kschltz.agent.llm.client :as llm-client]
             [kschltz.agent.memory :as memory]
             [kschltz.agent.tools :as tools]))
+
+;; ---- Default exchange chain ----
+
+;; (Moved to kschltz.agent.exchange to break the loop <-> interceptors
+;; require cycle. loop requires interceptors; interceptors requires
+;; loop for delegated helpers; exchange is the third-party assembly
+;; point that depends on both.)
 
 ;; ---- Callbacks ----
 
@@ -90,9 +99,10 @@
   (when (seq tools)
     (vec (mapv tools/openai-tool-def tools))))
 
-(defn- parse-tool-calls-native
+(defn parse-tool-calls-native
   "Extract tool calls from an OpenAI native function-calling response.
-   Returns [{:id call-id :tool name :args json-args-string}] or nil."
+   Returns [{:id call-id :tool name :args json-args-string}] or nil.
+   Public for `kschltz.agent.interceptors` delegation (Phase 2)."
   [response]
   (when-let [tcs (http/tool-calls response)]
     (vec (for [tc tcs
@@ -106,7 +116,7 @@
   (or (some-> (System/getenv "LATERALUS_MAX_TOOL_RESULT_CHARS") parse-long)
       8000))
 
-(defn- truncate-tool-result
+(defn truncate-tool-result
   "Truncate a tool result string to max-tool-result-chars."
   [s]
   (let [s (str s)]
@@ -114,7 +124,7 @@
       (str (subs s 0 max-tool-result-chars) "\n... [truncated]")
       s)))
 
-(defn- format-tool-results-native
+(defn format-tool-results-native
   "Build role:\"tool\" messages from tool execution results.
    Results are truncated to max-tool-result-chars to prevent context bloat."
   [results]
@@ -124,7 +134,7 @@
           :content (truncate-tool-result
                     (if error (str "Error: " error) (str result)))})))
 
-(defn- execute-tool-call
+(defn execute-tool-call
   "Execute a single tool call with Malli validation.
    Returns {:id call-id :tool name :args decoded-map :result output-str}
    or {:id call-id :tool name :args raw-json :error humanized-errors}."
@@ -142,14 +152,14 @@
             (catch Exception e
               {:id id :tool tool :args args :error (.getMessage e)})))))))
 
-(defn- execute-tool-calls
+(defn execute-tool-calls
   "Execute multiple tool calls serially. Returns vector of results."
   [calls tools]
   (mapv #(execute-tool-call tools %) calls))
 
 ;; ---- LLM ----
 
-(defn- llm-call
+(defn llm-call
   "Call the LLM API. Uses memory-augmented context when available.
    Passes tools for native function calling.
    Returns the raw API response map."
@@ -365,23 +375,47 @@
 
 (defn process-messages
   "Process a batch of drained queue items against the LLM.
-   Handles tool calls in a loop until a final text response.
-   Delivers each item's promise and calls its handler.
-   Returns updated state map. On error, delivers error messages and continues."
+   Builds an initial ctx and runs the default exchange chain. Returns
+   a state map (with :agent/state-delta keys merged in) for the outer
+   agent-loop to apply via `send`. Errors are caught by `error-boundary`
+   inside the chain; this fn has a belt-and-suspenders catch for
+   unexpected throws.
+
+   NOTE: the chain is referenced via `requiring-resolve` to avoid a
+   load-time cycle (loop -> exchange -> interceptors -> loop)."
   [ag state items]
   (let [texts         (mapv :text items)
-        combined-input (str/join "\n" texts)]
+        combined-input (str/join "\n" texts)
+        chain-val      (deref (requiring-resolve 'kschltz.agent.exchange/default-exchange-chain))
+        ctx           {:agent/ref ag
+                      :agent/state state
+                      :agent/state-delta {}
+                      :exchange/items items
+                      :exchange/user-text combined-input
+                      :exchange/response nil
+                      :exchange/error nil
+                      :turn/messages [{:role "user" :content combined-input}]
+                      :turn/transcript []
+                      :turn/depth 0
+                      :turn/retries 0
+                      :llm/request nil
+                      :llm/response nil
+                      :llm/api-error nil
+                      :tool/calls nil
+                      :tool/results nil
+                      :memory/recalled nil
+                      :memory/stored nil
+                      :llm/client (or (:llm/client state) (llm-client/default-client))}]
     (try
-      (let [{:keys [response transcript]} (llm-turn ag state combined-input)
-            stored   (store-exchange state combined-input :transcript transcript)
-            entries  (history-entries-for-exchange items stored :transcript transcript)
-            state'   (-> state
-                         (assoc :current-response response)
-                         (update :history into entries)
-                         context/cap-history)]
-        (doseq [item items]
-          (deliver-response (merge item (select-keys state [:on-response])) response))
-        state')
+      (let [result (chain/execute ctx chain-val)
+            response (or (:exchange/response result)
+                         (:exchange/error result)
+                         "(no response)")]
+        ;; The deliver-responses interceptor (in default-exchange-chain)
+        ;; already called `loop/deliver-response` for each item, which
+        ;; fires the per-item handler, the on-response callback, and
+        ;; delivers the promise. No need to call it again here.
+        (merge state (:agent/state-delta result)))
       (catch Exception e
         (let [on-error (:on-error state)
               err-str (str "Error: " (.getMessage e))]

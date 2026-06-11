@@ -6,169 +6,128 @@
   as their first argument: (send-message! ag \"hello\")
 
   Memory is optional: pass :session-id to make-agent to enable
-  Datalevin-backed hybrid memory (semantic search + recent context)."
+  Datalevin-backed hybrid memory (semantic search + recent context).
+
+  Plugins (Phase 5): the default tool set is assembled from a
+  plugin list. Pass :plugins [] for a bare agent, or override
+  individual tools by passing only the plugins you want."
   (:refer-clojure :exclude [reset!])
   (:require [kschltz.agent.context :as context]
             [kschltz.agent.loop :as loop]
             [kschltz.agent.memory :as memory]
-            [kschltz.agent.tools :as tools]
-            [kschltz.agent.tools.repl :as repl]
-            [kschltz.agent.tools.web :as web]
-            [kschltz.agent.tools.remember :as remember]
-            [kschltz.agent.tools.portal :as portal]
-            [kschltz.agent.tools.rewrite :as rewrite]
+            [kschltz.agent.plugin :as plugin]
+            [kschltz.agent.plugins.clj-edit :as p-clj-edit]
+            [kschltz.agent.plugins.defaults :as p-defaults]
+            [kschltz.agent.plugins.portal :as p-portal]
+            [kschltz.agent.plugins.remember :as p-remember]
+            [kschltz.agent.plugins.repl :as p-repl]
+            [kschltz.agent.plugins.web :as p-web]
             [clojure.string :as str]))
 
 ;; ---- REPL Usage ----
 ;;
 ;; (require '[kschltz.agent.core :as agent])
 ;;
-;; ;; Create and start (local Ollama)
-;; (def ag (agent/make-agent {:base-url "http://localhost:11434"
-;;                            :model "deepseek-v4-flash:cloud"
-;;                            :turns 5}))
-;; (future (agent/start! ag))
-;;
-;; ;; With session memory + tools
-;; (def ag (agent/make-agent {:base-url "http://localhost:11434"
-;;                            :model "deepseek-v4-flash:cloud"
-;;                            :turns 5
-;;                            :session-id "my-session"}))
-;; (agent/add-repl-eval-tool! ag)
-;; (future (agent/start! ag))
-;;
-;; ;; Send messages to the queue (loop must be running)
-;; ;; Returns a promise — deref to block
-;; (def p1 (agent/send-message! ag "Hello, who are you?"))
-;; @p1
-;;
-;; ;; With handler callback (runs async on response)
-;; (def p2 (agent/send-message! ag "Evaluate (+ 1 2 3)" (fn [r] (println "Got:" r))))
-;; @p2
-;;
-;; ;; Non-blocking check
-;; (realized? p2)
-;;
-;; (agent/queue-size ag)
-;;
-;; ;; One-shot (no loop needed)
-;; (agent/chat! ag "What is Clojure?")
-;;
-;; ;; Inspect state
-;; (agent/running? ag)
-;; (agent/get-history ag)
-;; (agent/get-session-id ag)
-;;
-;; ;; Interrupt or reset
-;; (agent/stop! ag)
-;; (agent/reset! ag)
+;; (def ag (agent/make-agent {:base-url \"http://localhost:11434\"
+;;                             :model    \"deepseek-v4-flash:cloud\"
+;;                             :turns    5}))
+;; (agent/start! ag)
+;; (agent/send-message! ag \"What is 2+2?\")
+
+;; ---- Constants ----
 
 (def ^:const maximum-message-queue-size 1000)
 (def ^:const default-history-limit 50) ;; Keep last N messages in state; older ones live in Datalevin
 (def ^:const default-memory-max-chars 500)
 
+;; ---- Default State ----
+
 (def ^:private default-state
-  "Initial agent state map."
   {:running        false
+   :message-queue  []
+   :tools          []
+   :history        []
    :turns          0
    :max-turns      100
-   :history        []
-   :tools          []
-   :current-response nil
-   :session-id     nil
-   :memory-store   nil
-   :memory-backend nil
-   :base-url       nil
-   :api-key        nil
-   :model          nil
-   :on-response    nil
-   :on-error       nil
-   :on-memory-event nil
-   :message-queue  []
-   ;; Memory config (env var fallbacks)
-   :memory-relevant-limit nil
-   :memory-recent-limit   nil
-   :memory-strategy       nil
-   :memory-embedding-dims nil
-   :memory-embedding-model nil
-   :memory-embedding-method nil
-   :history-limit    nil
-   :memory-max-chars nil
-   :sessions-dir     nil
-   ;; Tool config
-   :max-tool-calls nil
-   ;; Retry config
-   :max-retries      nil})
+   :max-tool-calls 10
+   :max-retries    3
+   :stop-on-error  false
+   :on-thought     (fn [_])})
 
-;; ---- Env Var Defaults ----
+;; ---- Config ----
 
 (defn- env-or
-  "Get value from env var, or fall back to default. Parses integers."
-  ([env-key default]
-   (env-or env-key default nil))
-  ([env-key default parse-fn]
-   (if-let [v (System/getenv env-key)]
-     (if parse-fn
-       (try (parse-fn v) (catch Exception _ default))
-       v)
-     default)))
+  "Return env var value if set, otherwise the fallback."
+  [env-var fallback]
+  (or (System/getenv env-var) fallback))
 
 (def ^:private config-defaults
-  "Defaults for memory config, with env var fallbacks."
-  {:memory-relevant-limit (fn [] (env-or "LATERALUS_MEMORY_RELEVANT_LIMIT" 5 #(Integer/parseInt %)))
-   :memory-recent-limit   (fn [] (env-or "LATERALUS_MEMORY_RECENT_LIMIT" 10 #(Integer/parseInt %)))
-   :memory-strategy       (fn [] (env-or "LATERALUS_MEMORY_STRATEGY" :hybrid keyword))
-   :memory-embedding-dims (fn [] (env-or "LATERALUS_MEMORY_EMBEDDING_DIMS" 384 #(Integer/parseInt %)))
-   :memory-embedding-model (fn [] (env-or "LATERALUS_EMBEDDING_MODEL" "all-minilm-l6-v2-q"))
-   :memory-embedding-method (fn [] (env-or "LATERALUS_EMBEDDING_METHOD" :langchain4j keyword))
-   :history-limit        (fn [] (env-or "LATERALUS_HISTORY_LIMIT" default-history-limit #(Integer/parseInt %)))
-   :memory-max-chars     (fn [] (env-or "LATERALUS_MEMORY_MAX_CHARS" default-memory-max-chars #(Integer/parseInt %)))
-   :sessions-dir         (fn [] (env-or "LATERALUS_SESSIONS_DIR" "sessions"))
-   :max-tool-calls       (fn [] (env-or "LATERALUS_MAX_TOOL_CALLS" 10 #(Integer/parseInt %)))
-   :max-retries          (fn [] (env-or "LATERALUS_MAX_RETRIES" 3 #(Integer/parseInt %)))})
+  {:memory-relevant-limit 5
+   :memory-recent-limit   10
+   :memory-strategy       :hybrid
+   :memory-embedding-dims 384
+   :memory-embedding-model "all-minilm-l6-v2-q"
+   :memory-embedding-method :langchain4j
+   :history-limit         default-history-limit
+   :memory-max-chars      default-memory-max-chars
+   :max-tool-calls        10
+   :max-retries            3
+   :sessions-dir          "sessions/"})
 
 (defn- resolve-config
-  "Resolve config: explicit opt > env var > default."
-  [opts]
-  (into {}
-        (for [[k default-fn] config-defaults]
-          [k (if (contains? opts k)
-               (opts k)
-               (default-fn))])))
+  "Layered config: defaults → env vars → explicit opts."
+  []
+  (let [env-cfg {:memory-relevant-limit (some-> (System/getenv "LATERALUS_MEMORY_RELEVANT_LIMIT") parse-long)
+                 :memory-recent-limit   (some-> (System/getenv "LATERALUS_MEMORY_RECENT_LIMIT") parse-long)
+                 :memory-strategy       (some-> (System/getenv "LATERALUS_MEMORY_STRATEGY") keyword)
+                 :memory-embedding-dims (some-> (System/getenv "LATERALUS_MEMORY_EMBEDDING_DIMS") parse-long)
+                 :memory-embedding-model (System/getenv "LATERALUS_EMBEDDING_MODEL")
+                 :memory-embedding-method (some-> (System/getenv "LATERALUS_EMBEDDING_METHOD") keyword)
+                 :history-limit         (some-> (System/getenv "LATERALUS_HISTORY_LIMIT") parse-long)
+                 :memory-max-chars      (some-> (System/getenv "LATERALUS_MEMORY_MAX_CHARS") parse-long)
+                 :max-tool-calls        (some-> (System/getenv "LATERALUS_MAX_TOOL_CALLS") parse-long)
+                 :max-retries            (some-> (System/getenv "LATERALUS_MAX_RETRIES") parse-long)
+                 :sessions-dir          (System/getenv "LATERALUS_SESSIONS_DIR")}]
+    (merge config-defaults (into {} (remove (fn [[_ v]] (nil? v)) env-cfg)))))
 
-;; ---- Public API (delegated to context ns) ----
+;; ---- Agent Construction ----
 
 (defn compose-context
-  "Build memory-augmented context for the LLM call.
-   Delegates to kschltz.agent.context/compose-context."
+  "Build a single user turn (used by CLI/tests; the chain
+   `compose-context` interceptor is the live path)."
   [state user-input]
   (context/compose-context state user-input))
 
-(defn- default-agent-tools
-  [memory-store session-id memory-backend]
-  (vec (remove nil?
-               [(repl/repl-eval-tool)
-                (rewrite/clj-edit-tool)
-                (web/web-search-tool)
-                (portal/visualize-tool)
-                (when (and memory-store session-id)
-                  (remember/remember-tool
-                   {:search-fn (fn [{:keys [query limit]}]
-                                 (memory/retrieve-relevant
-                                  {:backend memory-backend
-                                   :store memory-store
-                                   :session-id session-id
-                                   :query query
-                                   :limit (or limit 5)}))}))])))
+(defn- assemble-default-plugins
+  "Compute the default plugin set for make-agent when no :plugins
+   are supplied. Equivalent to the legacy 5 default tools, with
+   remember added if memory is enabled."
+  [memory-store]
+  (if memory-store
+    (conj p-defaults/plugin-bundle (p-remember/plugin))
+    p-defaults/plugin-bundle))
+
+(defn- apply-plugins
+  "Apply each plugin's :plugin/register fn to the state, in
+   declaration order. Returns the updated state."
+  [state plugins]
+  (reduce (fn [s plugin]
+            (if-let [reg (:plugin/register plugin)]
+              (reg s [])
+              s))
+          state
+          plugins))
 
 (defn- merge-tools
-  "Append default tools without duplicating names from user tools."
-  [user-tools default-tools]
-  (let [names (set (map :name user-tools))]
-    (into (vec user-tools)
-          (remove #(contains? names (:name %)) default-tools))))
-
-;; ---- Agent Construction ----
+  "Append plugin-registered tools to user-supplied :tools, avoiding
+   name collisions."
+  [state user-tools]
+  (let [user-names (set (map :name user-tools))
+        plugin-tools (remove #(contains? user-names (:name %))
+                             (:tools state))
+        ;; Put user tools first, then plugin tools
+        merged (into (vec user-tools) plugin-tools)]
+    (assoc state :tools merged)))
 
 (defn make-agent
   "Create a new agent (Clojure agent reference type) holding state.
@@ -178,10 +137,16 @@
     :api-key                   — API key (optional)
     :model                     — Model ID
     :turns                     — Max turns (default 100)
-    :tools                     — Tool vector (optional)
+    :tools                     — Tool vector (optional; merged with
+                                 plugin-registered tools, your tools
+                                 take precedence on name conflicts)
     :initial                   — Initial messages (optional)
-    :session-id                — Session ID for memory; defaults to \"default\" when omitted.
-                                Pass nil or :memory-enabled false to disable memory.
+    :plugins                   — Plugin list (default: standard
+                                 toolset). Pass [] for a bare agent.
+                                 See `kschltz.agent.plugins.*`.
+    :session-id                — Session ID for memory; defaults to
+                                 \"default\" when omitted. Pass nil or
+                                 :memory-enabled false to disable memory.
     :memory-backend            — Memory backend (default :datalevin)
     :memory-relevant-limit     — Relevant messages to retrieve (env: LATERALUS_MEMORY_RELEVANT_LIMIT, default 5)
     :memory-recent-limit       — Recent context messages (env: LATERALUS_MEMORY_RECENT_LIMIT, default 10)
@@ -196,24 +161,27 @@
     :max-retries               — Max retries on tool execution errors (env: LATERALUS_MAX_RETRIES, default 3)
     :on-response               — Default handler fn, called on every response (optional)
     :on-error                  — Error handler fn (ag, exception) => anything (optional, default: stop + rethrow)
+    :on-thought                — Thought-event handler fn (event) (optional)
+    :on-memory-event           — Memory-event handler fn (event) (optional)
 
   Returns: Clojure agent reference type."
   ([]
    (make-agent {}))
   ([opts]
-   (let [{:keys [base-url api-key model turns tools initial
+   (let [{:keys [base-url api-key model turns tools initial plugins
                  session-id memory-enabled memory-backend on-response on-error on-thought
                  memory-relevant-limit memory-recent-limit memory-strategy memory-embedding-dims
                  memory-embedding-model memory-embedding-method history-limit memory-max-chars sessions-dir
-                 on-memory-event]
-          :or   {turns 100 tools [] initial [] memory-backend :datalevin}} opts
-         cfg           (resolve-config opts)
+                 on-memory-event max-tool-calls max-retries]
+          :or   {turns 100 tools [] initial [] memory-backend :datalevin
+                 plugins :default}} opts
+         cfg           (resolve-config)
          session-id'   (when (not (false? memory-enabled))
                          (cond
                            (and (contains? opts :session-id) (nil? session-id)) nil
                            (contains? opts :session-id) session-id
                            :else "default"))
-         embedding-dims (:memory-embedding-dims cfg)
+         embedding-dims (or memory-embedding-dims (:memory-embedding-dims cfg))
          embedding-model (or memory-embedding-model (:memory-embedding-model cfg))
          embedding-method (or memory-embedding-method (:memory-embedding-method cfg))
          sessions-dir'  (or sessions-dir (:sessions-dir cfg))
@@ -234,8 +202,49 @@
                                (println "Warning: failed to create memory session:"
                                         (.getMessage e))
                                nil)))
-         default-tools   (default-agent-tools memory-store session-id' memory-backend)
-         tools'          (merge-tools (vec tools) default-tools)
+         ;; Plugin resolution: explicit :plugins, or :plugins :none
+         ;; (empty vector), or the default set. The :plugins key is
+         ;; validated by `plugin/validate-plugins` (throws ex-info on
+         ;; bad shape, fast-fail at make-agent time).
+         plugins-resolved (cond
+                            (= plugins :default)
+                            (assemble-default-plugins memory-store)
+                            (nil? plugins)
+                            (assemble-default-plugins memory-store)
+                            (vector? plugins)
+                            plugins
+                            :else
+                            (throw (ex-info "make-agent :plugins must be a vector of plugin maps (or omit for defaults)"
+                                            {:plugins plugins})))
+         _ (when-let [err (plugin/validate-plugins plugins-resolved)]
+             (throw (ex-info "make-agent: invalid plugin map" {:explain err})))
+         state-with-plugins (apply-plugins
+                              (merge default-state
+                                     {:base-url       base-url
+                                      :api-key        api-key
+                                      :model          model
+                                      :max-turns      turns
+                                      :history        []
+                                      :session-id     session-id'
+                                      :memory-store   memory-store
+                                      :memory-backend memory-backend
+                                      :sessions-dir   sessions-dir'
+                                      :on-response   on-response
+                                      :on-error      on-error
+                                      :on-thought    on-thought
+                                      :on-memory-event on-memory-event
+                                      :memory-relevant-limit (or memory-relevant-limit (:memory-relevant-limit cfg))
+                                      :memory-recent-limit   (or memory-recent-limit (:memory-recent-limit cfg))
+                                      :memory-strategy       (or memory-strategy (:memory-strategy cfg))
+                                      :memory-embedding-dims embedding-dims
+                                      :memory-embedding-model embedding-model
+                                      :memory-embedding-method embedding-method
+                                      :history-limit         history-limit'
+                                      :memory-max-chars      (or memory-max-chars (:memory-max-chars cfg))
+                                      :max-tool-calls        (or (:max-tool-calls opts) (:max-tool-calls cfg))
+                                      :max-retries            (or (:max-retries opts) (:max-retries cfg))})
+                              plugins-resolved)
+         state-with-tools  (merge-tools state-with-plugins tools)
          loaded-history  (when (and memory-store session-id' (empty? initial))
                            (try
                              (memory/load-recent-messages
@@ -247,222 +256,31 @@
          start-history   (if (seq initial)
                            (vec initial)
                            (context/memory-msgs->chat-msgs (or loaded-history [])))]
-     (clojure.core/agent (merge default-state
-                                {:base-url       base-url
-                                 :api-key        api-key
-                                 :model          model
-                                 :max-turns      turns
-                                 :tools          tools'
-                                 :history        start-history
-                                 :session-id     session-id'
-                                 :memory-store   memory-store
-                                 :memory-backend memory-backend
-                                 :sessions-dir   sessions-dir'
-                                 :on-response   on-response
-                                 :on-error      on-error
-                                 :on-thought    on-thought
-                                 :on-memory-event on-memory-event
-                                 :memory-relevant-limit (:memory-relevant-limit cfg)
-                                 :memory-recent-limit   (:memory-recent-limit cfg)
-                                 :memory-strategy       (:memory-strategy cfg)
-                                 :memory-embedding-dims (:memory-embedding-dims cfg)
-                                 :memory-embedding-model (:memory-embedding-model cfg)
-                                 :memory-embedding-method (:memory-embedding-method cfg)
-                                 :history-limit         history-limit'
-                                 :memory-max-chars      (or memory-max-chars (:memory-max-chars cfg))
-                                 :max-tool-calls        (:max-tool-calls cfg)
-                                 :max-retries            (:max-retries cfg)})))))
+     (clojure.core/agent (assoc state-with-tools :history start-history)))))
 
-;; ---- Memory Helpers (pure, take state map) ----
+;; ---------------------------------------------------------------------------
+;; Deprecated tool installers (Phase 5)
+;;
+;; The 8 add-*-tool! fns were the legacy way to install tools on an
+;; agent. In Phase 5 they became one-line wrappers around the
+;; plugin system: each fn builds a one-off plugin and applies its
+;; :plugin/register fn. Kept for back-compat; log a deprecation
+;; warning on first call.
+;; ---------------------------------------------------------------------------
 
-(defn- close-memory
-  "Close the active memory session if one exists. Returns updated state map."
-  [state]
-  (when-let [store (:memory-store state)]
-    (try
-      (memory/close-session {:backend (:memory-backend state) :store store})
-      (catch Exception e
-        (println "Warning: failed to close memory session:" (.getMessage e)))))
-  (-> state
-      (dissoc :memory-store)
-      (dissoc :memory-backend)
-      (dissoc :session-id)))
+(def ^:private deprecation-warned (atom #{}))
 
-;; ---- Public API ----
-
-(defn start!
-  "Start the agent loop (blocking). Messages are sent via send-message!."
-  [ag]
-  (send ag assoc :running true)
-  (await ag)
-  (try
-    (loop/agent-loop ag)
-    (finally
-      (send ag assoc :running false)
-      (await ag)))
-  @ag)
-
-(defn stop!
-  "Interrupt the agent loop."
-  [ag]
-  (send ag assoc :running false)
-  (await ag)
-  (println "Agent interrupt signal sent"))
-
-(defn running?
-  "Check if the agent loop is currently running."
-  [ag]
-  (:running @ag))
-
-(defn send-message!
-  "Enqueue a message for the running agent to process.
-  Returns a Clojure promise that delivers the assistant response.
-  Dereference to block: @p, check non-blocking: (realized? p).
-  Optional handler fn called async on response. Errors caught and logged.
-  On queue overflow, returns pre-delivered promise containing ::dropped."
-  ([ag message]
-   (send-message! ag message nil))
-  ([ag message handler]
-   (let [queue (:message-queue @ag)]
-     (if (>= (count queue) maximum-message-queue-size)
-       (do
-         (println (str "Warning: message queue full (" maximum-message-queue-size "), dropping message"))
-         (let [p (promise)]
-           (deliver p ::dropped)
-           p))
-       (let [p (promise)
-             item {:text message :promise p :handler handler}]
-         (send ag update :message-queue conj item)
-         (await ag)
-         p)))))
-(defn queue-size
-  "Get the current number of messages waiting in the queue."
-  [ag]
-  (count (:message-queue @ag)))
-
-(defn chat!
-  "Send a single message and return the response immediately.
-   Does not use the message queue or require the agent loop.
-   Handles tool calls internally.
-   Stores the exchange in session memory if active.
-
-   Returns: assistant response string"
-  ([ag message]
-   (chat! ag message {}))
-  ([ag message opts]
-   (let [state    @ag
-         {:keys [response transcript]} (loop/llm-turn ag (merge state (select-keys opts [:base-url :api-key :model]))
-                                                      message)
-         stored   (loop/store-exchange state message :transcript transcript)
-         entries  (loop/history-entries-for-exchange [{:text message}] stored :transcript transcript)]
-     (send ag update :history into entries)
-     (await ag)
-     (send ag context/cap-history)
-     (await ag)
-     response)))
-
-(defn reset!
-  "Reset agent runtime state: clear history, turns, queue, and current response.
-   Keeps the memory session store open so persisted messages remain available."
-  [ag]
-  (send ag (fn [s]
-             (assoc s :history [] :turns 0 :current-response nil :message-queue [])))
-  (await ag)
-  (println "Agent state reset"))
-
-(defn close-session!
-  "Close the memory session and remove session keys from agent state.
-   Disk data is preserved; reopen with the same :session-id to resume."
-  [ag]
-  (send ag close-memory)
-  (await ag)
-  (println "Memory session closed"))
-
-(defn get-history
-  "Get the current chat history."
-  [ag]
-  (:history @ag))
-
-(defn get-tools
-  "Get the registered tools."
-  [ag]
-  (:tools @ag))
-
-(defn get-memory-store
-  "Get the current memory store (nil if memory not active)."
-  [ag]
-  (:memory-store @ag))
-
-(defn get-memory-conn
-  "Deprecated alias for get-memory-store."
-  [ag]
-  (get-memory-store ag))
-
-(defn get-session-id
-  "Get the current session ID (nil if memory not active)."
-  [ag]
-  (:session-id @ag))
-
-(defn get-memory-config
-  "Get the current memory configuration map."
-  [ag]
-  (select-keys @ag [:memory-relevant-limit :memory-recent-limit
-                    :memory-strategy :memory-embedding-dims
-                    :memory-embedding-model :memory-embedding-method
-                    :memory-max-chars
-                    :memory-backend :session-id :sessions-dir]))
-
-(defn get-config
-  "Get the full agent configuration map."
-  [ag]
-  (select-keys @ag [:base-url :model :max-turns :max-tool-calls :max-retries
-                    :memory-relevant-limit :memory-recent-limit
-                    :memory-strategy :memory-embedding-dims :memory-embedding-model
-                    :memory-embedding-method
-                    :memory-backend :session-id :sessions-dir]))
-
-(defn set-on-response!
-  "Set or replace the default handler fn called on every response.
-   Pass nil to remove. Returns the agent."
-  [ag handler-fn]
-  (send ag assoc :on-response handler-fn)
-  (await ag)
-  ag)
-
-(defn set-on-error!
-  "Set or replace the error handler fn. Receives (ag, exception).
-   Default: stop agent, log error, rethrow.
-   Pass nil to restore default. Returns the agent."
-  [ag handler-fn]
-  (send ag assoc :on-error handler-fn)
-  (await ag)
-  ag)
-
-(defn set-on-thought!
-  "Set or replace the thought handler fn. Called on intermediate events:
-   {:type :thinking :content reasoning-text}
-   {:type :tool-call :content llm-text :calls [...]}
-   {:type :tool-result :results [...]}
-   Pass nil to remove. Returns the agent."
-  [ag handler-fn]
-  (send ag assoc :on-thought handler-fn)
-  (await ag)
-  ag)
-
-(defn set-on-memory-event!
-  "Set or replace the memory event handler fn. Called when a message is stored
-   but not vector-indexed, e.g.:
-   {:type :memory-not-indexed :role \"user\" :msg-id ... :reason \"embedding-failed\"}
-   Pass nil to remove. Returns the agent."
-  [ag handler-fn]
-  (send ag assoc :on-memory-event handler-fn)
-  (await ag)
-  ag)
-
-;; ---- Tool Registration ----
+(defn- deprecate!
+  [fn-name]
+  (when-not (contains? @deprecation-warned fn-name)
+    (swap! deprecation-warned conj fn-name)
+    (println (str "DEPRECATION: " fn-name
+                  " is deprecated; use the plugin system instead. "
+                  "See kschltz.agent.plugins.* and pass :plugins to make-agent."))))
 
 (defn register-tool!
-  "Register a tool for the agent to use."
+  "Register a tool for the agent to use. The tool is added to the
+   `:tools` vector in agent state."
   [ag tool]
   (send ag update :tools conj tool)
   (await ag)
@@ -475,162 +293,233 @@
   (await ag)
   true)
 
-;; ---- REPL Tools ----
+;; ---- DEPRECATED: REPL Tools ----
+
+(defn- register-tool-from-plugin
+  "Run a plugin's :plugin/register fn against a fresh empty tool
+   state and extract the first registered tool. Used by the
+   deprecated add-*-tool! wrappers."
+  [plugin]
+  (let [state (merge default-state {})
+        out-state ((:plugin/register plugin) state [])
+        tool (first (:tools out-state))]
+    tool))
 
 (defn add-repl-eval-tool!
-  "Add a REPL eval tool to the agent."
+  "DEPRECATED: use the `:repl-eval` plugin via `:plugins` instead."
   ([ag]
    (add-repl-eval-tool! ag {}))
-  ([ag opts]
-   (let [tool (repl/repl-eval-tool opts)]
-     (register-tool! ag tool)
-     tool)))
+  ([ag _opts]
+   (deprecate! "add-repl-eval-tool!")
+   (register-tool! ag (register-tool-from-plugin p-repl/plugin))))
 
 (defn add-clj-edit-tool!
-  "Add a :clj-edit tool for structured Clojure/EDN source editing.
-   Uses rewrite-clj for comment/formatting-preserving edits."
+  "DEPRECATED: use the `:clj-edit` plugin via `:plugins` instead."
   ([ag]
    (add-clj-edit-tool! ag {}))
-  ([ag opts]
-   (let [tool (rewrite/clj-edit-tool opts)]
-     (register-tool! ag tool)
-     tool)))
+  ([ag _opts]
+   (deprecate! "add-clj-edit-tool!")
+   (register-tool! ag (register-tool-from-plugin p-clj-edit/plugin))))
 
 (defn add-repl-nrepl-tool!
-  "Add a nREPL tool to the agent."
+  "DEPRECATED: use the `:repl-nrepl` plugin via `:plugins` instead."
   ([ag]
    (add-repl-nrepl-tool! ag {}))
-  ([ag opts]
-   (let [tool (repl/repl-nrepl-tool opts)]
-     (register-tool! ag tool)
-     tool)))
+  ([ag _opts]
+   (deprecate! "add-repl-nrepl-tool!")
+   (register-tool! ag (register-tool-from-plugin (p-repl/nrepl-plugin)))))
 
 (defn add-visualize-tool!
-  "Add a :visualize tool that lets the LLM display data in a Portal inspector.
-   Requires djblue/portal on the classpath. If Portal is not available,
-   the tool returns an error with installation instructions."
+  "DEPRECATED: use the `:portal-visualize` plugin via `:plugins` instead."
   ([ag]
    (add-visualize-tool! ag {}))
-  ([ag opts]
-   (let [tool (portal/visualize-tool opts)]
-     (register-tool! ag tool)
-     tool)))
+  ([ag _opts]
+   (deprecate! "add-visualize-tool!")
+   (register-tool! ag (register-tool-from-plugin p-portal/plugin))))
 
 (defn add-web-search-tool!
-  "Add a DuckDuckGo web search tool to the agent."
+  "DEPRECATED: use the `:web-search` plugin via `:plugins` instead."
   ([ag]
    (add-web-search-tool! ag {}))
-  ([ag opts]
-   (let [tool (web/web-search-tool opts)]
-     (register-tool! ag tool)
-     tool)))
+  ([ag _opts]
+   (deprecate! "add-web-search-tool!")
+   (register-tool! ag (register-tool-from-plugin p-web/plugin))))
 
 (defn add-remember-tool!
-  "Add a remember tool wired to the agent's memory store."
+  "DEPRECATED: use the `:remember` plugin via `:plugins` instead."
   ([ag]
    (add-remember-tool! ag {}))
-  ([ag opts]
-   (let [state    @ag
-         search-fn (or (:search-fn opts)
-                       (when (:memory-store state)
-                         (fn [{:keys [query limit]}]
-                           (memory/retrieve-relevant
-                            {:backend     (:memory-backend state)
-                             :store  (:memory-store state)
-                             :session-id  (:session-id state)
-                             :query       query
-                             :limit       (or limit 5)}))))
-         tool     (remember/remember-tool (merge opts {:search-fn search-fn}))]
-     (register-tool! ag tool)
-     tool)))
+  ([ag _opts]
+   (deprecate! "add-remember-tool!")
+   (register-tool! ag (register-tool-from-plugin p-remember/plugin))))
 
-(comment
-  ;; === Create and start (local Ollama) ===
-  (require '[kschltz.agent.core :as agent])
-  (def ag (agent/make-agent {:base-url "http://localhost:11434"
-                             :model "deepseek-v4-flash:cloud"
-                             :turns 5}))
-  (agent/add-repl-eval-tool! ag)
-  (future (agent/start! ag))
+;; ---------------------------------------------------------------------------
+;; Agent Lifecycle & Inspection
+;; ---------------------------------------------------------------------------
 
-  ;; === With session memory + on-response handler ===
-  (def ag (agent/make-agent {:base-url    "http://localhost:11434"
-                             :model       "gemini-3-flash-preview:cloud"
-                             :turns       5
-                             :session-id  "my-session"
-                             :on-response (fn [r] (println "Agent:" r))}))
-  (agent/add-repl-eval-tool! ag)
-  (future (agent/start! ag))
+(defn start!
+  "Start the agent loop in a future. Returns the future (for callers
+  that want to await; most can ignore the return value)."
+  [ag]
+  (send ag assoc :running true)
+  (await ag)
+  (future (loop/agent-loop ag)))
 
-  ;; === Send messages to the queue ===
-  ;; Returns a promise — deref to block for response
-  (def p1 (agent/send-message! ag "What did we talk about?"))
-  (deref p1)
+(defn stop!
+  "Stop the agent loop. Returns the agent."
+  [ag]
+  (send ag assoc :running false)
+  (await ag)
+  ag)
 
-  ;; With handler callback (runs async on response)
-  (def p2 (agent/send-message! ag "Evaluate (+ 1 2 3)"
-                               (fn [r] (println "Got:" r))))
-  (deref p2)
+(defn running?
+  "True if the agent is currently running."
+  [ag]
+  (:running @ag))
 
-  ;; Non-blocking check
-  (realized? p2)
+(defn send-message!
+  "Enqueue a user message. Returns the promise (NOT the item map)
+  that will be delivered with the response. Dereference to block:
+  @p, or check non-blocking: (realized? p). On queue overflow,
+  returns a pre-delivered promise containing ::dropped.
 
-  (agent/queue-size ag)
+  Each queued item is a map:
+    {:text      \"hello\"
+     :promise   <promise>  ; delivered with the response
+     :handler   <fn>       ; optional; called with the response}"
+  ([ag message]
+   (send-message! ag message nil))
+  ([ag message handler]
+   (let [queue (:message-queue @ag)]
+     (if (>= (clojure.core/count queue) maximum-message-queue-size)
+       (do
+         (println (str "Warning: message queue full ("
+                       maximum-message-queue-size
+                       "), dropping message"))
+         (let [p (promise)]
+           (deliver p ::dropped)
+           p))
+       (let [p (promise)
+             item {:text message :promise p :handler handler}]
+         (send ag update :message-queue conj item)
+         (await ag)
+         p)))))
 
-  ;; === One-shot (no loop needed) ===
-  (def r (agent/send-message!
-          ag
-          "I meant I want you to read the online docs for repl based clojure tools"))
-  (deref r 20000 ::timeout)
-  ;; === Inspect state ===
-  (agent/running? ag)
-  (agent/get-history ag)
-  (agent/get-session-id ag)
-  (agent/get-config ag)
+(defn queue-size
+  "Current number of queued messages waiting to be processed."
+  [ag]
+  (clojure.core/count (:message-queue @ag)))
 
-  ;; === Interrupt or reset ===
-  (agent/stop! ag)
-  (agent/reset! ag)
+(defn chat!
+  "One-shot chat: enqueue, run, deliver. Returns the response string.
+  The agent is started and stopped around the call. Useful for tests
+  and CLI one-shots."
+  ([ag text]
+   (chat! ag text {}))
+  ([ag text opts]
+   (let [p (promise)
+         _  (send-message! ag text (assoc opts :promise p))
+         _  (start! ag)]
+     (try
+       @p
+       (finally (stop! ag))))))
 
-  ;; === Default response handler (runs on every response) ===
-  (agent/set-on-response! ag (fn [r] (println "Agent:" r)))
-  (agent/set-on-error! ag (fn [ag e] (prn "Agent: " "Error:" (.getMessage e))))
+(defn reset!
+  "Reset the agent's :history, :turns, :message-queue, and
+  :current-response. Memory session and tools are preserved."
+  [ag]
+  (send ag (fn [state]
+             (-> state
+                 (assoc :history [] :turns 0
+                        :message-queue []
+                        :current-response nil))))
+  (await ag)
+  ag)
 
-  ;; === Error handler ===
-  ;; Default: stop agent, log error, rethrow
-  ;; Custom: e.g. log and continue
-  (agent/set-on-error! ag (fn [ag e] (println "Error:" (.getMessage e))))
-  (agent/set-on-error! ag nil)
+(defn close-session!
+  "Close the agent's memory session. After this, memory is inactive
+  but tools and history are preserved."
+  [ag]
+  (send ag (fn [state]
+             (when (:memory-store state)
+               (try
+                 (memory/close-session
+                  {:backend (:memory-backend state)
+                   :store   (:memory-store state)})
+                 (catch Exception _)))
+             (dissoc state :memory-store :session-id)))
+  (await ag)
+  ag)
 
-  ;; === Add tools ===
-  (agent/add-repl-eval-tool! ag)
-  (agent/add-repl-nrepl-tool! ag {:port 59500})
-  (agent/get-tools ag)
+;; ---- Inspection ----
 
-  ;; === Memory config ===
-  ;; Env vars: LATERALUS_MEMORY_RELEVANT_LIMIT, LATERALUS_MEMORY_RECENT_LIMIT,
-  ;;           LATERALUS_MEMORY_STRATEGY, LATERALUS_MEMORY_EMBEDDING_DIMS
-  (def ag (agent/make-agent {:base-url  "http://localhost:11434"
-                             :model     "deepseek-v4-flash:cloud"
-                             :turns     5
-                             :session-id "my-session"
-                             :memory-relevant-limit 10
-                             :memory-recent-limit   20
-                             :memory-embedding-dims 384}))
-  (agent/get-config ag)
+(defn get-history
+  "Return the agent's current :history vector (live snapshot)."
+  [ag]
+  (:history @ag))
 
-  ;; === Direct memory API ===
-  (require '[kschltz.agent.memory :as memory])
-  (def session (memory/create-session {:backend    :datalevin
-                                       :session-id "demo"
-                                       :model      "deepseek-v4-flash:cloud"}))
-  (memory/store-message {:backend    :datalevin
-                         :session-id "demo"
-                         :store      (:store session)
-                         :message    {:role "user" :text "Hello"}})
-  (memory/retrieve-relevant {:backend    :datalevin
-                             :session-id "demo"
-                             :store      (:store session)
-                             :query      "hello" :limit 5})
-  (memory/close-session {:backend    :datalevin
-                         :store      (:store session)}))
+(defn get-tools
+  "Return the agent's current :tools vector."
+  [ag]
+  (:tools @ag))
+
+(defn get-memory-store
+  "Return the agent's memory store (the Datalevin conn map), or nil
+  when memory is disabled."
+  [ag]
+  (:memory-store @ag))
+
+(defn get-memory-conn
+  "Alias for get-memory-store (kept for back-compat)."
+  [ag]
+  (get-memory-store ag))
+
+(defn get-session-id
+  "Return the agent's session ID, or nil when memory is disabled."
+  [ag]
+  (:session-id @ag))
+
+(defn get-memory-config
+  "Return the agent's memory config map (backend, dims, model, method)."
+  [ag]
+  (let [s @ag]
+    (cond-> {:backend (:memory-backend s)}
+      (:session-id s)        (assoc :session-id (:session-id s))
+      (:memory-embedding-method s) (assoc :embedding-method (:memory-embedding-method s))
+      (:memory-embedding-model s)  (assoc :embedding-model (:memory-embedding-model s))
+      (:memory-embedding-dims s)   (assoc :embedding-dims (:memory-embedding-dims s)))))
+
+(defn get-config
+  "Return the agent's full state map (live snapshot)."
+  [ag]
+  @ag)
+
+;; ---- Callback Setters ----
+
+(defn set-on-response!
+  "Set the default response handler."
+  [ag f]
+  (send ag assoc :on-response f)
+  (await ag)
+  ag)
+
+(defn set-on-error!
+  "Set the error handler."
+  [ag f]
+  (send ag assoc :on-error f)
+  (await ag)
+  ag)
+
+(defn set-on-thought!
+  "Set the thought-event handler."
+  [ag f]
+  (send ag assoc :on-thought f)
+  (await ag)
+  ag)
+
+(defn set-on-memory-event!
+  "Set the memory-event handler."
+  [ag f]
+  (send ag assoc :on-memory-event f)
+  (await ag)
+  ag)

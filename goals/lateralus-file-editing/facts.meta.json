@@ -1,0 +1,19 @@
+{
+  "facts": [
+    { "id": "fact-2",  "text": "create-ns op on clj-edit", "automatedVerification": true, "recommendedAutomatedVerification": true },
+    { "id": "fact-3",  "text": "create-file op on clj-edit", "automatedVerification": true, "recommendedAutomatedVerification": true },
+    { "id": "fact-4",  "text": "clj-edit hard-refuses non-Clojure files", "automatedVerification": true, "recommendedAutomatedVerification": true },
+    { "id": "fact-5",  "text": "New general file_edit tool with 5 ops", "automatedVerification": true, "recommendedAutomatedVerification": true },
+    { "id": "fact-6",  "text": "edit_file ambiguity errors", "automatedVerification": true, "recommendedAutomatedVerification": true },
+    { "id": "fact-7",  "text": "file_edit hard-refuses Clojure files (except read_file)", "automatedVerification": true, "recommendedAutomatedVerification": true },
+    { "id": "fact-8",  "text": "write_dir constraint on both tools", "automatedVerification": true, "recommendedAutomatedVerification": true },
+    { "id": "fact-9",  "text": "Blocked-paths list on both tools", "automatedVerification": true, "recommendedAutomatedVerification": true },
+    { "id": "fact-10", "text": "Auto-backup + restore! on both tools", "automatedVerification": true, "recommendedAutomatedVerification": true },
+    { "id": "fact-11", "text": "show_diff op with hand-rolled LCS", "automatedVerification": true, "recommendedAutomatedVerification": true },
+    { "id": "fact-12", "text": "Multi-step parity scenario test", "automatedVerification": true, "recommendedAutomatedVerification": true },
+    { "id": "fact-13", "text": "Multi-tool routing integration test", "automatedVerification": true, "recommendedAutomatedVerification": true },
+    { "id": "fact-14", "text": "edamame parse-validate on create-ns/create-file", "automatedVerification": true, "recommendedAutomatedVerification": true },
+    { "id": "fact-15", "text": "Tool descriptions tuned for unambiguous LLM selection", "automatedVerification": true, "recommendedAutomatedVerification": true },
+    { "id": "fact-16", "text": "Audit + fix existing 6 clj-edit ops against real-world failure modes", "automatedVerification": true, "recommendedAutomatedVerification": true }
+  ]
+}

@@ -1,0 +1,111 @@
+{
+  "stage": "interview",
+  "title": "Lateralus file-editing reliability",
+  "goalSlug": "lateralus-file-editing",
+  "questions": [
+    {
+      "id": "scope",
+      "prompt": "What scope of fix do you want?",
+      "description": "The current clj-edit (rewrite-clj) exists but you said 'it does not work properly'. There are also zero tools for non-Clojure files. Pick which problems this goal should address.",
+      "answerMode": "multi-custom",
+      "recommendedAnswer": "All three: improve the existing clj-edit tool (add missing ops, fix real-world reliability, sharpen descriptions), add a general file tool for non-Clojure files, and add system-prompt guidance so the LLM actually picks the right tool.",
+      "recommendedOptionIds": ["clj-edit-hardening", "general-file-tool", "llm-tool-selection"],
+      "options": [
+        { "id": "clj-edit-hardening", "label": "Improve existing clj-edit tool (missing ops, reliability, descriptions)" },
+        { "id": "general-file-tool", "label": "Add a general file-edit tool for non-Clojure files (.py, .md, .toml, etc.)" },
+        { "id": "llm-tool-selection", "label": "System-prompt / tool-description guidance so the LLM picks the right tool" }
+      ],
+      "required": true
+    },
+    {
+      "id": "clj-edit-missing-ops",
+      "prompt": "Which clj-edit operations are missing or broken?",
+      "description": "Existing 6 ops: read-structure, find-form, replace-form, insert-form, add-require, remove-form. What should be added or fixed?",
+      "answerMode": "multi-custom",
+      "recommendedAnswer": "rename-form (preserves docstring/attrs), edit-form-body (in-place body replace without losing metadata), move-form (relocate a form to a different position), and stricter error messages when a form name is ambiguous or doesn't exist. Also fix the documented bug where clj-paren-repair mangles (cond (pred? x) val) — but that lives in clj-paren-repair, not here.",
+      "recommendedOptionIds": ["rename-form", "edit-form-body", "move-form", "better-errors"],
+      "options": [
+        { "id": "rename-form", "label": "rename-form — change a defn's name in place, preserving docstring/attrs" },
+        { "id": "edit-form-body", "label": "edit-form-body — replace only the body of a defn, preserve metadata/args" },
+        { "id": "move-form", "label": "move-form — relocate a form to after a different form" },
+        { "id": "better-errors", "label": "Better error messages for ambiguous / missing form names" }
+      ],
+      "required": true
+    },
+    {
+      "id": "general-file-tool",
+      "prompt": "What operations should a general file tool expose?",
+      "description": "Design the API for the non-Clojure file tool. Should be minimal — LLM will compose these into edits.",
+      "answerMode": "multi-custom",
+      "recommendedAnswer": "Five ops: read_file (path → contents with optional offset/limit), write_file (path → full overwrite, refuses if path looks like a Clojure file unless explicit), edit_file (path + old_text + new_text, the classic str-replace but with validation that old_text exists exactly once), list_dir (path → entries), and show_diff (path + new_contents → unified diff). edit_file must reject ambiguous matches (old_text appears 0 or >1 times) with a structured error so the LLM can adapt.",
+      "recommendedOptionIds": ["read_file", "write_file", "edit_file", "list_dir", "show_diff"],
+      "options": [
+        { "id": "read_file", "label": "read_file — read a file, with optional offset/limit for large files" },
+        { "id": "write_file", "label": "write_file — create or fully overwrite a file" },
+        { "id": "edit_file", "label": "edit_file — find unique old_text, replace with new_text (the Edit tool pattern)" },
+        { "id": "list_dir", "label": "list_dir — list directory entries" },
+        { "id": "show_diff", "label": "show_diff — show unified diff before applying a change" }
+      ],
+      "required": true
+    },
+    {
+      "id": "tool-preference",
+      "prompt": "How should the agent decide which file tool to use?",
+      "description": "A Clojure file ending in .clj/.cljs/.cljc/.edn should go through clj-edit. Everything else through the general tool. How is that enforced?",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "By tool description: the general file tool's :description explicitly says 'For Clojure/EDN files, use clj_edit instead.' clj_edit's :description says it's the preferred tool for Clojure. The write_file op refuses .clj/.cljs/.cljc/.edn paths with a structured error pointing at clj_edit. The system prompt (or equivalent) reinforces: 'For Clojure file changes that should persist, prefer clj_edit over repl-eval.'",
+      "recommendedOptionIds": ["description-gating"],
+      "options": [
+        { "id": "description-gating", "label": "Tool descriptions gate which tool to use for which file type, plus system-prompt hint" },
+        { "id": "hard-refusal", "label": "General tool hard-refuses Clojure files; clj_edit hard-refuses non-Clojure" },
+        { "id": "router", "label": "A single 'edit' tool that auto-routes to clj-edit or general based on file extension" }
+      ],
+      "required": true
+    },
+    {
+      "id": "safety",
+      "prompt": "What safety constraints should the file tools have?",
+      "description": "Both tools write to disk. What's the safety surface?",
+      "answerMode": "multi-custom",
+      "recommendedAnswer": "write_dir constraint (only write under an allowed directory, default $cwd), reject writes to common sensitive paths (.git, target/, .clojure-mcp-light/, node_modules/), and require a confirmation flag for writes outside write_dir. No undo/rollback in v1 (defer).",
+      "recommendedOptionIds": ["write-dir", "blocked-paths", "confirm-outside-dir"],
+      "options": [
+        { "id": "write-dir", "label": "write_dir constraint (configurable; only writes under allowed root)" },
+        { "id": "blocked-paths", "label": "Block writes to .git, target/, node_modules/, etc." },
+        { "id": "confirm-outside-dir", "label": "Require a :force flag for writes outside write_dir" },
+        { "id": "rollback", "label": "Auto-backup before each write so a rollback fn can revert" }
+      ],
+      "required": true
+    },
+    {
+      "id": "tests",
+      "prompt": "What test coverage is required?",
+      "description": "How should we verify the new behavior end-to-end?",
+      "answerMode": "multi-custom",
+      "recommendedAnswer": "All four: per-op unit tests for new clj-edit ops; per-op unit tests for the general file tool; a parity/scenario test that runs the agent through a multi-step Clojure refactor (add-require → find-form → edit-form-body) and asserts the file on disk matches; an integration test that verifies the general file tool correctly refuses a Clojure path with a 'use clj_edit' error.",
+      "recommendedOptionIds": ["clj-edit-unit", "general-file-unit", "multi-step-parity", "routing-integration"],
+      "options": [
+        { "id": "clj-edit-unit", "label": "Unit tests for each new clj-edit operation" },
+        { "id": "general-file-unit", "label": "Unit tests for each general file tool operation (incl. edit_file ambiguity)" },
+        { "id": "multi-step-parity", "label": "Multi-step parity: scripted LLM refactor scenario through clj_edit ops" },
+        { "id": "routing-integration", "label": "Integration: general file tool refuses .clj with a 'use clj_edit' error" }
+      ],
+      "required": true
+    },
+    {
+      "id": "out-of-scope",
+      "prompt": "What's explicitly out of scope?",
+      "description": "Helps bound the work.",
+      "answerMode": "multi-custom",
+      "recommendedAnswer": "No changes to repl-eval (it stays as the in-memory / one-off tool per your direction). No LLM-side self-modification protocol changes. No rewrite of the existing 6 clj-edit ops (we add to them, not rewrite). No sandboxing / OS-level isolation.",
+      "recommendedOptionIds": ["no-repl-eval-changes", "no-self-mod-protocol", "no-rewrite-existing-ops"],
+      "options": [
+        { "id": "no-repl-eval-changes", "label": "Do not touch repl-eval — it stays as-is" },
+        { "id": "no-self-mod-protocol", "label": "No changes to the self-modification protocol" },
+        { "id": "no-rewrite-existing-ops", "label": "Don't rewrite the existing 6 clj-edit ops; only add new ones" },
+        { "id": "no-sandboxing", "label": "No OS-level sandboxing (no firejail, no seccomp, no chroot)" }
+      ],
+      "required": true
+    }
+  ]
+}

@@ -1,0 +1,127 @@
+{
+  "stage": "facts",
+  "title": "Lateralus file-editing reliability",
+  "goalSlug": "lateralus-file-editing",
+  "facts": [
+    {
+      "id": "fact-2",
+      "text": "The clj-edit tool gains a `create-ns` operation that creates a new Clojure file from scratch with a given ns name, optional requires, and zero or more top-level forms. The file is created at the path implied by the ns name (e.g. `my.cool.ns` → `src/my/cool/ns.clj` under the configured source root).",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    },
+    {
+      "id": "fact-3",
+      "text": "The clj-edit tool gains a `create-file` operation that creates a new file at a specified path with a given source string. Unlike `create-ns`, this does NOT derive the path from an ns name. The path's extension must still be .clj/.cljs/.cljc/.edn — clj-edit hard-refuses other extensions.",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    },
+    {
+      "id": "fact-4",
+      "text": "clj-edit hard-refuses any op that targets a file whose extension is not in {.clj .cljs .cljc .edn}, returning a structured `{:error :wrong-file-type :extension \"...\" :use-tool \"file_edit\"}` error so the LLM can switch tools.",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    },
+    {
+      "id": "fact-5",
+      "text": "A new general file tool (`file_edit`) is added with 5 operations: `read_file` (path with optional offset/limit), `write_file` (full overwrite, refuses .clj/.cljs/.cljc/.edn unless explicit), `edit_file` (find unique old_text, replace with new_text — errors if 0 or >1 matches), `list_dir` (path → entries), `show_diff` (path + new_contents → unified diff).",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    },
+    {
+      "id": "fact-6",
+      "text": "The `edit_file` operation rejects ambiguous matches (old_text appears 0 or >1 times in the file) with a structured error `{:error :ambiguous-match :occurrences N :old-text-preview \"...\"}`. If N=0, includes `:suggestion \"old_text not found in file\"`; if N>1, includes `:suggestion \"N matches; provide more context\"`.",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    },
+    {
+      "id": "fact-7",
+      "text": "The `file_edit` tool hard-refuses any op that targets a file with extension .clj/.cljs/.cljc/.edn, returning a structured `{:error :use-clj-edit :path \"...\"}` error. The exception is `read_file` which CAN read Clojure files (reading is fine; only writing is gated).",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    },
+    {
+      "id": "fact-8",
+      "text": "Both file tools (clj_edit and file_edit) enforce a `write_dir` constraint: writes are only allowed under the configured write_dir (default: project root). Writes outside write_dir require an explicit `:force true` parameter, which produces a clear log entry.",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    },
+    {
+      "id": "fact-9",
+      "text": "Both file tools block writes to a configurable list of sensitive paths: by default `.git/`, `target/`, `node_modules/`, `.clojure-mcp-light/`, `.mvn/`, `dist/`, `build/`. A write to a blocked path returns `{:error :blocked-path :path \"...\" :reason \"...\"}` without modifying the file.",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    },
+    {
+      "id": "fact-10",
+      "text": "Before every write (clj_edit create/replace/insert/remove, file_edit write_file/edit_file), the tool creates a backup of the target file at `<path>.bak.<unix-ms>` in the same directory. A `restore!` function in the tool's namespace accepts a path and reverts it from the most recent backup, returning the restored path or nil if no backup exists.",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    },
+    {
+      "id": "fact-11",
+      "text": "The file_edit tool's `show_diff` operation computes a unified diff between the current file contents and the proposed new contents, returning `{:diff \"...\" :additions N :deletions M :path \"...\"}` without writing anything. The diff is computed via `clojure.java.io` and a hand-rolled LCS-based diff (no new dependencies).",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    },
+    {
+      "id": "fact-12",
+      "text": "A parity/scenario test in `parity_test.clj` (or a new file_editing_parity_test.clj) runs a scripted LLM through a multi-step Clojure refactor: read-structure → find-form → replace-form. The test asserts (a) the LLM received the same requests, (b) the on-disk file matches the expected content, (c) the round-trip through rewrite-clj preserved all comments and whitespace.",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    },
+    {
+      "id": "fact-13",
+      "text": "A multi-tool routing integration test verifies that `file_edit` on a .clj path returns `{:error :use-clj-edit ...}` and that `clj_edit` on a .py path returns `{:error :wrong-file-type ...}`. The two tools are mutually exclusive on file-type.",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    },
+    {
+      "id": "fact-14",
+      "text": "The clj_edit tool's `create-ns` and `create-file` operations validate that the resulting file parses as valid Clojure (using edamame, same as the existing write-validation). If parsing fails, the file is NOT written and an error is returned to the LLM.",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    },
+    {
+      "id": "fact-15",
+      "text": "The clj_edit tool description (registered in the LlmClient's OpenAI tool def) explicitly states it's the preferred tool for Clojure file changes that need to persist, and the file_edit description explicitly states it's for non-Clojure files. Both descriptions are tuned so the LLM picks the right tool without ambiguity.",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    },
+    {
+      "id": "fact-16",
+      "text": "Each of the existing 6 clj-edit operations (read-structure, find-form, replace-form, insert-form, add-require, remove-form) is audited against at least one real-world LLM refactor scenario (per the audit's findings in `lateralus-self-modify-final` and `clj-edit-tool-implementation-lessons` memex cards) and any real-world failure mode — including but not limited to: clj-paren-repair mangling `(cond (pred? x) val)`, lost comments/attrs, ambiguous-form-name errors, parse failures on otherwise-valid output — is fixed. Each fix is covered by a regression test.",
+      "accepted": true,
+      "removed": false,
+      "automatedVerification": true,
+      "recommendedAutomatedVerification": true
+    }
+  ]
+}

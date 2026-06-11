@@ -289,7 +289,8 @@
                                            "  - Fix the specific error mentioned (e.g. ClassNotFoundException → fix the import)\n"
                                            "  - Simplify the code if it was too complex\n"
                                            "  - If a tool keeps failing, try a different approach or answer from what you know\n"
-                                           "Do NOT repeat the exact same call.\n"
+                                           "The stuck-loop-detector will fire mechanically if you repeat similar calls;\n"
+                                           "the corrective guidance has moved to the detector.\n"
                                            "Errors:\n"
                                            (str/join "\n" (map #(str "  " (:tool %) ": " (:error %)) errors)))})
                     (update :turn/retries inc))

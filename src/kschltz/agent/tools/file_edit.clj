@@ -29,7 +29,8 @@
   nil)
 
 (def OpType
-  [:enum "read_file" "write_file" "edit_file" "list_dir" "show_diff"])
+  [:enum "read_file" "write_file" "edit_file" "list_dir" "show_diff"
+   "restore_file" "list_backups"])
 
 (def ReadFileParams
   [:map
@@ -52,7 +53,8 @@
    [:path [:string {:min 1}]]
    [:old_text [:string {:min 1}]]
    [:new_text [:string {:min 1}]]
-   [:force {:optional true} :boolean]])
+   [:force {:optional true} :boolean]
+   [:clj-override {:optional true} :boolean]])
 
 (def ListDirParams
   [:map
@@ -64,6 +66,16 @@
    [:op [:= "show_diff"]]
    [:path [:string {:min 1}]]
    [:new_contents {:optional true} [:string {:min 1}]]])
+
+(def RestoreFileParams
+  [:map
+   [:op [:= "restore_file"]]
+   [:path [:string {:min 1}]]])
+
+(def ListBackupsParams
+  [:map
+   [:op [:= "list_backups"]]
+   [:path [:string {:min 1}]]])
 
 (def FileEditParams
   [:map
@@ -80,17 +92,6 @@
 
 ;; ---- Helpers ----
 
-(defn- read-file-lines
-  "Read a file, optionally offset and limit (1-based line numbers)."
-  [path offset limit]
-  (let [content (slurp path)
-        lines (str/split-lines content)]
-    (cond
-      (and offset limit) (vec (take limit (drop (dec offset) lines)))
-      offset (vec (drop (dec offset) lines))
-      limit (vec (take limit lines))
-      :else lines)))
-
 (defn- count-occurrences
   "Count occurrences of `needle` in `haystack`."
   [needle haystack]
@@ -102,18 +103,22 @@
           found
           (recur (+ idx (count needle)) (inc found)))))))
 
-;; ---- Op: read_file ----
-
 (defn- op-read-file [{:keys [path offset limit]}]
   (or (fs/validate-read-target! path {:clojure-only? false
                                       :tool-name "file_edit"})
-      (let [lines (read-file-lines path offset limit)
-            total (count (str/split-lines (slurp path)))]
+      ;; Slurp once, derive both the requested slice and the total count
+      ;; from the same content vector (avoids a second file read).
+      (let [all-lines (str/split-lines (slurp path))
+            lines (cond
+                    (and offset limit) (vec (take limit (drop (dec offset) all-lines)))
+                    offset (vec (drop (dec offset) all-lines))
+                    limit (vec (take limit all-lines))
+                    :else (vec all-lines))]
         {:op "read_file"
          :path path
          :content (str/join "\n" lines)
          :lines-returned (count lines)
-         :total-lines total})))
+         :total-lines (count all-lines)})))
 
 ;; ---- Op: list_dir ----
 
@@ -124,13 +129,13 @@
       (when-not (.isDirectory (io/file path))
         {:error :not-a-directory :path path :op "list_dir"
          :message (str "Not a directory: " path)})
-      (let [entries (->> (file-seq (io/file path))
-                         (filter #(and (.isFile %) (not= path (.getPath %))))
+      (let [entries (->> (.listFiles (io/file path))
+                         (remove nil?)
                          (mapv (fn [f]
                                  {:name (.getName f)
                                   :path (.getAbsolutePath f)
-                                  :size (.length f)
-                                  :is-dir false})))]
+                                  :size (when (.isFile f) (.length f))
+                                  :is-dir (.isDirectory f)})))]
         {:op "list_dir"
          :path path
          :entries entries
@@ -139,18 +144,12 @@
 ;; ---- Op: write_file ----
 
 (defn- op-write-file [{:keys [path content force clj-override]} tool]
-  (let [write-dir (or (:write-dir tool) @file-edit-write-dir)
-        ;; Hard-refuse Clojure files unless :clj-override is true
-        refuse-clj? (and (fs/clojure-file? path) (not clj-override))]
-    (or (when refuse-clj?
-          {:error :use-clj-edit
-           :path path
-           :tool "file_edit"
-           :use-tool "clj_edit"
-           :message "Clojure/EDN files must use the clj_edit tool. Pass :clj-override true to override."})
-        (fs/validate-write-target! path
-                                   {:clojure-only? false
+  (let [write-dir (or (:write-dir tool) @file-edit-write-dir)]
+    (or (fs/validate-write-target! path
+                                   {:refuse-clojure? true
+                                    :clj-override clj-override
                                     :tool-name "file_edit"
+                                    :use-tool "clj_edit"
                                     :force? force
                                     :write-dir write-dir
                                     :create? true})
@@ -168,19 +167,13 @@
 
 ;; ---- Op: edit_file ----
 
-(defn- op-edit-file [{:keys [path old_text new_text force]} tool]
-  (let [write-dir (or (:write-dir tool) @file-edit-write-dir)
-        ;; Hard-refuse Clojure files (read is fine, write is not)
-        refuse-clj? (and (fs/clojure-file? path) (not force))]
-    (or (when refuse-clj?
-          {:error :use-clj-edit
-           :path path
-           :tool "file_edit"
-           :use-tool "clj_edit"
-           :message "Clojure/EDN files must use the clj_edit tool. Pass :force true to override."})
-        (fs/validate-write-target! path
-                                   {:clojure-only? false
+(defn- op-edit-file [{:keys [path old_text new_text force clj-override]} tool]
+  (let [write-dir (or (:write-dir tool) @file-edit-write-dir)]
+    (or (fs/validate-write-target! path
+                                   {:refuse-clojure? true
+                                    :clj-override clj-override
                                     :tool-name "file_edit"
+                                    :use-tool "clj_edit"
                                     :force? force
                                     :write-dir write-dir})
         (let [content (slurp path)
@@ -188,7 +181,7 @@
           (cond
             (zero? n)
             {:op "edit_file"
-             :error :ambiguous-match
+             :error :no-match
              :occurrences 0
              :old-text-preview (subs old_text 0 (min 80 (count old_text)))
              :suggestion "old_text not found in file"}
@@ -229,6 +222,24 @@
          :old-length (count old-content)
          :new-length (count new_contents)})))
 
+;; ---- Op: restore_file ----
+
+(defn- op-restore-file [{:keys [path]}]
+  (or (when-not (.exists (io/file path))
+        {:error :file-not-found :path path :op "restore_file"
+         :message "File does not exist."})
+      (let [restored (fs/restore! path)]
+        (if restored
+          {:op "restore_file" :status :ok :path path :restored-from restored}
+          {:op "restore_file" :error :no-backup :path path
+           :message "No backup files found for this path."}))))
+
+;; ---- Op: list_backups ----
+
+(defn- op-list-backups [{:keys [path]}]
+  (let [backups (fs/list-backups path)]
+    {:op "list_backups" :path path :backups backups :count (count backups)}))
+
 ;; ---- Tool Registration ----
 
 (defn file-edit-tool
@@ -240,7 +251,8 @@
    {:type        :file-edit
     :name        (or (:name opts) "file_edit")
     :description (str "General file editing tool for non-Clojure files. "
-                      "Operations: read_file, write_file, edit_file, list_dir, show_diff. "
+                      "Operations: read_file, write_file, edit_file, list_dir, show_diff, "
+                      "restore_file, list_backups. "
                       "For Clojure/EDN files (.clj/.cljs/.cljc/.edn), use clj_edit instead — "
                       "this tool hard-refuses them with a structured error. "
                       "Respects write_dir (default: $cwd) and blocks writes to .git/, target/, "
@@ -264,10 +276,13 @@
                                            :force force :clj-override clj-override}
                                           tool))
       "edit_file"  (pr-str (op-edit-file {:path path :old_text old_text
-                                          :new_text new_text :force force}
+                                          :new_text new_text :force force
+                                          :clj-override clj-override}
                                          tool))
-      "list_dir"   (pr-str (op-list-dir {:path path}))
-      "show_diff"  (pr-str (op-show-diff {:path path :new_contents new_contents}))
+      "list_dir"      (pr-str (op-list-dir {:path path}))
+      "show_diff"     (pr-str (op-show-diff {:path path :new_contents new_contents}))
+      "restore_file"  (pr-str (op-restore-file {:path path}))
+      "list_backups"  (pr-str (op-list-backups {:path path}))
       (pr-str {:error (str "Unknown operation: " op)}))))
 
 (defmethod tools/parse :file-edit

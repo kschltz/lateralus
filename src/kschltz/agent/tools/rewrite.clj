@@ -110,10 +110,10 @@
     (vec
      (for [form forms]
        (let [form-type (cond (list? form) (str (first form))
-                                    (vector? form) "vector"
-                                    (map? form) "map"
-                                    (set? form) "set"
-                                    :else (pr-str (type form)))
+                             (vector? form) "vector"
+                             (map? form) "map"
+                             (set? form) "set"
+                             :else (pr-str (type form)))
              form-name (when (list? form)
                          (let [fst (first form)]
                            (when (symbol? fst)
@@ -234,9 +234,10 @@
                 {:op "remove-form" :path path :name name
                  :error (str "Form '" name "' not found")}
                 (let [removed (z/remove form-loc)
-                      result (str/trimr (z/root-string removed))]
-                  (spit path result)
-                  {:op "remove-form" :path path :name name :status "ok"})))
+                      result (str/trimr (z/root-string removed))
+                      _ (fs/make-backup! path)
+                      outcome (write-validated! path result)]
+                  (merge {:op "remove-form" :path path :name name} outcome))))
             (catch Exception e
               {:op "remove-form" :path path :name name :error (.getMessage e)}))))))
 
@@ -262,7 +263,6 @@
                             inserted (z/insert-right ns-name-loc (z/node new-req))
                             result (z/root-string inserted)
                             _ (fs/make-backup! path)
-                            _ (fs/make-backup! path)
                             outcome (write-validated! path result)]
                         (merge {:op "add-require" :path path :lib lib} outcome))))
                   (let [req-next (z/right require-loc)]
@@ -270,7 +270,6 @@
                       (let [entry-node (z/node (z/of-string entry-sym))
                             inserted (z/append-child req-next entry-node)
                             result (z/root-string inserted)
-                            _ (fs/make-backup! path)
                             _ (fs/make-backup! path)
                             outcome (write-validated! path result)]
                         (merge {:op "add-require" :path path :lib lib} outcome))
@@ -301,13 +300,13 @@
                      (when (seq requires)
                        (str "\n  (:require\n    "
                             (clojure.string/join "\n    "
-                                                (map (fn [r]
-                                                       (let [{:keys [lib as refer]} r]
-                                                         (str lib
-                                                              (when as (str " :as " as))
-                                                              (when (seq refer)
-                                                                (str " :refer [" (clojure.string/join " " refer) "]")))))
-                                                     requires))
+                                                 (map (fn [r]
+                                                        (let [{:keys [lib as refer]} r]
+                                                          (str lib
+                                                               (when as (str " :as " as))
+                                                               (when (seq refer)
+                                                                 (str " :refer [" (clojure.string/join " " refer) "]")))))
+                                                      requires))
                             ")"))
                      ")")
         body (when (seq forms) (str "\n\n" (clojure.string/join "\n\n" forms)))]
@@ -383,11 +382,11 @@
    {:type        :clj-edit
     :name        (or (:name opts) "clj_edit")
     :description (str "The preferred tool for Clojure file changes that need to persist. "
-                     "Structured Clojure/EDN source editing via rewrite-clj. "
-                     "Operations: read-structure, find-form, replace-form, insert-form, "
-                     "add-require, remove-form, create-ns, create-file. "
-                     "Preserves comments and formatting. "
-                     "Hard-refuses non-Clojure files (use the file_edit tool for those).")
+                      "Structured Clojure/EDN source editing via rewrite-clj. "
+                      "Operations: read-structure, find-form, replace-form, insert-form, "
+                      "add-require, remove-form, create-ns, create-file. "
+                      "Preserves comments and formatting. "
+                      "Hard-refuses non-Clojure files (use the file_edit tool for those).")
     :parameters  CljEditParams
     :write-dir   (or (:write-dir opts) (System/getProperty "user.dir"))}))
 
@@ -410,8 +409,8 @@
       "add-require"    (pr-str (op-add-require path require-entry write-dir))
       "remove-form"    (pr-str (op-remove-form path name write-dir))
       "create-ns"      (pr-str (op-create-ns {:ns ns :requires requires
-                                               :forms forms :source-root source-root}
-                                              write-dir))
+                                              :forms forms :source-root source-root}
+                                             write-dir))
       "create-file"    (pr-str (op-create-file {:path path :source source} write-dir))
       (pr-str {:error (str "Unknown operation: " op)}))))
 

@@ -64,6 +64,23 @@
   (testing "default write-dir is project cwd"
     (is (fs/within-write-dir? (str (System/getProperty "user.dir") "/foo.clj")))))
 
+(deftest within-write-dir?-rejects-prefix-bypass
+  (testing "P0-1: /proj/lateralus-evil does NOT match write-dir /proj/lateralus"
+    ;; Simulate by creating a real dir and an 'evil' sibling
+    (let [parent (temp-dir)
+          legit (str parent "/legit")
+          evil-sibling (str parent "/legit-evil")
+          _ (.mkdirs (io/file legit))
+          _ (.mkdirs (io/file evil-sibling))
+          inside (str legit "/file.clj")
+          outside (str evil-sibling "/file.clj")]
+      (is (fs/within-write-dir? inside legit)
+          "file inside legit IS within write-dir")
+      (is (not (fs/within-write-dir? outside legit))
+          "file in 'legit-evil' sibling is REJECTED — prefix bypass prevented")
+      (.delete (io/file legit))
+      (.delete (io/file evil-sibling)))))
+
 ;; ---- blocked-path? ----
 
 (deftest blocked-path?-default-set

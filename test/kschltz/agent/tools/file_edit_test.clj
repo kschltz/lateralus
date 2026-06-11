@@ -83,16 +83,35 @@
 
 ;; ---- write_file ----
 
-(deftest write-file-creates-new
-  (let [f (str test-dir "/fe-write-test.txt")
-        _ (cleanup! f)
-        r (tools/parse (fe/file-edit-tool {:write-dir test-dir})
-                       (tools/run (fe/file-edit-tool {:write-dir test-dir}) {:op "write_file" :path f
-                                                                             :content "hello\nworld"}))]
-    (is (= :ok (:status r)))
-    (is (= 11 (:bytes-written r)))
-    (is (= "hello\nworld" (slurp f)))
-    (cleanup! f)))
+(deftest list-dir-not-recursive
+  (testing "P0-2: list_dir returns only IMMEDIATE children, not subdirectory contents"
+    (let [d (str test-dir "/fe-list-not-recursive")
+          sub (str d "/sub")
+          _ (.mkdirs (io/file d))
+          _ (.mkdirs (io/file sub))
+          _ (spit (str d "/top.txt") "t")
+          _ (spit (str sub "/nested.txt") "n")
+          r (tools/parse (fe/file-edit-tool {:write-dir test-dir})
+                         (tools/run (fe/file-edit-tool {:write-dir test-dir})
+                                    {:op "list_dir" :path d}))]
+      (is (= 2 (:count r)) "returns 2 entries (top.txt + sub/)")
+      (is (= #{"top.txt" "sub"} (set (map :name (:entries r))))
+          "nested.txt does NOT appear (it's inside sub/)")
+      (is (some #(and (:is-dir %) (= "sub" (:name %))) (:entries r))
+          "the 'sub' directory IS included as a directory entry")
+      (cleanup! (str d "/top.txt"))
+      (cleanup! (str sub "/nested.txt"))
+      (.delete (io/file sub))
+      (.delete (io/file d))))) (deftest write-file-creates-new
+                                 (let [f (str test-dir "/fe-write-test.txt")
+                                       _ (cleanup! f)
+                                       r (tools/parse (fe/file-edit-tool {:write-dir test-dir})
+                                                      (tools/run (fe/file-edit-tool {:write-dir test-dir}) {:op "write_file" :path f
+                                                                                                            :content "hello\nworld"}))]
+                                   (is (= :ok (:status r)))
+                                   (is (= 11 (:bytes-written r)))
+                                   (is (= "hello\nworld" (slurp f)))
+                                   (cleanup! f)))
 
 (deftest write-file-overwrites
   (let [f (temp-file "old content")
@@ -147,16 +166,17 @@
     (is (re-find #"FOO BAR" (slurp f)))
     (cleanup! f)))
 
-(deftest edit-file-rejects-ambiguous-zero-matches
-  (let [f (temp-file "hello world")
-        r (tools/parse (fe/file-edit-tool {:write-dir test-dir})
-                       (tools/run (fe/file-edit-tool {:write-dir test-dir}) {:op "edit_file" :path f
-                                                                             :old_text "nonexistent"
-                                                                             :new_text "x"}))]
-    (is (= :ambiguous-match (:error r)))
-    (is (= 0 (:occurrences r)))
-    (is (string? (:suggestion r)))
-    (cleanup! f)))
+(deftest edit-file-rejects-no-match
+  (testing "P2-6: 0 matches returns :no-match (NOT :ambiguous-match)"
+    (let [f (temp-file "hello world")
+          r (tools/parse (fe/file-edit-tool {:write-dir test-dir})
+                         (tools/run (fe/file-edit-tool {:write-dir test-dir}) {:op "edit_file" :path f
+                                                                               :old_text "nonexistent"
+                                                                               :new_text "x"}))]
+      (is (= :no-match (:error r)))
+      (is (= 0 (:occurrences r)))
+      (is (string? (:suggestion r)))
+      (cleanup! f))))
 
 (deftest edit-file-rejects-ambiguous-multiple-matches
   (let [f (temp-file "abc\nabc\nabc")
@@ -203,6 +223,47 @@
       (cleanup! f))))
 
 ;; ---- Tool definition sanity ----
+
+;; ---- restore_file / list_backups ----
+
+(deftest restore-file-restores-from-backup
+  (testing "restore_file reverts a file to its most recent backup"
+    (let [f (temp-file "v1")
+          _ (Thread/sleep 5)
+          b (kschltz.agent.tools.file-safety/make-backup! f) ; "v1" backup
+          _ (spit f "v2")
+          r (tools/parse (fe/file-edit-tool {:write-dir test-dir})
+                         (tools/run (fe/file-edit-tool {:write-dir test-dir})
+                                    {:op "restore_file" :path f}))]
+      (is (= :ok (:status r)))
+      (is (= "v1" (slurp f)) "file restored to v1 content")
+      (cleanup! f)
+      (cleanup! b))))
+
+(deftest restore-file-no-backup
+  (testing "restore_file on a file with no backup returns :no-backup"
+    (let [f (temp-file "x")
+          r (tools/parse (fe/file-edit-tool {:write-dir test-dir})
+                         (tools/run (fe/file-edit-tool {:write-dir test-dir})
+                                    {:op "restore_file" :path f}))]
+      (is (= :no-backup (:error r)))
+      (cleanup! f))))
+
+(deftest list-backups-returns-sorted
+  (testing "list_backups returns backup paths newest-first"
+    (let [f (temp-file "v1")
+          _ (Thread/sleep 5)
+          b1 (kschltz.agent.tools.file-safety/make-backup! f)
+          _ (Thread/sleep 5)
+          b2 (kschltz.agent.tools.file-safety/make-backup! f)
+          r (tools/parse (fe/file-edit-tool {:write-dir test-dir})
+                         (tools/run (fe/file-edit-tool {:write-dir test-dir})
+                                    {:op "list_backups" :path f}))]
+      (is (= 2 (:count r)))
+      (is (= b2 (first (:backups r))) "newest first")
+      (is (= b1 (second (:backups r))))
+      (cleanup! f)
+      (doseq [b [b1 b2]] (cleanup! b)))))
 
 (deftest file-edit-tool-metadata
   (testing "tool has the right type, name, and parameters"

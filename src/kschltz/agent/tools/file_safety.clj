@@ -57,15 +57,19 @@
 (defn within-write-dir?
   "True when `path` is at or under `write-dir` (default: project cwd).
    Both paths are canonicalized before comparison so symlinks and
-   `..` segments are normalized."
+   `..` segments are normalized. A path-segment boundary check (a `/`
+   after the write-dir prefix) prevents the prefix-bypass attack where
+   `/proj/lateralus-evil/file` would match write-dir `/proj/lateralus`."
   ([path] (within-write-dir? path nil))
   ([path write-dir]
    (let [write-dir (or write-dir (System/getProperty "user.dir"))
          p (canonical path)
-         d (canonical write-dir)]
-     (or (str/starts-with? p d)
-         ;; Allow exact match (starts-with of d by d)
-         (= p d)))))
+         d (canonical write-dir)
+         sep java.io.File/separator]
+     (or (= p d)
+         (and (str/starts-with? p d)
+              (or (= (.charAt p (count d)) \/)
+                  (= (.charAt p (count d)) (first sep))))))))
 
 ;; ---- Blocked-paths list ----
 
@@ -159,22 +163,39 @@
      4. The parent directory exists or can be created (for create ops)
 
    `opts` keys:
-     :clojure-only?   — bool, default false
+     :clojure-only?   — bool, default false (this tool is Clojure-only;
+                        refuse non-Clojure paths)
+     :refuse-clojure? — bool, default false (this tool is NOT for
+                        Clojure files; refuse Clojure paths unless
+                        :clj-override is true)
      :force?          — bool, default false (bypasses write_dir check)
+     :clj-override    — bool, default false (bypasses :refuse-clojure?)
      :write-dir       — string, default $cwd
      :blocked-set     — set, default default-blocked-paths
      :create?         — bool, default false (allows non-existent parents)
      :tool-name       — string, used in error messages
      :use-tool        — string, included in error when clojure-only? fails"
-  [path {:keys [clojure-only? force? write-dir blocked-set create?
-                tool-name use-tool]
+  [path {:keys [clojure-only? refuse-clojure? force? clj-override
+                write-dir blocked-set create? tool-name use-tool]
          :or   {clojure-only? false
+                refuse-clojure? false
                 force? false
+                clj-override false
                 write-dir (System/getProperty "user.dir")
                 blocked-set default-blocked-paths
                 create? false
                 tool-name "file_edit"}}]
   (cond
+    ;; 0. Refuse-Clojure check (for file_edit etc.) — checked FIRST so
+    ;;    the LLM gets the routing hint before any other error.
+    (and refuse-clojure? (clojure-file? path) (not clj-override))
+    {:error :use-clj-edit
+     :path path
+     :tool tool-name
+     :use-tool (or use-tool "clj_edit")
+     :message (str (or use-tool "clj_edit")
+                   " should be used for Clojure files. Pass :clj-override true to bypass.")}
+
     ;; 1. Clojure-only check (for clj_edit)
     (and clojure-only? (not (clojure-file? path)))
     {:error :wrong-file-type

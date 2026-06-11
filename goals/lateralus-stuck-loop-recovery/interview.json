@@ -1,0 +1,124 @@
+{
+  "stage": "interview",
+  "title": "Lateralus stuck-loop & timeout recovery",
+  "goalSlug": "lateralus-stuck-loop-recovery",
+  "questions": [
+    {
+      "id": "scope",
+      "prompt": "What scope of fix do you want?",
+      "description": "The session showed four symptoms (tool-result spin, empty-result ignored, viz failure, post-timeout unresponsiveness). Pick which ones this goal should address.",
+      "answerMode": "multi-custom",
+      "recommendedAnswer": "All four: stuck-loop detection, empty-result strategy shift, tool-failure self-diagnosis, and timeout recovery. They're all facets of the same root issue (no progress detection + no resilient failure handling).",
+      "recommendedOptionIds": ["stuck-loop", "empty-result", "tool-failure", "timeout-recovery"],
+      "options": [
+        { "id": "stuck-loop", "label": "Stuck-loop detection (repeated similar tool calls)" },
+        { "id": "empty-result", "label": "Empty/duplicate tool-result strategy shift" },
+        { "id": "tool-failure", "label": "Tool-failure self-diagnosis (e.g. Portal not opening)" },
+        { "id": "timeout-recovery", "label": "Post-timeout session unresponsiveness" }
+      ],
+      "required": true
+    },
+    {
+      "id": "detection-mechanism",
+      "prompt": "How should the agent detect it's stuck?",
+      "description": "Mechanism for recognizing no progress is being made.",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "Hybrid: hash recent tool-call signatures (tool + args) and flag when the last N calls have low diversity, combined with checking if tool results are non-empty and new. This catches both 'repeating the same search' and 'getting back nothing useful'.",
+      "recommendedOptionIds": ["hash-similarity"],
+      "options": [
+        { "id": "hash-similarity", "label": "Hash recent (tool, args) pairs — flag low diversity" },
+        { "id": "embedding-similarity", "label": "Embed tool args and compare — slower but semantically aware" },
+        { "id": "result-novelty", "label": "Compare new tool results to prior results — flag no-new-info" },
+        { "id": "all-of-the-above", "label": "All three layered together" }
+      ],
+      "required": true
+    },
+    {
+      "id": "intervention",
+      "prompt": "What should happen when the agent detects it's stuck?",
+      "description": "How aggressive should the recovery be?",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "Inject a corrective user message: 'You've called the same tool N times with similar args and are not making progress. Try a fundamentally different approach: use a different tool, simplify the question, or answer from what you know.' Then allow one more attempt. If still stuck, terminate the turn with an explanation.",
+      "recommendedOptionIds": ["inject-guidance"],
+      "options": [
+        { "id": "inject-guidance", "label": "Inject corrective user-message and allow N more retries" },
+        { "id": "force-tool-switch", "label": "Forbid the repeated tool on next attempt (hard block)" },
+        { "id": "summarize-and-stop", "label": "Skip remaining depth, force synthesis from existing results" },
+        { "id": "escalate-to-user", "label": "Stop the turn and ask the user for guidance" }
+      ],
+      "required": true
+    },
+    {
+      "id": "timeout-recovery",
+      "prompt": "How should timeout-induced unresponsiveness be handled?",
+      "description": "The session went dead after [timeout waiting for response]. This is a protocol/transport issue, not a logic one.",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "The agent-loop (Clojure side) should have a watchdog: if no state change occurs in N seconds, kill the in-flight LLM call, reset the message queue, and surface a 'session was unresponsive' error to the user via the :on-error callback. The CLI should not deadlock waiting on a never-delivered promise.",
+      "recommendedOptionIds": ["watchdog"],
+      "options": [
+        { "id": "watchdog", "label": "Clojure-side watchdog with hard timeout on LLM call + queue reset" },
+        { "id": "promise-timeout", "label": "Wrap deliver-response in a timeout with fallback error" },
+        { "id": "heartbeat", "label": "Periodic heartbeat from the LLM client that the loop checks" }
+      ],
+      "required": true
+    },
+    {
+      "id": "portal-diagnostics",
+      "prompt": "Should the visualize tool get self-diagnostic improvements?",
+      "description": "The repl-eval+visualize path silently produced no output. The agent should know when Portal isn't actually displaying.",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "Yes — the visualize tool should return a structured result that includes (1) whether Portal was successfully opened/connected, (2) the data hash so the agent can confirm it was submitted, and (3) a hint to the user to check the Portal window if submission succeeded. The agent loop should treat 'visualize called, no portal detected' as a recoverable error, not silent success.",
+      "recommendedOptionIds": ["structured-result"],
+      "options": [
+        { "id": "structured-result", "label": "Return structured {:portal-open? :data-submitted? :hint} from visualize" },
+        { "id": "verify-render", "label": "Verify Portal is actually rendering (e.g. via Portal API health check)" },
+        { "id": "skip-portal", "label": "Skip Portal entirely — just print to terminal or write to file" }
+      ],
+      "required": true
+    },
+    {
+      "id": "implementation-layer",
+      "prompt": "Where in the architecture should this live?",
+      "description": "The new interceptor architecture (chain.clj, interceptors.clj) is the natural place for cross-cutting loop concerns.",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "Add a new :guard slot interceptor 'stuck-loop-detector' (interceptors.clj) that runs in :enter, computes a signature hash of recent tool calls, and when stuck is detected, enqueues a corrective guidance stage. Timeout watchdog goes in agent-loop (loop.clj) since it's a transport concern. Portal diagnostics are tool-local (tools/portal.clj).",
+      "recommendedOptionIds": ["interceptor-pattern"],
+      "options": [
+        { "id": "interceptor-pattern", "label": "New :guard slot interceptor in interceptors.clj + tool-local fixes" },
+        { "id": "loop-modification", "label": "Modify llm-turn / process-messages directly in loop.clj" },
+        { "id": "plugin", "label": "Add as a new plugin (plugins/stuck_loop.clj) so it's opt-in" }
+      ],
+      "required": true
+    },
+    {
+      "id": "tests-required",
+      "prompt": "What test coverage is required?",
+      "description": "How should we verify the new behavior?",
+      "answerMode": "multi-custom",
+      "recommendedAnswer": "All four: parity tests for stuck-loop detection (scripted LLM that repeats the same call), unit tests for the hash/similarity function, integration test for timeout watchdog (simulated hung LLM client), and a Portal mock that returns a structured result.",
+      "recommendedOptionIds": ["parity", "unit", "integration", "portal-mock"],
+      "options": [
+        { "id": "parity", "label": "Parity tests (scripted LLM that simulates stuck behavior)" },
+        { "id": "unit", "label": "Unit tests for detection fn (hash, signature comparison)" },
+        { "id": "integration", "label": "Integration test for timeout watchdog with mocked hung LLM" },
+        { "id": "portal-mock", "label": "Mock Portal client that returns structured :portal-open? status" }
+      ],
+      "required": true
+    },
+    {
+      "id": "out-of-scope",
+      "prompt": "What's explicitly out of scope?",
+      "description": "Helps bound the work.",
+      "answerMode": "multi-custom",
+      "recommendedAnswer": "No changes to memory backend, no LLM provider swap, no new web-search backend, no work on the test-isolation Datalevin corruption issue (that's pre-existing and separate).",
+      "recommendedOptionIds": ["no-memory-changes", "no-provider-swap", "no-test-isolation"],
+      "options": [
+        { "id": "no-memory-changes", "label": "No memory backend / Datalevin changes" },
+        { "id": "no-provider-swap", "label": "No LLM provider changes (keep :openai-compatible default)" },
+        { "id": "no-test-isolation", "label": "No fix for the pre-existing test-runner Datalevin corruption" },
+        { "id": "no-new-tools", "label": "No new tools — only modifications to existing ones" }
+      ],
+      "required": true
+    }
+  ]
+}

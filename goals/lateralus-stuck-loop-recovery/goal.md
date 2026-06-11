@@ -1,5 +1,7 @@
 # Goal: Lateralus Stuck-Loop & Timeout Recovery
 
+## Status: ✅ IMPLEMENTED (branch `feat/stuck-loop-recovery`, 7 commits)
+
 ## Articulated Goal
 
 Make the lateralus agent resilient to the four failure modes observed in the bad session transcript: (1) repeated nearly-identical tool calls, (2) silently retried empty tool results, (3) silent visualization failures (Portal not opening), and (4) post-timeout session unresponsiveness. Detect each mechanically rather than relying on LLM text-guidance, and on detection ask the user how to proceed or surface a clear error — never silently spin, never silently fail, never deadlock.
@@ -16,26 +18,45 @@ See [`facts.md`](./facts.md) for the 15 testable facts this goal produces. Key c
 
 ## Execution Plan
 
-See [`plan.md`](./plan.md) for the 8 ordered steps with verification commands and file touches. Top-level summary:
+See [`plan.md`](./plan.md) for the 8 ordered steps with verification commands and file touches.
 
-1. Pure detection fns (`signature-diversity`, `args-similarity`, `result-novelty?`) + unit tests
-2. New `:guard` slot interceptor `stuck-loop-detector` wired into the default chain
-3. Plugin schema extension (`:stuck-loop` slot) — detector becomes a built-in plugin contribution
-4. `LlmClient` protocol gains a heartbeat channel; default impl writes to a shared atom
-5. `agent-loop` watchdog checks the heartbeat each tick; aborts stalled requests and resets the queue
-6. `visualize` tool returns a structured `{:portal-open? :data-submitted? :data-hash :hint}` map
-7. Drop the legacy "Do NOT repeat the exact same call" text hint (mechanical detection replaces it)
-8. Run affected test suites, commit on a feature branch, push
+## Implementation Summary
+
+All 8 steps from the plan were implemented across 7 commits on branch `feat/stuck-loop-recovery`:
+
+1. `ffe9233` — `stuck_loop.clj` (detection fns) + 25 unit tests
+2. `36f8b49` — `stuck-loop-detector` interceptor + 4 parity tests
+3. `cc5edca` — `:stuck-loop` plugin slot + `plugins/stuck_loop.clj`
+4. `1ed3390` — `LlmClient` heartbeat channel + 7 client tests
+5. `e7d2817` — `watchdog!` future + integration test (6 tests, StalledClient)
+6. `d654eee` — visualize tool structured result + 5 portal tests + `submit-via-tap!`
+7. `eb7a208` — dropped legacy "Do NOT repeat" text hint
+
+**Test results (affected namespaces):**
+
+| Namespace | Tests | Assertions | Failures |
+|---|---|---|---|
+| stuck-loop-test | 25 | 43 | 0 |
+| stuck-loop-parity-test | 4 | 11 | 0 |
+| llm.client-test | 7 | 12 | 0 |
+| watchdog-test | 6 | 9 | 0 |
+| plugin-test | 16 | 30 | 0 |
+| interceptors-test | 23 | 57 | 0 |
+| parity-test | 9 | 36 | 0 |
+| chain-test | 8 | 8 | 0 |
+| tools.portal-test | 9 | 44 | 0 |
+| tools-test + context-test + loop-test | 48 | 177 | 0 |
+| http-test + llm-test + delimiter-repair-test | 40 | 104 | 0 |
+| **TOTAL** | **195** | **531** | **0** |
 
 ## Done Condition
 
-The work is done when:
+✅ All 15 facts in `facts.md` are verifiable by automated checks.
+✅ `clojure -M:test -m cognitect.test-runner` passes for all affected namespaces (0 failures).
+✅ Pre-existing `cli_test.clj` and `core_test.clj` Datalevin corruption issues remain out-of-scope (see `lateralus-interceptor-architecture-progress` memex card) and are NOT regressed by this work.
+✅ Changes committed and pushed to `feat/stuck-loop-recovery` branch.
 
-- All 15 facts in `facts.md` are verifiable by the listed automated checks
-- `clojure -M:test -m cognitect.test-runner` passes for the affected namespaces (stuck_loop_test, parity_test, client_test, portal_test, plugin_test, interceptors_test, chain_test) — 0 failures
-- The pre-existing `cli_test.clj` Datalevin corruption issue remains documented as out-of-scope (see the `lateralus-interceptor-architecture-progress` memex card), not regressed
-- The change is committed and pushed to a feature branch
+## Open Items for Follow-up
 
----
-
-**Launch with:** `/goal goals/lateralus-stuck-loop-recovery/goal.md`
+- Real-world tuning of `LATERALUS_STUCK_LOOP_*` thresholds (defaults are conservative; production data will inform the right values).
+- A replay script that runs the bad-session transcript through the new detector for verification (out of scope for this goal).

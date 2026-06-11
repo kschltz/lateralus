@@ -29,7 +29,18 @@
   (call [this opts]
     "Synchronous call. Returns a raw response map. May throw on
      transport/4xx/5xx errors; the llm-call interceptor catches those
-     and converts them into :llm/api-error on the ctx."))
+     and converts them into :llm/api-error on the ctx.")
+  (start-heartbeat! [this]
+    "Begin writing heartbeat timestamps to a fresh atom while a call
+     is in flight. Returns the atom; the loop checks the timestamp to
+     detect a stalled request. The atom must be reset/cleared on call
+     completion. Default impl uses a future that writes every 5s; impls
+     can override for tighter integration (e.g. hato streaming).")
+  (cancel [this heartbeat-ref]
+    "Best-effort cancellation of an in-flight call. For HTTP, this is
+     a no-op (we cannot revoke an in-flight hato request) but the
+     agent-loop uses this to mark the request as cancelled so the
+     next :send clears stale state. Returns nil."))
 
 (defn- ->clj [x]
   (if (map? x) (into {} x) x))
@@ -42,7 +53,26 @@
                :api-key     api-key
                :model       model
                :messages    messages
-               :tools       tools})))
+               :tools       tools}))
+  (start-heartbeat! [_]
+    (let [state (atom {:last-beat (System/currentTimeMillis)
+                       :running?  true
+                       :future    nil})
+          heartbeat-future
+          (future
+            (try
+              (while (:running? @state)
+                (Thread/sleep 5000)
+                (when (:running? @state)
+                  (swap! state assoc :last-beat (System/currentTimeMillis))))
+              (catch Throwable _ nil)))]
+      (swap! state assoc :future heartbeat-future)
+      state))
+  (cancel [_ heartbeat-state]
+    (swap! heartbeat-state assoc :running? false)
+    (when-let [f (:future @heartbeat-state)]
+      (future-cancel f))
+    nil))
 
 (defn default-client
   "Build the default LlmClient (wraps `llm/call`)."
@@ -63,4 +93,6 @@
       (let [resp (call client opts)]
         (when-let [err (m/explain CallResponse (->clj resp))]
           (throw (ex-info "LlmClient.call: invalid response" {:explain err})))
-        resp))))
+        resp))
+    (start-heartbeat! [_] (start-heartbeat! client))
+    (cancel [_ ref] (cancel client ref))))

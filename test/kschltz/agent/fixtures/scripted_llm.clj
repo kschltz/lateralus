@@ -16,7 +16,9 @@
     (let [idx (count @calls)
           resp (nth script idx {:choices [{:message {:content (str "(script exhausted at call " idx ")")}}]})]
       (swap! calls conj (assoc opts :_script-index idx))
-      resp)))
+      resp))
+  (start-heartbeat! [_] (atom (System/currentTimeMillis)))
+  (cancel [_ _] nil))
 
 (defn scripted
   "Build a scripted LLM client.

@@ -51,6 +51,28 @@
       (is (re-find #"\+a" out))
       (is (re-find #"\+b" out)))))
 
+(deftest unified-diff-size-guard
+  (testing "P3-10: huge inputs return :too-large before O(n*m) blowup"
+    (let [;; Simulate "huge" by overriding the env-backed cap to 10
+          big-xs (vec (repeat 100 "line"))
+          big-ys (vec (repeat 100 "different line"))
+          cap-fn (fn [] 10)]
+      (with-redefs [kschltz.agent.tools.diff/max-diff-lines 10]
+        (let [out (kschltz.agent.tools.diff/unified-diff big-xs big-ys)]
+          (is (re-find #":too-large" out)
+              "returns :too-large marker")
+          (is (re-find #":line-count 200" out)
+              "reports actual line count")
+          (is (re-find #":max 10" out)
+              "reports the cap"))))))
+
+(deftest unified-diff-under-cap-runs
+  (testing "inputs under the cap compute the diff normally"
+    (let [out (kschltz.agent.tools.diff/unified-diff
+               ["a" "b" "c"] ["a" "x" "c"])]
+      (is (string? out))
+      (is (re-find #"@@" out) "produces hunk markers"))))
+
 (deftest unified-diff-handles-empty-new
   (testing "all-delete case (lines old, empty new)"
     (let [out (diff/unified-diff ["a" "b"] [])]

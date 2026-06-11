@@ -104,21 +104,39 @@
       (= :equal (first (nth ops j))) (recur (inc j))
       :else j)))
 
+(def ^:private max-diff-lines
+  "Hard cap on the number of lines LCS will process in a single diff.
+   O(n*m) memory and time blow up quadratically; at 10k×10k that's
+   100M cell allocations. The cap returns :too-large before that
+   happens. Env override: LATERALUS_DIFF_MAX_LINES."
+  (or (some-> (System/getenv "LATERALUS_DIFF_MAX_LINES") parse-long)
+      10000))
+
 (defn unified-diff
   "Compute a unified diff between two vectors of strings (lines).
    ctx is the number of context lines around each hunk (default 3).
-   Returns a string in standard unified-diff format."
+   Returns a string in standard unified-diff format.
+
+   If the input exceeds max-diff-lines (default 10000), returns
+   {:too-large :line-count N :max N :suggestion 'Use show_diff on a
+   smaller slice or split the change into multiple edits'} instead of
+   computing the diff. This prevents O(n*m) blowup on huge files."
   ([xs ys] (unified-diff xs ys 3))
   ([xs ys ctx]
-   (let [ops (diff-ops xs ys)
-         hunks (loop [i 0
-                      out (transient [])]
-                 (if (>= i (count ops))
-                   (persistent! out)
-                   (let [end (find-hunk-end ops i)
-                         h (hunk ctx xs ys ops i (min (inc end) (count ops)))]
-                     (recur (inc end) (conj! out h)))))]
-     (str/join "\n\n" hunks))))
+   (let [n (+ (count xs) (count ys))]
+     (if (> n max-diff-lines)
+       (str "{:too-large :line-count " n
+            " :max " max-diff-lines
+            " :suggestion \"Use show_diff on a smaller slice or split the change into multiple edits\"}")
+       (let [ops (diff-ops xs ys)
+             hunks (loop [i 0
+                          out (transient [])]
+                     (if (>= i (count ops))
+                       (persistent! out)
+                       (let [end (find-hunk-end ops i)
+                             h (hunk ctx xs ys ops i (min (inc end) (count ops)))]
+                         (recur (inc end) (conj! out h)))))]
+         (str/join "\n\n" hunks))))))
 
 (defn diff-stats
   "Compute {:additions N :deletions M} for a diff between xs and ys."

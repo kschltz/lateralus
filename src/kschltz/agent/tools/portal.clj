@@ -43,6 +43,16 @@
   ([portal] (p/close portal) nil)
   ([] (p/close :all) nil))
 
+(defn submit-via-tap!
+  "Submit a value to Portal via the tap> system. Wraps clojure.core/tap>
+   so tests can stub it via with-redefs on this var. Returns true on
+   successful submission, false on any error."
+  [valued]
+  (try
+    (clojure.core/tap> valued)
+    true
+    (catch Throwable _ false)))
+
 (defn submit!
   "Submit a value to a Portal inspector. Returns nil (side-effect only)."
   [portal value]
@@ -64,6 +74,13 @@
 (def ^:private portal-tapped?
   "True once Portal is open and registered as a tap> target."
   (atom false))
+
+(defn reset-portal-tapped-for-test
+  "Reset the private `portal-tapped?` atom to false. For tests only;
+   lets a test rebind `open!` and have it actually be called."
+  []
+  (reset! portal-tapped? false)
+  nil)
 
 (defn ensure-tap-portal!
   "Open Portal and register tap> on first call. No-op on subsequent calls.
@@ -417,7 +434,7 @@
           (if (symbol? parsed)
             {:data parsed :parsed? false
              :error (str "data looks like a variable name, not data: " trimmed
-                          " — pass the actual EDN/JSON value")}
+                         " — pass the actual EDN/JSON value")}
             {:data parsed :parsed? true}))
         (catch Exception e1
           (try
@@ -497,26 +514,55 @@
 
 (defmethod tools/run :visualize
   [_tool args]
-  (let [{:keys [data viewer title parsed? parse-error]} (normalize-visualize-args args)]
+  (let [{:keys [data viewer title parsed? parse-error]} (normalize-visualize-args args)
+        data-str (pr-str data)
+        data-hash-str (try
+                        (let [md (java.security.MessageDigest/getInstance "SHA-256")]
+                          (.update md (.getBytes data-str "UTF-8"))
+                          (.toString (java.math.BigInteger. 1 (.digest md)) 16))
+                        (catch Throwable _ nil))]
     (cond
       (false? parsed?)
       (pr-str {:status :error
                :message (or parse-error
-                            "Could not parse :data — pass actual EDN/JSON, not a variable name")})
+                            "Could not parse :data — pass actual EDN/JSON, not a variable name")
+               :portal-open? false
+               :data-submitted? false
+               :data-hash nil
+               :hint "Fix the :data argument and retry."})
 
       (not (data-ready? data viewer))
       (pr-str {:status :error
                :message (str "Viewer " viewer " needs parsed data (vector/map), got string. "
-                             "Pass EDN like [{:k v}] or [:html [:body ...]]")})
+                             "Pass EDN like [{:k v}] or [:html [:body ...]]")
+               :portal-open? false
+               :data-submitted? false
+               :data-hash nil
+               :hint "Pass EDN/JSON as :data, not a string."})
 
       :else
-      (let [_portal (ensure-tap-portal! (when title {:title title}))
-            valued (prepare-for-portal data viewer)]
-        (clojure.core/tap> valued)
-        (pr-str {:status   :ok
-                 :viewer   (or viewer :default)
+      (let [portal-result (ensure-tap-portal! (when title {:title title}))
+            portal-open? (some? portal-result)
+            data-submitted? (let [valued (prepare-for-portal data viewer)]
+                              (submit-via-tap! valued))
+            hint (cond
+                   (not portal-open?)
+                   "Portal could not be opened. Check that djblue/portal is on the classpath and that no display restrictions are in effect."
+                   (not data-submitted?)
+                   "Portal is open but the data was not accepted by tap>. This usually means the data is not serializable."
+                   :else nil)]
+        (pr-str {:status (if (and portal-open? data-submitted?)
+                           :ok
+                           (cond (not portal-open?) :portal-unavailable
+                                 (not data-submitted?) :submit-failed
+                                 :else :error))
+                 :portal-open? portal-open?
+                 :data-submitted? data-submitted?
+                 :data-hash data-hash-str
                  :data-type (.getSimpleName (class data))
-                 :preview  (subs (pr-str data) 0 (min 120 (count (pr-str data))))})))))
+                 :preview (subs data-str 0 (min 120 (count data-str)))
+                 :viewer (or viewer :default)
+                 :hint hint})))))
 
 (defmethod tools/parse :visualize
   [_ response]

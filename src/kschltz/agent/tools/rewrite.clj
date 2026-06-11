@@ -1,18 +1,25 @@
 (ns kschltz.agent.tools.rewrite
   "Source editing tool — rewrite-clj powered structural Clojure/EDN editing.
    The LLM describes WHAT to change; rewrite-clj does the structural edit,
-   preserving comments and whitespace."
+   preserving comments and whitespace.
+
+   Per the file-editing-reliability goal: this tool hard-refuses non-Clojure
+   files (routing them to the general file_edit tool), enforces a write_dir
+   constraint, blocks writes to sensitive paths, and auto-backups before
+   every write. See kschltz.agent.tools.file-safety for the shared scaffolding."
   (:require [rewrite-clj.zip :as z]
             [rewrite-clj.node :as n]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [edamame.core :as edamame]
             [kschltz.agent.tools :as tools]
+            [kschltz.agent.tools.file-safety :as fs]
             [malli.core :as m]))
 
 (def OpType
   [:enum "read-structure" "find-form" "replace-form"
-   "insert-form" "add-require" "remove-form"])
+   "insert-form" "add-require" "remove-form"
+   "create-ns" "create-file"])
 
 (def RequireEntry
   [:map
@@ -23,33 +30,59 @@
 (def CljEditParams
   [:map
    [:op OpType]
-   [:path [:string {:min 1}]]
+   [:path {:optional true} [:string {:min 1}]]
    [:name {:optional true} [:string {:min 1}]]
    [:source {:optional true} [:string {:min 1}]]
-   [:require-entry {:optional true} RequireEntry]])
+   [:require-entry {:optional true} RequireEntry]
+   [:ns {:optional true} [:string {:min 1}]]
+   [:requires {:optional true} [:vector RequireEntry]]
+   [:forms {:optional true} [:vector :string]]
+   [:source-root {:optional true} [:string {:min 1}]]])
 
 ;; ---- Helpers ----
 
-(defn- clj-ext? [path]
-  (some #(str/ends-with? path %) [".clj" ".cljs" ".cljc" ".edn"]))
+(def ^:private clj-edit-write-dir (atom nil))
+
+(defn set-write-dir!
+  "Set the global write_dir used by all clj-edit operations. Called by
+   make-agent at agent construction. Pass nil to use cwd default."
+  [d]
+  (reset! clj-edit-write-dir d)
+  nil)
 
 (defn- read-file [path]
   (let [f (io/file path)]
     (when (.canRead f) (slurp f))))
 
-(defn- writable? [path write-dir]
-  (if write-dir
-    (str/starts-with? (.getCanonicalPath (io/file path))
-                      (.getCanonicalPath (io/file write-dir)))
-    true))
+(defn- validate-write!
+  "Validate a write target for clj_edit. Composes file-safety checks
+   with clj_edit-specific rules (must be a Clojure file). Returns
+   nil on success or a structured `{:error ...}` map on failure."
+  [path write-dir]
+  (let [error (fs/validate-write-target! path
+                                         {:clojure-only? true
+                                          :tool-name "clj_edit"
+                                          :use-tool "file_edit"
+                                          :write-dir (or write-dir
+                                                         @clj-edit-write-dir)})]
+    (when error
+      ;; Normalize error key for the LLM-facing return shape (rewrites
+      ;; the file-safety error to include :op :path so downstream
+      ;; callers that expect the old shape still work).
+      (cond-> error
+        (:error error) (assoc :op "clj-edit" :path path)))))
 
-(defn- validate-write! [path write-dir]
-  (cond
-    (not (writable? path write-dir))
-    {:error (str "Path outside write directory: " write-dir)}
-    (not (clj-ext? path))
-    {:error "Path must be a .clj, .cljs, .cljc, or .edn file"}
-    :else nil))
+(defn- validate-validate-read!
+  "Validate a read target for clj_edit. clj_edit reads are also
+   Clojure-only."
+  [path]
+  (let [error (fs/validate-read-target! path
+                                        {:clojure-only? true
+                                         :tool-name "clj_edit"
+                                         :use-tool "file_edit"})]
+    (when error
+      (cond-> error
+        (:error error) (assoc :op "clj-edit" :path path)))))
 
 (defn- validate-parse! [source]
   (edamame/parse-string-all source {:all true :read-cond :allow})
@@ -76,11 +109,11 @@
                                         {:all true :read-cond :allow :auto-resolve name})]
     (vec
      (for [form forms]
-       (let [form-type (cond (list? form) (str (first form)
+       (let [form-type (cond (list? form) (str (first form))
                                     (vector? form) "vector"
                                     (map? form) "map"
                                     (set? form) "set"
-                                    :else (pr-str (type form))))
+                                    :else (pr-str (type form)))
              form-name (when (list? form)
                          (let [fst (first form)]
                            (when (symbol? fst)
@@ -128,23 +161,26 @@
 
 ;; ---- Operations ----
 
-(defn- op-read-structure [path] (form-index path))
+(defn- op-read-structure [path]
+  (or (validate-validate-read! path)
+      (form-index path)))
 
 (defn- op-find-form [path name]
-  (let [source (read-file path)]
-    (if-not source
-      {:op "find-form" :path path :name name :error "File not found"}
-      (try
-        (let [zloc (z/of-string source)
-              form-loc (find-any-named-form zloc name)]
-          (if form-loc
-            {:op "find-form" :path path :name name
-             :source (z/string form-loc)
-             :line (-> (z/node form-loc) meta :row)}
-            {:op "find-form" :path path :name name
-             :error (str "Form '" name "' not found")}))
-        (catch Exception e
-          {:op "find-form" :path path :name name :error (.getMessage e)})))))
+  (or (validate-validate-read! path)
+      (let [source (read-file path)]
+        (if-not source
+          {:op "find-form" :path path :name name :error "File not found"}
+          (try
+            (let [zloc (z/of-string source)
+                  form-loc (find-any-named-form zloc name)]
+              (if form-loc
+                {:op "find-form" :path path :name name
+                 :source (z/string form-loc)
+                 :line (-> (z/node form-loc) meta :row)}
+                {:op "find-form" :path path :name name
+                 :error (str "Form '" name "' not found in " path)}))
+            (catch Exception e
+              {:op "find-form" :path path :name name :error (.getMessage e)}))))))
 
 (defn- op-replace-form [path name new-source write-dir]
   (or (validate-write! path write-dir)
@@ -156,10 +192,11 @@
                   form-loc (find-any-named-form zloc name)]
               (if-not form-loc
                 {:op "replace-form" :path path :name name
-                 :error (str "Form '" name "' not found")}
+                 :error (str "Form '" name "' not found in " path)}
                 (let [new-node (z/of-string new-source)
                       replaced (z/replace form-loc (z/node new-node))
                       result (z/root-string replaced)
+                      _ (fs/make-backup! path)
                       outcome (write-validated! path result)]
                   (merge {:op "replace-form" :path path :name name} outcome))))
             (catch Exception e
@@ -179,6 +216,7 @@
                 (let [new-node (z/node (z/of-string (str "\n\n" new-source)))
                       inserted (z/insert-right form-loc new-node)
                       result (z/root-string inserted)
+                      _ (fs/make-backup! path)
                       outcome (write-validated! path result)]
                   (merge {:op "insert-form" :path path :name after-name} outcome))))
             (catch Exception e
@@ -223,6 +261,8 @@
                             new-req (z/of-string req-str)
                             inserted (z/insert-right ns-name-loc (z/node new-req))
                             result (z/root-string inserted)
+                            _ (fs/make-backup! path)
+                            _ (fs/make-backup! path)
                             outcome (write-validated! path result)]
                         (merge {:op "add-require" :path path :lib lib} outcome))))
                   (let [req-next (z/right require-loc)]
@@ -230,9 +270,12 @@
                       (let [entry-node (z/node (z/of-string entry-sym))
                             inserted (z/append-child req-next entry-node)
                             result (z/root-string inserted)
+                            _ (fs/make-backup! path)
+                            _ (fs/make-backup! path)
                             outcome (write-validated! path result)]
                         (merge {:op "add-require" :path path :lib lib} outcome))
-                      (let [result (str/replace source
+                      (let [_ (fs/make-backup! path)
+                            result (str/replace source
                                                 #"(:require\s*\[)"
                                                 (str "(:require [" entry-sym "\n               "))
                             outcome (write-validated! path result)]
@@ -240,6 +283,95 @@
               (catch Exception e
                 {:op "add-require" :path path :lib (:lib require-entry)
                  :error (.getMessage e)})))))))
+
+;; ---- Create ops (creation from scratch) ----
+
+(defn- ns->path
+  "Convert a Clojure namespace name to a relative file path.
+   `my.cool.ns` → `my/cool/ns.clj`"
+  [ns-name]
+  (let [parts (clojure.string/split (name ns-name) #"\.")]
+    (str (clojure.string/join "/" parts) ".clj")))
+
+(defn- ns-source
+  "Build the source string for a new namespace from ns-name,
+   requires, and forms."
+  [ns-name requires forms]
+  (let [ns-form (str "(ns " ns-name
+                     (when (seq requires)
+                       (str "\n  (:require\n    "
+                            (clojure.string/join "\n    "
+                                                (map (fn [r]
+                                                       (let [{:keys [lib as refer]} r]
+                                                         (str lib
+                                                              (when as (str " :as " as))
+                                                              (when (seq refer)
+                                                                (str " :refer [" (clojure.string/join " " refer) "]")))))
+                                                     requires))
+                            ")"))
+                     ")")
+        body (when (seq forms) (str "\n\n" (clojure.string/join "\n\n" forms)))]
+    (str ns-form body "\n")))
+
+(defn- op-create-ns [{:keys [ns requires forms source-root]} write-dir]
+  (or (when (str/blank? ns)
+        {:error :missing-arg :arg "ns" :op "create-ns"
+         :message "create-ns requires a :ns argument"})
+      (let [path (str (or source-root "src") "/" (ns->path ns))
+            parent (.getParentFile (io/file path))]
+        (or (fs/validate-write-target! path
+                                       {:clojure-only? true
+                                        :tool-name "clj_edit"
+                                        :use-tool "file_edit"
+                                        :write-dir write-dir
+                                        :create? true})
+            (when (.exists (io/file path))
+              {:error :file-exists :path path :op "create-ns"
+               :message (str "File already exists: " path)})
+            (let [source (ns-source ns requires forms)
+                  _ (fs/make-backup! path) ; creates backup only if file exists (no-op here)
+                  _ (when (and parent (not (.exists parent)))
+                      (.mkdirs parent)) ; create parent dirs for nested namespaces
+                  outcome (try
+                            (validate-parse! source)
+                            (spit path source)
+                            {:status :ok :path path
+                             :ns ns
+                             :lines-written (count (str/split-lines source))}
+                            (catch Exception e
+                              {:error :parse-failed :path path :op "create-ns"
+                               :message (.getMessage e)}))]
+              (merge {:op "create-ns" :ns ns} outcome))))))
+
+(defn- op-create-file [{:keys [path source]} write-dir]
+  (or (when (str/blank? path)
+        {:error :missing-arg :arg "path" :op "create-file"
+         :message "create-file requires a :path argument"})
+      (when (str/blank? source)
+        {:error :missing-arg :arg "source" :op "create-file"
+         :message "create-file requires a :source argument"})
+      (or (fs/validate-write-target! path
+                                     {:clojure-only? true
+                                      :tool-name "clj_edit"
+                                      :use-tool "file_edit"
+                                      :write-dir write-dir
+                                      :create? true})
+          (when (.exists (io/file path))
+            {:error :file-exists :path path :op "create-file"
+             :message (str "File already exists: " path)})
+          (let [parent (.getParentFile (io/file path))
+                _ (when (and parent (not (.exists parent)))
+                    (.mkdirs parent))
+                _ (fs/make-backup! path)
+                outcome (try
+                          (validate-parse! source)
+                          (spit path source)
+                          {:status :ok :path path
+                           :lines-written (count (str/split-lines source))}
+                          (catch Exception e
+                            {:error :parse-failed :path path :op "create-file"
+                             :message (.getMessage e)}))]
+            (merge {:op "create-file" :path path} outcome)))))
 
 ;; ---- Tool Registration ----
 
@@ -250,7 +382,12 @@
   ([opts]
    {:type        :clj-edit
     :name        (or (:name opts) "clj_edit")
-    :description "Structured Clojure/EDN source editing. Read, find, replace, insert, or remove top-level forms. Preserves comments and formatting."
+    :description (str "The preferred tool for Clojure file changes that need to persist. "
+                     "Structured Clojure/EDN source editing via rewrite-clj. "
+                     "Operations: read-structure, find-form, replace-form, insert-form, "
+                     "add-require, remove-form, create-ns, create-file. "
+                     "Preserves comments and formatting. "
+                     "Hard-refuses non-Clojure files (use the file_edit tool for those).")
     :parameters  CljEditParams
     :write-dir   (or (:write-dir opts) (System/getProperty "user.dir"))}))
 
@@ -262,7 +399,8 @@
                       :else {})
         decoded (or (tools/coerce-args tool (if (map? args) (pr-str args) (str args)))
                     raw)
-        {:keys [op path name source require-entry]} (if (map? decoded) decoded raw)
+        {:keys [op path name source require-entry ns requires forms
+                source-root]} (if (map? decoded) decoded raw)
         write-dir (:write-dir tool)]
     (case op
       "read-structure" (pr-str (op-read-structure path))
@@ -271,6 +409,10 @@
       "insert-form"    (pr-str (op-insert-form path name source write-dir))
       "add-require"    (pr-str (op-add-require path require-entry write-dir))
       "remove-form"    (pr-str (op-remove-form path name write-dir))
+      "create-ns"      (pr-str (op-create-ns {:ns ns :requires requires
+                                               :forms forms :source-root source-root}
+                                              write-dir))
+      "create-file"    (pr-str (op-create-file {:path path :source source} write-dir))
       (pr-str {:error (str "Unknown operation: " op)}))))
 
 (defmethod tools/parse :clj-edit

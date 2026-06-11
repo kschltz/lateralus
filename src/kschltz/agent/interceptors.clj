@@ -58,16 +58,25 @@
 
 (def llm-call
   "Invoke the LLM client. Network/protocol errors are caught and stored
-   on :llm/api-error. The :leave stage is a no-op."
+   on :llm/api-error. The :enter stage starts an LLM heartbeat so the
+   watchdog can detect a stalled request; the :leave stage clears it."
   {:name ::llm-call
    :enter (fn [ctx]
             (let [client (or (:llm/client ctx) (llm-client/default-client))
-                  req (:llm/request ctx)]
+                  req (:llm/request ctx)
+                  ag (:agent/ref ctx)
+                  ;; Start a heartbeat so the watchdog can detect a stall
+                  heartbeat-state (llm-client/start-heartbeat! client)]
               (when-not req
                 (throw (ex-info "llm-call: missing :llm/request"
                                 {:stage :enter})))
+              (when ag
+                (send ag assoc :llm/heartbeat-state heartbeat-state)
+                (await ag))
               (try
-                (assoc ctx :llm/response (llm-client/call client req))
+                (assoc ctx
+                       :llm/response (llm-client/call client req)
+                       :llm/heartbeat-state heartbeat-state)
                 (catch Throwable t
                   (let [data (ex-data t)
                         short (or (get-in data [:body :error :message])
@@ -76,7 +85,17 @@
                     (-> ctx
                         (assoc :llm/api-error {:exception t :message short})
                         (assoc :llm/response
-                               {:choices [{:message {:content (str "LLM API error: " short)}}]})))))))})
+                               {:choices [{:message {:content (str "LLM API error: " short)}}]})))))))
+   :leave (fn [ctx]
+            (let [ag (:agent/ref ctx)
+                  client (:llm/client ctx)
+                  hb (:llm/heartbeat-state ctx)]
+              (when (and ag hb client)
+                (try (llm-client/cancel client hb)
+                     (send ag dissoc :llm/heartbeat-state)
+                     (await ag)
+                     (catch Throwable _ nil)))
+              ctx))})
 
 ;; ---------------------------------------------------------------------------
 ;; parse-response (enter)

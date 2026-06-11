@@ -71,7 +71,8 @@
   (cancel [_ heartbeat-state]
     (swap! heartbeat-state assoc :running? false)
     (when-let [f (:future @heartbeat-state)]
-      (future-cancel f))
+      (when (instance? java.util.concurrent.Future f)
+        (future-cancel f)))
     nil))
 
 (defn default-client

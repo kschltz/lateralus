@@ -358,6 +358,96 @@
     (send ag assoc :running false)
     (await ag)))
 
+;; ---- Heartbeat Watchdog ----
+
+(defn- heartbeat-timeout-ms
+  "Read LATERALUS_LLM_HEARTBEAT_TIMEOUT_S, default 60s. Returns ms."
+  []
+  (let [s (or (some-> (System/getenv "LATERALUS_LLM_HEARTBEAT_TIMEOUT_S")
+                      parse-long)
+              60)]
+    (* s 1000)))
+
+(defn heartbeat-stalled?
+  "True when the agent's LLM heartbeat ref is older than the
+   configured threshold. Returns nil when no heartbeat ref is set
+   (i.e. no call in flight). Public so tests can probe the check fn."
+  [ag now-ms]
+  (when-let [hb (:llm/heartbeat-state @ag)]
+    (let [last-beat (:last-beat @hb)
+          elapsed (- now-ms (long last-beat))]
+      (when (and (number? last-beat)
+                 (> elapsed (heartbeat-timeout-ms)))
+        elapsed))))
+
+(defn watchdog!
+  "Spawn a watchdog future that monitors the agent's LLM heartbeat
+   ref. When the heartbeat is stalled beyond the configured timeout,
+   the watchdog:
+     1. Calls cancel on the LLM client (best-effort)
+     2. Resets the message queue to []
+     3. Fires :on-thought :session-unresponsive
+     4. Fires :on-error with a synthesized exception
+   The watchdog runs until the agent is stopped (:running false) or
+   the watchdog future is cancelled. Returns the watchdog ref.
+
+   Optional `opts` map:
+     :check-interval-ms  — how often to check (default 5000)"
+  ([ag] (watchdog! ag {}))
+  ([ag {:keys [check-interval-ms]
+        :or   {check-interval-ms 5000}}]
+   (let [watchdog-running? (atom true)
+         f (future
+             (try
+               (while @watchdog-running?
+                 (let [state @ag]
+                   (when (:running state)
+                     (let [now (System/currentTimeMillis)]
+                       (when-let [stalled-ms (heartbeat-stalled? ag now)]
+                         (let [client (:llm/client state)
+                               hb (:llm/heartbeat-state state)
+                               ;; 1. Cancel the LLM request (best-effort)
+                               _ (when (and client hb)
+                                   (try (llm-client/cancel client hb)
+                                        (catch Throwable _)))
+                               ;; 2. Fire :on-thought
+                               _ (fire-on-thought state
+                                                  {:type :session-unresponsive
+                                                   :stalled-for-ms stalled-ms})
+                               ;; 3. Fire :on-error
+                               ex (ex-info (str "Session unresponsive: LLM heartbeat stalled for "
+                                                stalled-ms "ms")
+                                           {:type :session-unresponsive
+                                            :stalled-for-ms stalled-ms})]
+                           (when-let [on-error (:on-error state)]
+                             (try (on-error ag ex) (catch Throwable _))))
+                         ;; 4. Reset the message queue and clear heartbeat.
+                         ;; Use send+await for production agents; fall back
+                         ;; to swap! for plain atoms (used in tests).
+                         (let [reset-fn (fn [s]
+                                          (-> s
+                                              (assoc :message-queue [])
+                                              (dissoc :llm/heartbeat-state)))]
+                           (try
+                             (if (instance? clojure.lang.Agent ag)
+                               (do (send ag reset-fn) (await ag))
+                               (swap! ag reset-fn))
+                             (catch Throwable _ nil)))))))
+                 (Thread/sleep check-interval-ms))
+               (catch Throwable _ nil)))]
+     {:running? watchdog-running?
+      :future   f
+      :interval-ms check-interval-ms
+      :timeout-ms (heartbeat-timeout-ms)})))
+
+(defn stop-watchdog!
+  "Stop a watchdog spawned by `watchdog!`. Idempotent."
+  [wd]
+  (when wd
+    (reset! (:running? wd) false)
+    (future-cancel (:future wd))
+    nil))
+
 (defn history-entries-for-exchange
   "Build chronological chat-history entries for a completed exchange."
   [items stored & {:keys [transcript]}]
@@ -388,24 +478,24 @@
         combined-input (str/join "\n" texts)
         chain-val      (deref (requiring-resolve 'kschltz.agent.exchange/default-exchange-chain))
         ctx           {:agent/ref ag
-                      :agent/state state
-                      :agent/state-delta {}
-                      :exchange/items items
-                      :exchange/user-text combined-input
-                      :exchange/response nil
-                      :exchange/error nil
-                      :turn/messages [{:role "user" :content combined-input}]
-                      :turn/transcript []
-                      :turn/depth 0
-                      :turn/retries 0
-                      :llm/request nil
-                      :llm/response nil
-                      :llm/api-error nil
-                      :tool/calls nil
-                      :tool/results nil
-                      :memory/recalled nil
-                      :memory/stored nil
-                      :llm/client (or (:llm/client state) (llm-client/default-client))}]
+                       :agent/state state
+                       :agent/state-delta {}
+                       :exchange/items items
+                       :exchange/user-text combined-input
+                       :exchange/response nil
+                       :exchange/error nil
+                       :turn/messages [{:role "user" :content combined-input}]
+                       :turn/transcript []
+                       :turn/depth 0
+                       :turn/retries 0
+                       :llm/request nil
+                       :llm/response nil
+                       :llm/api-error nil
+                       :tool/calls nil
+                       :tool/results nil
+                       :memory/recalled nil
+                       :memory/stored nil
+                       :llm/client (or (:llm/client state) (llm-client/default-client))}]
     (try
       (let [result (chain/execute ctx chain-val)
             response (or (:exchange/response result)

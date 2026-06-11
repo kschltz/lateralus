@@ -219,31 +219,31 @@
          _ (when-let [err (plugin/validate-plugins plugins-resolved)]
              (throw (ex-info "make-agent: invalid plugin map" {:explain err})))
          state-with-plugins (apply-plugins
-                              (merge default-state
-                                     {:base-url       base-url
-                                      :api-key        api-key
-                                      :model          model
-                                      :max-turns      turns
-                                      :history        []
-                                      :session-id     session-id'
-                                      :memory-store   memory-store
-                                      :memory-backend memory-backend
-                                      :sessions-dir   sessions-dir'
-                                      :on-response   on-response
-                                      :on-error      on-error
-                                      :on-thought    on-thought
-                                      :on-memory-event on-memory-event
-                                      :memory-relevant-limit (or memory-relevant-limit (:memory-relevant-limit cfg))
-                                      :memory-recent-limit   (or memory-recent-limit (:memory-recent-limit cfg))
-                                      :memory-strategy       (or memory-strategy (:memory-strategy cfg))
-                                      :memory-embedding-dims embedding-dims
-                                      :memory-embedding-model embedding-model
-                                      :memory-embedding-method embedding-method
-                                      :history-limit         history-limit'
-                                      :memory-max-chars      (or memory-max-chars (:memory-max-chars cfg))
-                                      :max-tool-calls        (or (:max-tool-calls opts) (:max-tool-calls cfg))
-                                      :max-retries            (or (:max-retries opts) (:max-retries cfg))})
-                              plugins-resolved)
+                             (merge default-state
+                                    {:base-url       base-url
+                                     :api-key        api-key
+                                     :model          model
+                                     :max-turns      turns
+                                     :history        []
+                                     :session-id     session-id'
+                                     :memory-store   memory-store
+                                     :memory-backend memory-backend
+                                     :sessions-dir   sessions-dir'
+                                     :on-response   on-response
+                                     :on-error      on-error
+                                     :on-thought    on-thought
+                                     :on-memory-event on-memory-event
+                                     :memory-relevant-limit (or memory-relevant-limit (:memory-relevant-limit cfg))
+                                     :memory-recent-limit   (or memory-recent-limit (:memory-recent-limit cfg))
+                                     :memory-strategy       (or memory-strategy (:memory-strategy cfg))
+                                     :memory-embedding-dims embedding-dims
+                                     :memory-embedding-model embedding-model
+                                     :memory-embedding-method embedding-method
+                                     :history-limit         history-limit'
+                                     :memory-max-chars      (or memory-max-chars (:memory-max-chars cfg))
+                                     :max-tool-calls        (or (:max-tool-calls opts) (:max-tool-calls cfg))
+                                     :max-retries            (or (:max-retries opts) (:max-retries cfg))})
+                             plugins-resolved)
          state-with-tools  (merge-tools state-with-plugins tools)
          loaded-history  (when (and memory-store session-id' (empty? initial))
                            (try
@@ -358,17 +358,32 @@
 ;; ---------------------------------------------------------------------------
 
 (defn start!
-  "Start the agent loop in a future. Returns the future (for callers
-  that want to await; most can ignore the return value)."
+  "Start the agent loop in a future. Also spawns the heartbeat
+  watchdog (per the stuck-loop-recovery goal) which detects stalled
+  LLM requests and surfaces a :session-unresponsive error. Returns
+  the agent loop future (for callers that want to await; most can
+  ignore the return value). The watchdog can be retrieved via
+  `get-watchdog` for explicit shutdown."
   [ag]
   (send ag assoc :running true)
   (await ag)
-  (future (loop/agent-loop ag)))
+  (let [loop-future (future (loop/agent-loop ag))
+        watchdog (loop/watchdog! ag)]
+    (send ag assoc :watchdog watchdog)
+    (await ag)
+    loop-future))
+
+(defn get-watchdog
+  "Return the watchdog ref for an agent, or nil if none is attached."
+  [ag]
+  (:watchdog @ag))
 
 (defn stop!
-  "Stop the agent loop. Returns the agent."
+  "Stop the agent loop and the heartbeat watchdog. Returns the agent."
   [ag]
-  (send ag assoc :running false)
+  (when-let [wd (:watchdog @ag)]
+    (loop/stop-watchdog! wd))
+  (send ag (fn [s] (-> s (assoc :running false) (dissoc :watchdog))))
   (await ag)
   ag)
 

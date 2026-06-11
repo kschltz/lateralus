@@ -19,7 +19,9 @@
   llm-client/LlmClient
   (call [_ _] (if (empty? script)
                 {:choices [{:message {:content "(no more scripted responses)"}}]}
-                (first script))))
+                (first script)))
+  (start-heartbeat! [_] (atom {:last-beat (System/currentTimeMillis) :running? true}))
+  (cancel [_ _] nil))
 
 (defn fake-client [& responses]
   (->FakeLlmClient (vec responses)))
@@ -64,7 +66,9 @@
 
 (defrecord ThrowingClient []
   llm-client/LlmClient
-  (call [_ _] (throw (ex-info "boom" {}))))
+  (call [_ _] (throw (ex-info "boom" {})))
+  (start-heartbeat! [_] (atom {:last-beat (System/currentTimeMillis) :running? true}))
+  (cancel [_ _] nil))
 
 (deftest llm-call-converts-exceptions-to-api-error
   (let [ctx (assoc (base-ctx) :llm/client (->ThrowingClient) :llm/request {:messages []})
@@ -165,8 +169,8 @@
 
 (deftest update-history-stages-delta
   (let [ctx (assoc (base-ctx) :exchange/response "hi"
-                                 :exchange/items [{:text "hi"}]
-                                 :turn/transcript [{:role "assistant" :content "hi"}])
+                   :exchange/items [{:text "hi"}]
+                   :turn/transcript [{:role "assistant" :content "hi"}])
         out ((:leave ix/update-history) ctx)]
     (is (map? (:agent/state-delta out)))
     (is (some? (-> out :agent/state-delta :current-response)))

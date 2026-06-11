@@ -17,7 +17,9 @@
           resp (nth script idx {:choices [{:message {:content (str "(script exhausted at call " idx ")")}}]})]
       (swap! calls conj (assoc opts :_script-index idx))
       resp))
-  (start-heartbeat! [_] (atom (System/currentTimeMillis)))
+  (start-heartbeat! [_] (atom {:last-beat (System/currentTimeMillis)
+                               :running?  true
+                               :future    nil}))
   (cancel [_ _] nil))
 
 (defn scripted

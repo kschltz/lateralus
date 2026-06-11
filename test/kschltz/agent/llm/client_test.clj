@@ -42,9 +42,10 @@
 (deftest scripted-client-start-heartbeat
   (testing "ScriptedLlmClient implements start-heartbeat!"
     (let [{:keys [client]} (sl/scripted [])
-          ref (client/start-heartbeat! client)]
-      (is (some? ref) "returns an atom")
-      (is (number? @ref)))))
+          state (client/start-heartbeat! client)]
+      (is (some? state) "returns an atom")
+      (is (map? @state) "atom holds a map")
+      (is (number? (:last-beat @state)) ":last-beat is a timestamp"))))
 
 (deftest scripted-client-cancel-noop
   (testing "ScriptedLlmClient's cancel is a no-op (returns nil)"

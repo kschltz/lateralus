@@ -8,6 +8,7 @@
             [kschltz.agent.plugins.remember :as p-remember]
             [kschltz.agent.plugins.repl :as p-repl]
             [kschltz.agent.plugins.safety :as p-safety]
+            [kschltz.agent.plugins.stuck-loop :as p-stuck-loop]
             [kschltz.agent.plugins.web :as p-web]
             [malli.core :as m]))
 
@@ -126,3 +127,23 @@
         "two safety plugins contribute two guard interceptors")
     (is (every? #(= % :safety.guard) names)
         "interceptor names use plugin.slot dot format")))
+
+;; ---- Stuck-loop slot ----
+
+(deftest stuck-loop-plugin-contributes-detector
+  (testing "the stuck-loop plugin contributes a :stuck-loop slot interceptor"
+    (let [chain (plugin/assemble-chain [p-stuck-loop/plugin])
+          names (mapv :name chain)]
+      (is (= 1 (count names)))
+      (is (= :stuck-loop-detector.stuck-loop (first names))
+          "interceptor name uses plugin.slot dot format"))))
+
+(deftest default-slot-order-includes-stuck-loop
+  (testing ":stuck-loop appears in default-slot-order between :guard and :enrich"
+    (let [order plugin/default-slot-order
+          guard-idx (.indexOf order :guard)
+          stuck-idx (.indexOf order :stuck-loop)
+          enrich-idx (.indexOf order :enrich)]
+      (is (>= stuck-idx 0) ":stuck-loop is in default-slot-order")
+      (is (> stuck-idx guard-idx) ":stuck-loop comes after :guard")
+      (is (< stuck-idx enrich-idx) ":stuck-loop comes before :enrich"))))

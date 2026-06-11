@@ -12,18 +12,19 @@
       :plugin/register (fn [state tool-defs] new-state)  ; optional
 
    Named slots (in execution order; see `default-slot-order`):
-     :guard    — security / safety checks before compose
-     :enrich   — RAG / memory recall before compose
-     :compose  — context construction interceptors
-     :llm      — interceptors that wrap the LLM call
-     :dispatch — tool-loop dispatch interceptors
-     :tools    — tool interceptors (typically no-ops; the dispatcher
-                 routes tool-calls to the registered tool defs)
-     :finalize — after the loop, before leave
-     :history  — leave stage for history updates
-     :persist  — leave stage for memory persistence
-     :observe  — leave stage for tracing / metrics
-     :notify   — leave stage for event callbacks
+     :guard       — security / safety checks before compose
+     :stuck-loop  — tool-call loop detection (fires after tool calls)
+     :enrich      — RAG / memory recall before compose
+     :compose     — context construction interceptors
+     :llm         — interceptors that wrap the LLM call
+     :dispatch    — tool-loop dispatch interceptors
+     :tools       — tool interceptors (typically no-ops; the dispatcher
+                    routes tool-calls to the registered tool defs)
+     :finalize    — after the loop, before leave
+     :history     — leave stage for history updates
+     :persist     — leave stage for memory persistence
+     :observe     — leave stage for tracing / metrics
+     :notify      — leave stage for event callbacks
 
    `assemble-chain` is a pure fold: same plugins in the same order
    produce the same chain. Within a slot, plugin declaration order
@@ -33,7 +34,7 @@
 
 (def default-slot-order
   "The default order in which slots are folded into a chain."
-  [:guard :enrich :compose :llm :dispatch
+  [:guard :stuck-loop :enrich :compose :llm :dispatch
    :tools :finalize
    :history :persist :observe :notify])
 
